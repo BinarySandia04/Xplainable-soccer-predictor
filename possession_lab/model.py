@@ -57,6 +57,8 @@ class ModelParams:
     sigma_miss: float = 6.0
     gap_thresh: float = 120.0
     min_players: int = 6
+    w_parked_edge: float = 0.0
+    loose_stop_gate: bool = False
 
     @classmethod
     def from_mapping(cls, values: dict[str, Any] | None = None) -> "ModelParams":
@@ -148,6 +150,10 @@ def emission_log_probs(features: Any, params: ModelParams = DEFAULT_PARAMS) -> n
         q_dead += params.w_gap * _sigmoid((gap - params.gap0) / params.gap_scale)
     q_dead += params.w_out * out_of_play
 
+    parked = np.asarray(getattr(features, "parked_edge", False), dtype=bool)
+    if params.w_parked_edge:
+        q_dead = q_dead + params.w_parked_edge * parked
+
     log_emission = _log_normalize(np.stack([q_home, q_away, q_dead], axis=1))
 
     # Speed gate.  The reference model applies this even when ``gate`` is zero: a stationary or
@@ -226,6 +232,10 @@ def emission_log_probs(features: Any, params: ModelParams = DEFAULT_PARAMS) -> n
     # last, so give that team the mass and leave the rest for the prior.
     if params.loose_R > 0:
         loose = present & (d_min > params.loose_R) & ~out_of_play
+        if params.loose_stop_gate:
+            # A ball that sits at a boundary is a restart waiting to be taken, not a live loose
+            # ball.  Do not hand it to the prior or to last-touch.
+            loose &= ~parked
         log_emission[loose] = np.log(1.0 / 3.0)
         if params.touch_p > 0:
             last_touch = np.asarray(features.last_touch, dtype=np.int8)

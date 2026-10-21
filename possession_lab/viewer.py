@@ -37,6 +37,7 @@ from .config import (
     A,
     CODE_TO_LABEL,
     D,
+    EXPLANATIONS_PATH,
     FPS,
     GAME,
     GRADED_HALVES,
@@ -105,6 +106,7 @@ def build_viewer_data(
     halves: tuple[tuple[int, int], ...] = GRADED_HALVES,
     public: tuple[int, int] = (PUBLIC_START, PUBLIC_STOP),
     start_frame: int | None = None,
+    explanations: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the compact payload consumed by the browser.
 
@@ -173,6 +175,9 @@ def build_viewer_data(
         start_frame = int(public[0])
     start_frame = max(0, min(int(start_frame), n_frames - 1))
 
+    explanations = explanations if isinstance(explanations, dict) else {}
+    switches = [dict(s) for s in explanations.get("switches", ()) if isinstance(s, dict) and "frame" in s]
+
     counts = {
         label: int(np.sum(pred == code))
         for label, code in (("H", H), ("A", A), ("D", D), ("X", X))
@@ -203,6 +208,8 @@ def build_viewer_data(
         "disagreements": disagreements,
         "tags": tags_payload,
         "metrics": metric_payload,
+        "switches": switches,
+        "explanations_available": bool(switches),
     }
 
 
@@ -301,6 +308,7 @@ def load_viewer_data(
     tags_path: str | Path | None = None,
     metrics_path: str | Path | None = None,
     user_truth_path: str | Path | None = USER_TRUTH_PATH,
+    explanations_path: str | Path | None = EXPLANATIONS_PATH,
     start_frame: int | None = None,
 ) -> dict[str, Any]:
     """Read the generated CSV outputs and build the viewer payload."""
@@ -322,12 +330,17 @@ def load_viewer_data(
     if metrics_path is not None and Path(metrics_path).is_file():
         metrics = json.loads(Path(metrics_path).read_text(encoding="utf-8"))
 
+    explanations = None
+    if explanations_path is not None and Path(explanations_path).is_file():
+        explanations = json.loads(Path(explanations_path).read_text(encoding="utf-8"))
+
     data = build_viewer_data(
         pred,
         gt,
         tags=tags,
         metrics=metrics,
         start_frame=start_frame,
+        explanations=explanations,
     )
     data.update(build_user_truth_data(pred, load_user_truth(user_truth_path, pred.size)))
     return data
@@ -637,6 +650,7 @@ def serve_viewer(
     tags_path: str | Path | None = None,
     metrics_path: str | Path | None = None,
     user_truth_path: str | Path | None = USER_TRUTH_PATH,
+    explanations_path: str | Path | None = EXPLANATIONS_PATH,
     data_dir: str | Path | None = None,
     host: str = "127.0.0.1",
     port: int = 8765,
@@ -664,6 +678,7 @@ def serve_viewer(
         tags_path=tags_path,
         metrics_path=metrics_path,
         user_truth_path=user_truth_path,
+        explanations_path=explanations_path,
         start_frame=start_frame,
     )
     pred = load_submission(predictions)
@@ -686,6 +701,7 @@ def serve_viewer(
     print(
         f"data: {data['n_frames']:,} frames | {data['duration_s']:.2f}s | "
         f"{len(data['pred_spells'])} predicted spells | "
+        f"{len(data['switches'])} annotated switches | "
         f"GT {'yes' if data['gt_available'] else 'no'} | "
         f"UT {data['ut_labeled_frames']:,} frames",
         flush=True,

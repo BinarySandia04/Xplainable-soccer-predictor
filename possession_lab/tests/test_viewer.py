@@ -59,6 +59,42 @@ class ViewerDataTest(unittest.TestCase):
         self.assertEqual(data["tags"][0]["code"], "ATTACK")
         self.assertEqual(data["tags"][0]["team"], 0)
 
+    def test_switch_annotations_ride_the_payload(self):
+        pred = np.array([X, H, H, A, D, D, X], dtype=np.int8)
+        explanations = {
+            "switches": [
+                {
+                    "frame": 4,
+                    "t_s": 0.16,
+                    "from": "A",
+                    "to": "D",
+                    "confidence": 0.9,
+                    "summary": "El balón sale del campo",
+                    "reasons": [{"kind": "out_of_bounds", "text": "El balón sale del campo", "evidence": {"frame": 3}}],
+                }
+            ],
+        }
+        data = build_viewer_data(
+            pred,
+            None,
+            tags=None,
+            metrics=None,
+            fps=25,
+            halves=((1, 6),),
+            public=(1, 6),
+            start_frame=None,
+            explanations=explanations,
+        )
+        self.assertTrue(data["explanations_available"])
+        self.assertEqual(data["switches"][0]["frame"], 4)
+        self.assertEqual(data["switches"][0]["reasons"][0]["kind"], "out_of_bounds")
+
+    def test_payload_without_annotations_degrades_empty(self):
+        pred = np.full(10, H, dtype=np.int8)
+        data = build_viewer_data(pred, fps=25, halves=((0, 10),), public=(0, 10))
+        self.assertEqual(data["switches"], [])
+        self.assertFalse(data["explanations_available"])
+
     def test_prediction_spans_graded_halves_when_gt_is_public_only(self):
         pred = np.full(20, H, dtype=np.int8)
         gt = np.array([X] * 5 + [H] * 10 + [X] * 5, dtype=np.int8)

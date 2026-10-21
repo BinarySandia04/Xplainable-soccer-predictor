@@ -8,13 +8,37 @@ never pretends to know them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import warnings
 
 import numpy as np
 
 from .config import FPS, PITCH
 from .data import TagTable, TrackingData
+
+# Parked ball near a line: the shape of a throw-in, corner or goal-kick stoppage waiting for the
+# restart.  The thresholds are measured on the public ground truth: the ball sits within a couple
+# of metres of a boundary at under ~1.5 m/s for seconds, while a live ball near the line is on its
+# way through at speed.  ``PARKED_HOLD`` is the time the condition must hold; a ball that flickers
+# in and out of tracking is allowed for up to ``PARKED_FILL`` of the window.
+PARKED_NEAR = 2.5
+PARKED_SPEED = 1.5
+PARKED_HOLD_S = 0.8
+PARKED_FILL = 0.7
+
+
+def _held(cond: np.ndarray, seconds: float, fill: float) -> np.ndarray:
+    """True where ``cond`` held for at least ``fill`` of a trailing window of ``seconds``."""
+    n = cond.shape[0]
+    window = max(1, int(round(seconds * FPS)))
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    cum = np.concatenate([[0.0], np.cumsum(cond.astype(np.float64))])
+    out = np.zeros(n, dtype=bool)
+    if n >= window:
+        counts = cum[window:] - cum[:-window]
+        out[window - 1:] = counts >= fill * window
+    return out
 
 
 @dataclass(frozen=True)
@@ -45,6 +69,7 @@ class Features:
     tag_setpiece: np.ndarray
     tag_coverage: np.ndarray
     player_count: np.ndarray
+    parked_edge: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
 
     def __len__(self) -> int:
         return int(self.stop - self.start)
@@ -188,6 +213,17 @@ def extract_features(
         | (ball[:, 1] > width)
     )
 
+    # Parked ball at a boundary: visible, within ``PARKED_NEAR`` metres of a line, moving slower
+    # than ``PARKED_SPEED``, and holding that state for ``PARKED_HOLD_S``.  Frames beyond the line
+    # count too: the restart spot is the same situation with better evidence.
+    parked = (
+        present
+        & (edge < PARKED_NEAR)
+        & np.isfinite(ball_speed)
+        & (ball_speed < PARKED_SPEED)
+    )
+    parked_edge = _held(parked, PARKED_HOLD_S, PARKED_FILL) | out_of_play
+
     # Last touch: nearest player within 0.8 m.  This is not an identity, just a team hint.
     last_touch = np.full(n, -1, dtype=np.int8)
     last_touch_age = np.full(n, 9999, dtype=np.int32)
@@ -250,6 +286,7 @@ def extract_features(
         tag_setpiece=tags.setpiece[start:stop].astype(np.int8),
         tag_coverage=tags.coverage[start:stop].astype(bool),
         player_count=tracking.player_present[start:stop].sum(axis=1).astype(np.int16),
+        parked_edge=parked_edge,
     )
 
 

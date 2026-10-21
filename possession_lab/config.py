@@ -36,6 +36,8 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 PUBLIC_GT_PATH = ROOT / "evaluation" / "gt" / "BAR-ATH_possession_gt_public.csv"
 # Written by the local viewer only.  Never read by the model, features, or training code.
 USER_TRUTH_PATH = OUTPUT_DIR / "user_truth.json"
+# Generated switch annotations (explain.py).  Written by predict/explain, read by the viewer.
+EXPLANATIONS_PATH = OUTPUT_DIR / "explanations.json"
 
 # The exact parameters of the recommended model.  Kept here so the CLI, tests, and report agree.
 MODEL_PARAMS = {
@@ -70,6 +72,10 @@ MODEL_PARAMS = {
     "sigma_miss": 6.0,
     "gap_thresh": 120.0,
     "min_players": 6,
+    # Parked ball at a boundary: the strongest single dead-ball signature measured on the public
+    # window (spellF1 0.6074 -> 0.6857, D-F1 -0.014).
+    "w_parked_edge": 1.5,
+    "loose_stop_gate": False,
 }
 
 

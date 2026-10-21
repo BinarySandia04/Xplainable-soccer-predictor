@@ -67,6 +67,11 @@
     overviewHint: $("#overviewHint"),
     detailHint: $("#detailHint"),
     hoverInfo: $("#hoverInfo"),
+    explainCard: $("#explainCard"),
+    switchDetail: $("#switchDetail"),
+    switchList: $("#switchList"),
+    switchMeta: $("#switchMeta"),
+    explainFilters: $("#explainFilters"),
     fatal: $("#fatal"),
     fatalMessage: $("#fatalMessage"),
   };
@@ -88,6 +93,9 @@
     utAnchor: null,
     utSaving: false,
     anchorDrag: null,
+    selectedSwitch: -1,
+    switchFilter: "all",
+    switchFrames: [],
   };
 
   const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
@@ -447,6 +455,9 @@
     } else {
       ui.utMetrics.textContent = "Sin etiquetas UT.";
     }
+
+    updateSwitchDistance();
+    autoSelectSwitch();
   }
 
   function drawTimelines() {
@@ -538,6 +549,7 @@
     ctx.fillRect(0, 60, width, 16);
     paintSegments(ctx, data.ut_segments, xOf, 60, 16, width);
     drawAnchors(ctx, xOf, 60, 76, width);
+    drawDecisionMarkers(ctx, xOf, width, "overview");
 
     drawText(ctx, "PRED", 6, 8, { size: 8, color: "#8ca0b4" });
     drawText(ctx, "GT", 6, 36, { size: 8, color: "#8ca0b4" });
@@ -674,6 +686,7 @@
     ctx.fillRect(0, 88, width, 24);
     paintSegments(ctx, data.ut_segments, xOf, 88, 24, width);
     drawAnchors(ctx, xOf, 88, 112, width);
+    drawDecisionMarkers(ctx, xOf, width, "detail");
 
     drawText(ctx, "PRED", 6, 18, { size: 8, color: "rgba(232,240,247,0.72)" });
     drawText(ctx, data.gt_available ? "GT" : "GT no cargada", 6, 60, {
@@ -809,6 +822,12 @@
         drawTimelines();
         return;
       }
+      const markerHit = findMarkerHit(event.clientX, event.clientY, source);
+      if (markerHit) {
+        state.video.pause();
+        selectSwitch(markerHit.idx, { seek: true });
+        return;
+      }
       state.scrubbing = true;
       state.scrubSource = source;
       const frame = eventFrame(event, source);
@@ -830,8 +849,14 @@
         updateHover(frame, source);
         seekToFrame(frame, { pause: true, updateHistory: false });
       } else if (!state.scrubbing) {
-        canvas.style.cursor = findDraggableAnchor(event.clientX, event.clientY, source) ? "ew-resize" : "crosshair";
-        updateHover(frame, source);
+        const markerHit = findMarkerHit(event.clientX, event.clientY, source);
+        canvas.style.cursor = markerHit
+          ? "pointer"
+          : findDraggableAnchor(event.clientX, event.clientY, source)
+            ? "ew-resize"
+            : "crosshair";
+        if (markerHit) ui.hoverInfo.textContent = describeMarkerHit(markerHit);
+        else updateHover(frame, source);
         if (source === "overview") drawOverview();
         else drawDetail();
       }
@@ -947,6 +972,268 @@
     updateUTStatus(state.utAnchor === null ? "Ancla quitada. " : "Ancla fijada. ");
   }
 
+  function toggleUserTruthAnchor() {
+    if (!state.data) return;
+    state.utAnchor = state.utAnchor === state.frame ? null : state.frame;
+    updateUTStatus(state.utAnchor === null ? "Ancla quitada. " : "Ancla fijada. ");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Decision annotations: the "why" behind every state switch. Markers are
+  // clickable on both canvases; the side card lists every annotated switch
+  // with timestamps.
+  // ---------------------------------------------------------------------------
+
+  const KIND_LABELS = {
+    out_of_bounds: "fuera",
+    parked: "parado",
+    restart: "reanudación",
+    teams_slow: "lentitud",
+    ball_missing: "balón perdido",
+    tag: "etiqueta",
+    geometry: "geometría",
+    prior: "prior",
+  };
+  const KIND_COLORS = {
+    out_of_bounds: "#ff6b5f",
+    parked: "#d2a8ff",
+    restart: "#4ee68b",
+    teams_slow: "#9ad0ff",
+    ball_missing: "#8ca0b4",
+    tag: "#4ea8ff",
+    geometry: "#c8d6e5",
+    prior: "#8ca0b4",
+  };
+  const SWITCH_PLACEHOLDER =
+    '<p class="muted small">Sin cambio seleccionado. Haz clic en una marca <strong>│</strong> de la línea temporal o en la lista de abajo.</p>';
+  const SWITCH_LIST_WINDOW = 160;
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  function stamp(seconds) {
+    if (!Number.isFinite(seconds)) return "—";
+    const minutes = Math.floor(seconds / 60);
+    const rest = seconds - minutes * 60;
+    return `${minutes}:${rest.toFixed(1).padStart(4, "0")}`;
+  }
+
+  function switchListData() {
+    return state.data && Array.isArray(state.data.switches) ? state.data.switches : [];
+  }
+
+  function switchMatchesFilter(sw) {
+    const filter = state.switchFilter;
+    if (filter === "toD") return sw.to === "D";
+    if (filter === "fromD") return sw.from === "D";
+    if (filter === "team") return sw.from !== "D" && sw.to !== "D";
+    return true;
+  }
+
+  function filteredSwitchEntries() {
+    const entries = [];
+    switchListData().forEach((sw, idx) => {
+      if (switchMatchesFilter(sw)) entries.push({ sw, idx });
+    });
+    return entries;
+  }
+
+  function distanceLine(offsetS) {
+    const abs = Math.abs(offsetS);
+    if (abs < 0.05) return "estás en este frame";
+    return offsetS > 0 ? `este cambio está ${abs.toFixed(1)} s por delante del reproductor` : `este cambio quedó ${abs.toFixed(1)} s atrás`;
+  }
+
+  function updateSwitchDistance() {
+    const el = document.getElementById("swDistance");
+    const sw = state.selectedSwitch >= 0 ? switchListData()[state.selectedSwitch] : null;
+    if (el && sw && state.data) el.textContent = distanceLine((sw.frame - state.frame) / state.data.fps);
+  }
+
+  function renderSwitchDetail() {
+    if (!state.data) return;
+    const sw = state.selectedSwitch >= 0 ? switchListData()[state.selectedSwitch] : null;
+    if (sw) {
+      const confPct = Math.round((Number(sw.confidence) || 0) * 100);
+      const reasons = (sw.reasons || [])
+        .map((r) => {
+          const color = KIND_COLORS[r.kind] || "#8ca0b4";
+          const label = KIND_LABELS[r.kind] || r.kind;
+          const evFrame = r.evidence && Number.isFinite(r.evidence.frame) ? r.evidence.frame : null;
+          const jump =
+            evFrame !== null && Math.abs(evFrame - sw.frame) > 2
+              ? ` <button type="button" class="mini-seek" data-seek-frame="${evFrame}" title="Ir al frame ${evFrame}">${stamp(evFrame / state.data.fps)}</button>`
+              : "";
+          return `<li><span class="reason-chip" style="--chip:${color}">${escapeHtml(label)}</span><span class="reason-text">${escapeHtml(r.text)}${jump}</span></li>`;
+        })
+        .join("");
+      ui.switchDetail.innerHTML = `
+        <div class="switch-head">
+          <span class="badge badge-${sw.from}">${sw.from}</span>
+          <span class="switch-arrow">→</span>
+          <span class="badge badge-${sw.to}">${sw.to}</span>
+          <button type="button" class="mini-seek stamp-btn" data-seek-frame="${sw.frame}" title="Ir a este frame">${stamp(sw.t_s)}</button>
+          <span class="mono muted">f ${formatFrame(sw.frame)}</span>
+        </div>
+        <div class="conf-row" title="Probabilidad de emisión del estado entrante en el frame del cambio (antes del suavizado temporal)">
+          <div class="conf-bar"><i style="width:${confPct}%"></i></div><span class="mono muted">${confPct}%</span>
+        </div>
+        <ul class="reason-list">${reasons}</ul>
+        <div id="swDistance" class="muted small">${escapeHtml(distanceLine((sw.frame - state.frame) / state.data.fps))}</div>`;
+      return;
+    }
+    ui.switchDetail.innerHTML = SWITCH_PLACEHOLDER;
+  }
+
+  function renderSwitchList() {
+    const entries = filteredSwitchEntries();
+    if (!entries.length) {
+      ui.switchList.innerHTML = '<li class="muted small">Sin cambios con este filtro.</li>';
+      return;
+    }
+    let center = entries.findIndex((e) => e.idx === state.selectedSwitch);
+    if (center < 0) {
+      center = 0;
+      let best = Infinity;
+      entries.forEach((e, i) => {
+        const d = Math.abs(e.sw.frame - state.frame);
+        if (d < best) {
+          best = d;
+          center = i;
+        }
+      });
+    }
+    const half = Math.floor(SWITCH_LIST_WINDOW / 2);
+    const from = clamp(center - half, 0, Math.max(0, entries.length - SWITCH_LIST_WINDOW));
+    const to = Math.min(entries.length, from + SWITCH_LIST_WINDOW);
+    const rows = [];
+    if (from > 0) rows.push(`<li class="muted small">… ${from} cambios anteriores ocultos</li>`);
+    for (let i = from; i < to; i += 1) {
+      const { sw, idx } = entries[i];
+      rows.push(`
+        <li class="switch-row${idx === state.selectedSwitch ? " selected" : ""}" data-idx="${idx}" title="${escapeHtml(sw.summary)}">
+          <span class="stamp">${stamp(sw.t_s)}</span>
+          <span class="sw-label"><span class="badge badge-${sw.from}">${sw.from}</span>→<span class="badge badge-${sw.to}">${sw.to}</span></span>
+          <span class="sw-summary">${escapeHtml(sw.summary)}</span>
+        </li>`);
+    }
+    if (to < entries.length) rows.push(`<li class="muted small">… ${entries.length - to} cambios posteriores ocultos</li>`);
+    ui.switchList.innerHTML = rows.join("");
+  }
+
+  function renderSwitchMeta() {
+    const total = switchListData().length;
+    const filtered = filteredSwitchEntries().length;
+    if (!total) {
+      ui.switchMeta.textContent = "Sin anotaciones: ejecuta «python -m possession_lab explain» para generarlas.";
+      return;
+    }
+    ui.switchMeta.textContent = `${filtered} de ${total} cambios anotados`;
+  }
+
+  function renderDecisions() {
+    renderSwitchDetail();
+    renderSwitchList();
+    renderSwitchMeta();
+  }
+
+  function selectSwitch(idx, { seek = false } = {}) {
+    if (!Number.isInteger(idx) || idx < 0 || idx >= switchListData().length) return;
+    state.selectedSwitch = idx;
+    renderSwitchDetail();
+    renderSwitchList();
+    if (seek) seekToFrame(switchListData()[idx].frame, { pause: true });
+  }
+
+  function jumpSwitch(direction) {
+    const entries = filteredSwitchEntries();
+    if (!entries.length) return;
+    const frames = entries.map((e) => e.sw.frame);
+    const target = direction < 0 ? previousValue(frames, state.frame) : nextValue(frames, state.frame);
+    if (target === null || target === undefined) return;
+    const entry = entries.find((e) => e.sw.frame === target);
+    if (entry) selectSwitch(entry.idx, { seek: true });
+  }
+
+  function autoSelectSwitch() {
+    const frames = state.switchFrames;
+    if (!frames || !frames.length || !state.data) return;
+    const i = lowerBound(frames, state.frame);
+    let best = -1;
+    let bestDist = 1.5 * state.data.fps;
+    for (const j of [i - 1, i]) {
+      if (j >= 0 && j < frames.length) {
+        const d = Math.abs(frames[j] - state.frame);
+        if (d <= bestDist) {
+          best = j;
+          bestDist = d;
+        }
+      }
+    }
+    if (best >= 0 && best !== state.selectedSwitch) {
+      state.selectedSwitch = best;
+      renderSwitchDetail();
+      renderSwitchList();
+    }
+  }
+
+  function findMarkerHit(clientX, clientY, source) {
+    if (!state.data) return null;
+    const canvas = source === "overview" ? ui.overview : ui.detail;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0) return null;
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
+    const switchTop = source === "overview" ? 10 : 8;
+    const switchBottom = source === "overview" ? 36 : 46;
+    let best = null;
+    let bestDist = 6;
+    if (y >= switchTop && y <= switchBottom) {
+      switchListData().forEach((sw, idx) => {
+        const d = Math.abs(frameToX(canvas, source, sw.frame) - x);
+        if (d <= bestDist) {
+          best = { kind: "switch", idx, frame: sw.frame, distance: d };
+          bestDist = d;
+        }
+      });
+    }
+    return best;
+  }
+
+  function describeMarkerHit(hit) {
+    const sw = switchListData()[hit.idx];
+    return `cambio ${sw.from}→${sw.to} · ${stamp(sw.t_s)} · ${sw.summary}`;
+  }
+
+  function drawDecisionMarkers(ctx, xOf, width, source) {
+    ctx.save();
+    const tickTop = source === "overview" ? 12 : 10;
+    const tickBottom = source === "overview" ? 34 : 44;
+    const switches = switchListData();
+    switches.forEach((sw, i) => {
+      const x = xOf(sw.frame);
+      if (x < -2 || x > width + 2) return;
+      const selected = i === state.selectedSwitch;
+      ctx.strokeStyle = selected ? "#ffc857" : "rgba(232,240,247,0.55)";
+      ctx.lineWidth = selected ? 2 : 1;
+      ctx.beginPath();
+      ctx.moveTo(x + 0.5, tickTop);
+      ctx.lineTo(x + 0.5, tickBottom);
+      ctx.stroke();
+    });
+    if (source === "detail" && state.selectedSwitch >= 0) {
+      const sw = switches[state.selectedSwitch];
+      if (sw) {
+        const x = xOf(sw.frame);
+        if (x >= -2 && x <= width + 2) {
+          drawText(ctx, `${sw.from}→${sw.to}`, clamp(x + 5, 0, width - 30), 18, { size: 8, color: "#ffc857" });
+        }
+      }
+    }
+    ctx.restore();
+  }
+
   function setup() {
     const data = state.data;
     document.title = `Possession Review · ${data.game}`;
@@ -1045,6 +1332,30 @@
     ui.utAnchor.addEventListener("click", toggleUserTruthAnchor);
     ui.utClear.addEventListener("click", () => postUserTruth({ clear: true }));
 
+    state.switchFrames = switchListData().map((sw) => sw.frame);
+    for (const button of ui.explainFilters.querySelectorAll("button")) {
+      button.addEventListener("click", () => {
+        state.switchFilter = button.dataset.which;
+        for (const other of ui.explainFilters.querySelectorAll("button")) {
+          other.classList.toggle("active", other === button);
+        }
+        renderSwitchList();
+        renderSwitchMeta();
+      });
+    }
+    ui.switchList.addEventListener("click", (event) => {
+      const row = event.target instanceof Element ? event.target.closest("li[data-idx]") : null;
+      if (row) selectSwitch(Number.parseInt(row.dataset.idx, 10), { seek: true });
+    });
+    ui.switchDetail.addEventListener("click", (event) => {
+      const seekButton = event.target instanceof Element ? event.target.closest("[data-seek-frame]") : null;
+      if (seekButton) {
+        const frame = Number.parseInt(seekButton.dataset.seekFrame, 10);
+        if (Number.isFinite(frame)) seekToFrame(frame, { pause: true });
+      }
+    });
+    renderDecisions();
+
     window.addEventListener("keydown", (event) => {
       const target = event.target;
       const typing =
@@ -1071,6 +1382,12 @@
       } else if (event.key === "]") {
         event.preventDefault();
         jumpToValue(nextValue(data.changes, state.frame));
+      } else if (event.key === "j") {
+        event.preventDefault();
+        jumpSwitch(-1);
+      } else if (event.key === "k") {
+        event.preventDefault();
+        jumpSwitch(1);
       } else if (event.key === ",") {
         event.preventDefault();
         jumpToValue(previousValue(spellStarts(), state.frame));

@@ -46,6 +46,7 @@
               <span><i class="swatch swatch-A"></i>Athletic</span>
               <span><i class="swatch swatch-D"></i>Balón muerto</span>
               <span><i class="swatch swatch-X"></i>Sin evaluar</span>
+              <span><i class="marker marker-tick"></i>Cambio anotado</span>
             </div>
           </div>
 
@@ -56,7 +57,7 @@
           <div class="detail-head">
             <div>
               <div class="eyebrow">Detalle ±20 s</div>
-              <div id="detailHint" class="muted small">Predicción · GT pública · UT</div>
+              <div id="detailHint" class="muted small">Predicción · GT pública · UT · clic en una marca │ para ver el porqué</div>
             </div>
             <div id="hoverInfo" class="mono muted">—</div>
           </div>
@@ -108,6 +109,22 @@
           </dl>
         </section>
 
+        <section id="explainCard" class="card explain-card" aria-label="Por qué el modelo cambió de estado">
+          <div class="eyebrow">Decisiones · por qué</div>
+          <div id="switchDetail" class="switch-detail">
+            <p class="muted small">Sin cambio seleccionado. Haz clic en una marca <strong>│</strong> de la línea temporal o en la lista de abajo.</p>
+          </div>
+          <div id="explainFilters" class="explain-filters" role="group" aria-label="Filtro de cambios">
+            <button type="button" class="chip active" data-which="all">Todas</button>
+            <button type="button" class="chip" data-which="toD">→ D</button>
+            <button type="button" class="chip" data-which="fromD">D →</button>
+            <button type="button" class="chip" data-which="team">H ↔ A</button>
+          </div>
+          <ul id="switchList" class="switch-list" aria-label="Cambios de estado anotados"></ul>
+          <div id="switchMeta" class="muted small">—</div>
+          <p class="fine-print"><kbd>j</kbd>/<kbd>k</kbd> saltan entre cambios anotados; las razones las generan las reglas de «explain» sobre las mismas señales que vio el modelo — evidencia, no sentencia.</p>
+        </section>
+
         <section class="card controls-card" aria-label="Controles de inspección">
           <div class="eyebrow">Transporte</div>
           <div class="transport">
@@ -156,6 +173,7 @@
             <span><kbd>⇧</kbd> + flechas 1 s</span>
             <span><kbd>H</kbd><kbd>A</kbd><kbd>D</kbd><kbd>X</kbd> UT</span>
             <span><kbd>[</kbd><kbd>]</kbd> cambio</span>
+            <span><kbd>j</kbd><kbd>k</kbd> anotado</span>
             <span><kbd>n</kbd><kbd>N</kbd> discrep.</span>
           </div>
         </section>
