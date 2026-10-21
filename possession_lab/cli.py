@@ -61,6 +61,27 @@ def _write_core_outputs(
     pd.DataFrame(stress_rows).to_csv(output_dir / "stress.csv", index=False)
 
 
+def _build_explanations(lab, pred) -> dict:
+    """Per-switch "why" records for an existing prediction."""
+    from .explain import explain_prediction
+
+    return explain_prediction(lab.tracking, lab.tags, pred)
+
+
+def _explain_and_write(args: argparse.Namespace, lab, pred) -> None:
+    """Generate ``outputs/explanations.json``.  Never fatal: annotations must not break a run."""
+    from .config import EXPLANATIONS_PATH
+
+    try:
+        payload = _build_explanations(lab, pred)
+    except Exception as exc:  # noqa: BLE001 - best-effort side artifact
+        print(f"explanations: omitido ({exc})")
+        return
+    path = Path(args.output_dir) / EXPLANATIONS_PATH.name
+    _json(path, payload)
+    print(f"explanations: {len(payload['switches'])} switches anotados -> {path}")
+
+
 def cmd_all(args: argparse.Namespace) -> int:
     from .config import PUBLIC_START, PUBLIC_STOP
     from .evaluate import evaluate_stress, full_match_stats, public_metrics, to_jsonable
@@ -85,6 +106,8 @@ def cmd_all(args: argparse.Namespace) -> int:
     pred = predict_full(lab.tracking, lab.tags)
     predict_seconds = time.time() - t1
     print(f"decoded full match in {predict_seconds:.2f}s")
+    if not args.no_explain:
+        _explain_and_write(args, lab, pred)
 
     metrics = public_metrics(pred, lab.gt, bootstrap_n=args.bootstrap_n)
     print(
@@ -155,6 +178,25 @@ def cmd_predict(args: argparse.Namespace) -> int:
     pred = predict_full(lab.tracking, lab.tags)
     path = write_submission(pred, output_dir / "predictions.csv")
     print(validate_submission_file(path))
+    if not args.no_explain:
+        _explain_and_write(args, lab, pred)
+    return 0
+
+
+def cmd_explain(args: argparse.Namespace) -> int:
+    """(Re)build the per-switch explanation payload from an existing predictions.csv."""
+    from .data import load_submission
+    from .pipeline import load_lab
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    predictions = Path(args.predictions) if args.predictions else output_dir / "predictions.csv"
+    if not predictions.is_file():
+        print(f"explain: no existe {predictions}; ejecuta antes `predict`", file=sys.stderr)
+        return 2
+    lab = load_lab(args.data_dir, load_gt=False)
+    pred = load_submission(predictions)
+    _explain_and_write(args, lab, pred)
     return 0
 
 
@@ -246,6 +288,7 @@ def cmd_viewer(args: argparse.Namespace) -> int:
     tags = Path(args.tags) if args.tags else asset_paths(args.data_dir)["smart_tagging"]
     metrics = Path(args.metrics) if args.metrics else output_dir / "metrics_public.json"
     user_truth = Path(args.user_truth) if args.user_truth else USER_TRUTH_PATH
+    explanations = None if args.no_explanations else (Path(args.explanations) if args.explanations else output_dir / "explanations.json")
 
     try:
         return serve_viewer(
@@ -255,6 +298,7 @@ def cmd_viewer(args: argparse.Namespace) -> int:
             tags_path=tags,
             metrics_path=metrics,
             user_truth_path=user_truth,
+            explanations_path=explanations,
             data_dir=args.data_dir,
             port=args.port,
             open_browser=not args.no_open,
@@ -281,13 +325,14 @@ def build_parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         default="all",
-        choices=["all", "predict", "evaluate", "stress", "visualize", "viewer"],
+        choices=["all", "predict", "evaluate", "stress", "visualize", "viewer", "explain"],
     )
     parser.add_argument("--data-dir", default=None, help="gated data directory (default: data/)")
     parser.add_argument("--output-dir", default=None, help="output directory (default: possession_lab/outputs)")
     parser.add_argument("--bootstrap-n", type=int, default=2000, help="bootstrap draws; 0 disables")
     parser.add_argument("--no-stress", action="store_true", help="skip the missing-ball suite")
     parser.add_argument("--no-figures", action="store_true", help="write data only, no report")
+    parser.add_argument("--no-explain", action="store_true", help="skip building outputs/explanations.json")
 
     viewer = parser.add_argument_group("viewer", "local video reviewer options")
     viewer.add_argument("--port", type=int, default=8765, help="local HTTP port (default: 8765)")
@@ -302,6 +347,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="user-truth JSON (default: outputs/user_truth.json; viewer-only, never used by the model)",
     )
+    viewer.add_argument(
+        "--explanations",
+        default=None,
+        help="switch annotations JSON (default: outputs/explanations.json)",
+    )
+    viewer.add_argument("--no-explanations", action="store_true", help="start without the annotation layer")
     viewer.add_argument("--start-frame", type=int, default=None, help="initial frame (default: public GT start)")
     viewer.add_argument("--verbose", action="store_true", help="log HTTP requests")
     return parser
@@ -321,6 +372,7 @@ def main(argv: list[str] | None = None) -> int:
         "stress": cmd_stress,
         "visualize": cmd_visualize,
         "viewer": cmd_viewer,
+        "explain": cmd_explain,
     }
     return commands[args.command](args)
 

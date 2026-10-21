@@ -160,5 +160,38 @@ class ModelTest(unittest.TestCase):
         self.assertAlmostEqual(DEFAULT_PARAMS.w_dead, 0.02)
 
 
+class StopSignalParametersTest(unittest.TestCase):
+    """Parked-at-line evidence, weight-zero by default."""
+
+    def test_new_signal_at_weight_zero_changes_nothing(self):
+        f = make_feature_namespace()
+        base = emission_log_probs(f, ModelParams())
+        with_fields = SimpleNamespace(**{**f.__dict__, "parked_edge": np.ones(7, dtype=bool)})
+        np.testing.assert_array_equal(emission_log_probs(with_fields, ModelParams()), base)
+
+    def test_parked_edge_bonus_raises_the_dead_ball_evidence(self):
+        f = make_feature_namespace()
+        parked = np.zeros(7, dtype=bool)
+        parked[0] = True
+        with_field = SimpleNamespace(**{**f.__dict__, "parked_edge": parked})
+        base = emission_log_probs(f, ModelParams())
+        boosted = emission_log_probs(with_field, ModelParams(w_parked_edge=1.5))
+        self.assertGreater(boosted[0, 2], base[0, 2])
+
+    def test_loose_stop_gate_spares_parked_frames_from_the_loose_rule(self):
+        f = make_feature_namespace()
+        f.d_home[:] = 9.0
+        f.d_away[:] = 11.0
+        f.ball_speed[:] = 0.5
+        f.last_touch[:] = -1
+        flat = emission_log_probs(f, ModelParams())
+        np.testing.assert_allclose(flat[0], np.log(1.0 / 3.0), atol=1e-12)
+        parked = np.zeros(7, dtype=bool)
+        parked[0] = True
+        with_field = SimpleNamespace(**{**f.__dict__, "parked_edge": parked})
+        gated = emission_log_probs(with_field, ModelParams(loose_stop_gate=True))
+        self.assertGreater(np.abs(gated[0] - np.log(1.0 / 3.0)).max(), 1e-3)
+
+
 if __name__ == "__main__":
     unittest.main()

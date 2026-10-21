@@ -37,6 +37,10 @@ For each frame:
 * `d_H_last`, `d_A_last`: current team shape around the last observed ball.
 * `tag_vote`, `tag_setpiece`, `tag_coverage`.
 * `player_count`: visible player slots, used for the sparse-tracking guard.
+* `parked_edge`: the ball visible within `PARKED_NEAR = 2.5 m` of a boundary at
+  `PARKED_SPEED = 1.5 m/s` or less, held for `PARKED_HOLD_S = 0.8 s` (up to 70% tracking
+  flicker inside the window is tolerated). This is the throw-in / corner / goal-kick signature;
+  observed-out frames (`out_of_play`) are included.
 
 ## Emissions
 
@@ -49,16 +53,19 @@ q_D = sigmoid((min(d_H, d_A) - d_dead) / 1.5) + 1e-12
 q_D += w_dead + w_motion * sigmoid((motion0 - team_speed) / motion_scale)
      + w_edge * sigmoid((edge0 - edge) / edge_scale)
 q_D += w_out * out_of_play
+q_D += w_parked_edge * parked_edge
 q   = [q_H, q_A, q_D] / sum(q)
 logB = log(q)
 ```
 
 The validated model sets `w_out = 1`, `w_dead = 0.02`, `w_motion = 1`, `w_edge = 0.5`,
-`motion0 = 1.6 m/s`, `motion_scale = 0.35 m/s`. The motion and edge terms are the dead-ball
-evidence model: they do not look at the ball at all, which is what lets `D` separate a stoppage
-where the ball is visible and a player is standing next to it. `w_dead` is the dead-ball base
-rate; it keeps the `D` prior independent of the scale of the team Gaussians. The speed gate is
-applied even when `gate = 0`:
+`w_parked_edge = 1.5`, `motion0 = 1.6 m/s`, `motion_scale = 0.35 m/s`. The motion and edge terms
+are the dead-ball evidence model: they do not look at the ball at all, which is what lets `D`
+separate a stoppage where the ball is visible and a player is standing next to it. The
+`parked_edge` term is the strongest single dead-ball signature measured on the public window
+(spell F1 0.6074 → 0.6857): a ball stopped within 2.5 m of a line for at least 0.8 s is a set
+piece being prepared. `w_dead` is the dead-ball base rate; it keeps the `D` prior independent of
+the scale of the team Gaussians. The speed gate is applied even when `gate = 0`:
 
 ```
 α = 1 - sigmoid((ball_speed - gate) / 2)
@@ -75,6 +82,9 @@ the transition prior carries the possession. If the ball is also slower than
 team gets `touch_p = 0.7` of the emission mass, provided the touch is younger than
 `touch_age = 125` frames (5 s). The remaining mass is split evenly over the other two states. This
 removed the false `D` stretches where a rolling or in-flight ball sits 7–10 m from both teams.
+An optional `loose_stop_gate` (off in the validated model, kept for ablations) exempts loose
+frames that carry stoppage support — `parked_edge` — from this flattening: a ball parked near a
+line is a restart waiting to be taken, not a live loose ball.
 
 Missing-ball emissions:
 
@@ -109,6 +119,35 @@ computed for diagnostics only. After decoding, a run shorter than one second tha
 the same label is absorbed by it: a few frames of `D` (or of the other team) between two equal
 labels are a tracking or ball-in-flight flicker, not a possession change. `X` is never changed.
 
+## Explanation layer (`explain.py`)
+
+The Viterbi answer to “why did the model switch here?” is “the balance of evidence moved”.
+`explain.py` rebuilds that balance for every predicted switch from the same feature windows the
+model saw and the smart tags, and renders ordered, checkable reasons:
+
+| rule | evidence shown |
+|---|---|
+| `out_of_bounds` | ball coordinates crossed the line; depth in metres, frame |
+| `parked` | longest parked-at-line run before the switch; seconds, edge distance, speed |
+| `restart` | sustained ball ramp < 1.5 m/s → ≥ 5 m/s within 2 s after the switch (measured ramps take 0.3–1.5 s, so this is a ramp rule, not a one-frame jump rule) |
+| `teams_slow` | window median team speed below 0.62 × the window median of the half |
+| `ball_missing` | tracker lost the ball ≥ 1 s around the switch |
+| `tag` | covering or nearest `SET PIECES` smart tag with type and team (other tag codes run for minutes and explain nothing) |
+| `geometry` | nearest player to the ball just after the switch, team and distance |
+| `prior` | fallback when no local signature fired: the transition prior carried the state |
+
+Switches are deduplicated below 0.5 s (flickers collapse into the first), `X` transitions are
+excluded, and each half is explained with the same 500-frame context-padded window the decode
+used, so annotations describe evidence the model actually saw. `confidence` is the emission
+probability of the entered state at the switch frame (max over ±0.5 s) **before** temporal
+smoothing: how strongly that single frame favoured it — values near 1/3 honestly say “the frame
+itself carried no evidence; the prior decided”.
+
+`explain_prediction` walks the whole match; `python -m possession_lab explain` regenerates
+`outputs/explanations.json` from any existing `predictions.csv`. `predict` and `all` build it
+automatically (`--no-explain` skips; failures never break a run). The model never reads anything
+`explain.py` produces — explanations are built downstream of the prediction.
+
 ## Local synchronized reviewer
 
 `python -m possession_lab viewer` builds a compact JSON payload from `outputs/predictions.csv`, the
@@ -119,10 +158,18 @@ server. The page is plain HTML/CSS/JS; no frontend build step or extra Python de
   `currentTime = (i + 0.5) / 25`; the displayed frame is
   `clamp(floor(currentTime * 25 + 1e-6), 0, 199318)`. The video duration is checked against
   `199,319 / 25 = 7972.76 s` when metadata loads.
-* **Payload.** Labels are compact `H/A/D/X` strings; prediction segments/spells cover both full
+* **Payload.** Labels are compact `H/A/D/X` strings; prediction segments/spells cover both the full
   graded halves, while GT segments/spells cover only the public window because the public CSV has
   `X` outside it. Changes, disagreement runs (grouped in the browser), 638 tag intervals, and
-  public metrics are included.
+  public metrics are included. When `outputs/explanations.json` exists it is folded in as
+  `switches` and `explanations_available`; the UI degrades quietly without it.
+* **Decision annotations.** Every predicted switch is a thin tick on the PRED band of both
+  timelines; ticks are hit-tested within 6 px, seeking and opening the decision card on click.
+  The card lists every switch with a clickable timestamp, the
+  `from → to` transition, the emission confidence bar, and the ordered reason chips from
+  `explain.py` — each reason's evidence frame is itself a seek button. Filters: all / → D /
+  D → / H ↔ A; `j`/`k` jump to the previous/next annotated switch; selection auto-follows
+  playback within ±1.5 s.
 * **User truth (UT).** The browser can paint `H/A/D/X` on the current frame or an anchored range,
   from the buttons or globally from the keyboard. Each label press leaves an anchor at the end of
   the written span; run boundaries are drawn on both timelines and can be dragged to move a cut.
@@ -145,10 +192,14 @@ UT scoring/persistence/editing, range parsing (`normal`, open, suffix, invalid),
 
 ## Validation
 
-* Unit tests: 32 stdlib `unittest` tests, all passing.
-* Public metrics for the current parameters: spell F1 0.6074, macro F1 0.8925,
-  D-F1 0.8584, 10 predicted spells.
-* Stress (HMM gap-aware, current parameters): clean 0.6074 / random 0.4615 / long 0.4000 spell F1.
+* Unit tests: 53 stdlib `unittest` tests (+4 subtests), all passing — including switch/reason
+  rules (`test_explain.py`), stop-signal parameter neutrality and gating (`test_model.py`), and
+  annotation payload plumbing (`test_viewer.py`).
+* Public metrics for the current parameters: spell F1 0.6857, macro F1 0.8843,
+  D-F1 0.8441, 11 predicted spells (17 in GT).
+* Stress (HMM gap-aware, current parameters): clean 0.6857 / random 0.4615 / long 0.4000 spell F1.
+* Weight-zero neutrality: with `w_parked_edge = 0` the new code
+  reproduces the previous `predictions.csv` bit-for-bit (verified before adopting the tuned row).
 * The files in `reports/data/` were produced by the pre-retune parameter set (`σ=3.0`,
   `p_dh=0.001`, no dead-ball evidence, no loose-ball rule) and are kept as history, not as an
   equality target.
@@ -173,6 +224,8 @@ full-match structural diagnostic, not a score.
 * `python -m unittest discover -s possession_lab/tests -v` runs the tests.
 * `python evaluation/validate_submission.py possession_lab/outputs/predictions.csv` runs the
   official format gate.
+* `python -m possession_lab explain` rebuilds only `outputs/explanations.json` from an existing
+  `predictions.csv`.
 * The gated `data/` bundle and generated `outputs/` are not committed.
 * No private full-match GT and no match video frames are used.
 * CPU is intentional: the 3-state Viterbi pass takes ~1.8 s; a GPU transfer would dominate.

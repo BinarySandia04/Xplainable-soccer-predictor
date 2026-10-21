@@ -44,6 +44,7 @@ Outputs are written to `possession_lab/outputs/` (git-ignored):
 
 ```
 predictions.csv          199,319 rows: frame,label
+explanations.json        per-switch "why" annotations (clickable in the viewer)
 metrics_public.json      official public metrics + bootstrap
 stress.csv               clean / random / long stress rows
 full_stats.json          full-match spell structure
@@ -92,6 +93,14 @@ What is shown:
 * Full-match overview timeline with PRED / GT / UT channels, a ±20 s detail strip, and navigation
   by label change, possession, or GT disagreement. Click or drag either timeline to seek; the
   browser's native video controls still work.
+* **Decision annotations.** Every predicted state switch is a clickable tick on both timelines and
+  a timestamped row in the "Decisiones · por qué" card: the `from → to` transition, the emission
+  confidence of the entered state, and the ordered evidence reasons from `explain.py` (ball out of
+  bounds, parked at the line, restart ramp, group walking, ball lost, `SET PIECES` tag, nearest
+  player, or the transition prior) — each reason's evidence frame is itself a seek button. Filters
+  all / → D / D → / H ↔ A; `j`/`k` jump between annotated switches; the selection auto-follows
+  playback within ±1.5 s. Annotations come from `outputs/explanations.json`, built automatically by
+  `predict` / `all` and rebuildable with `.venv/bin/python -m possession_lab explain`.
 * UT editing: press **Ancla aquí** at the start of a passage, seek to its end, then press `H`, `A`,
   or `D` to write that span; without an anchor a label applies to the current frame. `X` erases
   the span and **Borrar UT** clears everything. The same `H/A/D/X` keys work anywhere on the page
@@ -99,8 +108,8 @@ What is shown:
   written span. Anchors are drawn on both timelines; drag one to move the label boundary. The UT is
   written to `outputs/user_truth.json` after every edit and reloaded on the next session.
 * Keyboard: `Espacio` play/pause, `←/→` one frame, `Shift` + arrows one second, `[`/`]` previous/next
-  label change, `,`/`.` previous/next possession, `n`/`N` next/previous GT disagreement, `H/A/D/X`
-  user-truth labels, `Home`/`End`.
+  label change, `,`/`.` previous/next possession, `n`/`N` next/previous GT disagreement, `j`/`k`
+  previous/next annotated switch, `H/A/D/X` user-truth labels, `Home`/`End`.
 
 The tactical timeline is exact: `frame i` is row `i`, `currentTime = (i + 0.5) / 25`. The viewer
 uses the synchronized tactical video only; the unsynchronized broadcast is excluded. The 5 GB MP4
@@ -133,6 +142,10 @@ Three states: **H** (Barcelona), **A** (Atletic Club), **D** (dead ball / out of
   a stoppage, so the emission is uniform and the prior carries the possession. If it is also slower
   than `2 m/s`, the team that touched it last gets 70% of the emission mass when that touch is under
   5 s old. This removed the false `D` stretches on rolling balls and recoveries.
+* **Ball parked at a boundary.** A ball seen within `2.5 m` of a line at walking pace (`≤ 1.5 m/s`)
+  for at least `0.8 s` — tolerating tracking flicker inside the window — gets a strong dead-ball
+  bonus (`w_parked_edge = 1.5`): the throw-in / corner / goal-kick signature. It is the strongest
+  single dead-ball signal measured on the public window: spell F1 **0.6074 → 0.6857** (D-F1 −0.014).
 * **Transitions.** `p_stay=0.995`, `p_ha=0.0005`, `p_hd=0.001`, `p_dh=0.01`.
 * **Decode.** Viterbi over each graded half with a leading 500-frame context pad. Frames outside the graded
   halves are `X`. Forward–backward posteriors are computed only for diagnostics; they never change
@@ -141,14 +154,16 @@ Three states: **H** (Barcelona), **A** (Atletic Club), **D** (dead ball / out of
 
 The exact parameter dictionary is `possession_lab/config.py:MODEL_PARAMS`. The implementation is in
 `model.py` (emissions, dead-ball evidence, Viterbi, forward–backward), `features.py` (geometry,
-motion energy, gaps, tags), `data.py` (ATD/tag/homography loaders), and `pipeline.py` (inference and
+motion energy, gaps, tags), `explain.py` (per-switch reason rules and the explanation payload),
+`data.py` (ATD/tag/homography loaders), and `pipeline.py` (inference and
 CSV writing).
 
 The current default was retuned on the public window against the possession folds and the
 missing-ball stress suite: the team Gaussian widened from `σ=3.0` to `3.5`, leaving dead ball
 became ten times more likely (`p_dh` 0.001 → 0.01), the dead-ball evidence described above was
-added (`w_motion=1.0`, `w_edge=0.5`, `w_dead=0.02`), and the loose-ball rule was added
-(`loose_R=7 m`, `loose_speed=2 m/s`, `touch_p=0.7`, `touch_age=125`).
+added (`w_motion=1.0`, `w_edge=0.5`, `w_dead=0.02`), the loose-ball rule was added
+(`loose_R=7 m`, `loose_speed=2 m/s`, `touch_p=0.7`, `touch_age=125`), and the parked-at-boundary
+signal was added (`w_parked_edge=1.5`).
 
 Two alternatives were measured and rejected. A fully split decode (an independent two-state
 alive/dead HMM combined with a two-state H/A HMM) reached only 0.547 spell F1 and 0.686 macro F1 on
@@ -167,15 +182,15 @@ Public window: frames **11,185–18,684** (7,500 frames, 17 possessions).
 
 | Metric | Value |
 |---|---:|
-| Spell F1 (headline) | **0.6074** |
-| Macro F1 (H/A/D) | **0.8925** |
-| D-F1 | **0.8584** |
-| Accuracy | 0.9009 |
-| Cohen's kappa | 0.8444 |
-| Alive/dead F1 | 0.9653 |
-| Team accuracy (both alive) | 0.9441 |
-| Predicted spells | 10 (GT 17) |
-| Spell F1 95% bootstrap | [0.385, 0.779] |
+| Spell F1 (headline) | **0.6857** |
+| Macro F1 (H/A/D) | **0.8843** |
+| D-F1 | **0.8441** |
+| Accuracy | 0.8943 |
+| Cohen's kappa | 0.8342 |
+| Alive/dead F1 | 0.9610 |
+| Team accuracy (both alive) | 0.9436 |
+| Predicted spells | 11 (GT 17) |
+| Spell F1 95% bootstrap | [0.457, 0.834] |
 
 These are the values of the current run. The files under `reports/data/` record an earlier
 parameter set and are not updated by the retune. The bootstrap interval
@@ -190,9 +205,9 @@ window. The baseline is a centred H/A vote with no gap model.
 
 | Mask | Method | Spell F1 | Macro F1 | D-F1 |
 |---|---|---:|---:|---:|
-| clean | HMM gap-aware | **0.6074** | **0.8925** | **0.8584** |
+| clean | HMM gap-aware | **0.6857** | **0.8843** | **0.8441** |
 | random | HMM gap-aware | **0.4615** | **0.7976** | **0.7385** |
-| long | HMM gap-aware | **0.4000** | **0.5864** | **0.5093** |
+| long | HMM gap-aware | **0.4000** | **0.6121** | **0.5687** |
 
 The gap-aware model beats the HMM-persistence and smoothing baselines on every mask. The long-gap
 spell F1 is still slightly below the pre-retune parameter set (0.4000 vs 0.4160), and the random
@@ -203,12 +218,12 @@ boundaries survive, so the number is reported, not editorialised.
 
 ### Full submission
 
-* **199,319 rows**, frames 0–199,318, labels in `{H,A,D,X}`.
-* 186 H/A spells over 158,857 graded frames; mean 25.3 s; median 19.0 s.
-* Shares: H 42.3%, A 31.9%, D 25.8%.
+* **199,319 rows**, frames 0–199,318, labels in `{H,A,D,X}` (H 66,930 · A 50,637 · D 41,290 · X 40,462).
+* 188 H/A spells (96 first half, 92 second) over 158,857 graded frames; mean 25.0 s; median 18.6 s.
+* Shares: H 42.1%, A 31.9%, D 26.0%.
 * Official validator: `OK predictions.csv` (format only).
-* Public metrics with the pinned environment and `--bootstrap-n 2000`: spell F1 **0.6074**,
-  macro F1 **0.8925**, and D-F1 **0.8584**.
+* Public metrics with the pinned environment and `--bootstrap-n 2000`: spell F1 **0.6857**,
+  macro F1 **0.8843**, and D-F1 **0.8441**.
 
 Predictions, metric values, and seeded bootstrap intervals are reproducible from the same data
 and pinned dependencies. Wall-clock timings in `timings.json` and the HTML report naturally vary
@@ -216,8 +231,8 @@ by machine.
 
 A previous reference run reported 256 spells and H 41.4% / A 32.5% / D 26.1%; the pre-retune run
 reported 255 spells and H 40.5% / A 32.5% / D 26.9%; the previous parameter set reported 239
-spells and H 44.1% / A 34.6% / D 21.3%. The current run reports 186 spells and
-H 42.3% / A 31.9% / D 25.8%: the loose-ball rule hands a slow ball that is far from
+spells and H 44.1% / A 34.6% / D 21.3%. The current run reports 188 spells and
+H 42.1% / A 31.9% / D 26.0%: the loose-ball rule hands a slow ball that is far from
 every player back to the team that touched it last, instead of calling a stoppage, so the D share
 falls and more possessions are found. Separately, the earlier difference was a 747-frame tracking
 blackout at the end of the first half (frames 89,905–90,651): no home players and only 1–3 away
@@ -258,12 +273,13 @@ possession_lab/
   data.py         ATD / smart-tag / homography / GT loaders
   features.py     distances, gap, edge, last touch, sparse-player count, tags
   model.py        emissions, Viterbi, forward-backward
+  explain.py      per-switch reason rules and the viewer explanation payload
   evaluate.py     official metrics, stress masks, full-match stats
   pipeline.py     full-match inference, CSV writing, preflight
   visualize.py    eight figures + HTML report
   viewer.py       local reviewer: UT editor, stats, byte-range streaming
   viewer_assets/  index.html, viewer.css, viewer.js (no build step)
-  cli.py          all / predict / evaluate / stress / visualize / viewer
+  cli.py          all / predict / explain / evaluate / stress / visualize / viewer
   tests/          stdlib unittest suite
   outputs/        generated, git-ignored
 ```
