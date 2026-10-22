@@ -532,19 +532,23 @@ class FrameStore:
         ball_pixel = _project(self.homography, frame, ex, ey, self.tracking.pitch) if has_estimate else None
 
         trail: list[list[float | int]] = []
+        trail_pitch: list[list[float | int]] = []
         start = max(0, frame - self.trail_frames + 1)
         for k in range(start, frame + 1):
             if int(self.track.source[k]) == 2:
                 trail = []
+                trail_pitch = []
                 continue
             point = self.track.estimate[k]
             if not (np.isfinite(point[0]) and np.isfinite(point[1])):
                 continue
+            source_k = int(self.track.source[k])
+            trail_pitch.append([round(float(point[0]), 2), round(float(point[1]), 2), source_k])
             pixel = _project(
                 self.homography, k, float(point[0]), float(point[1]), self.tracking.pitch
             )
             if pixel is not None:
-                trail.append([pixel[0], pixel[1], int(self.track.source[k])])
+                trail.append([pixel[0], pixel[1], source_k])
 
         players: list[dict[str, Any]] = []
         players_xy = self.tracking.players[frame]
@@ -558,14 +562,12 @@ class FrameStore:
             if not (np.isfinite(x) and np.isfinite(y)):
                 continue
             pixel = _project(self.homography, frame, x, y, self.tracking.pitch)
-            if pixel is None:
-                continue
             players.append(
                 {
                     "x": round(x, 2),
                     "y": round(y, 2),
-                    "px": pixel[0],
-                    "py": pixel[1],
+                    "px": pixel[0] if pixel is not None else None,
+                    "py": pixel[1] if pixel is not None else None,
                     "team": int(teams[index]) if index < len(teams) else -1,
                     "speed": _finite(speeds[index]) if np.isfinite(speeds[index]) else None,
                 }
@@ -578,6 +580,10 @@ class FrameStore:
             "time_s": round(frame / FPS, 3),
             "video_width": VIDEO_WIDTH,
             "video_height": VIDEO_HEIGHT,
+            "pitch": {
+                "length": float(self.tracking.pitch[0]),
+                "width": float(self.tracking.pitch[1]),
+            },
             "ball": {
                 "present": raw_present,
                 "source": source,
@@ -594,6 +600,7 @@ class FrameStore:
                 ),
             },
             "trail": trail,
+            "trail_pitch": trail_pitch,
             "players": players,
             "features": self._features_payload(frame),
             "active_events": self._active_events(frame),

@@ -29,6 +29,24 @@ The validated configuration uses the tactical audio through the event layer, not
 whistle emission weight. If the MP4 or ffmpeg is unavailable, whistle support is empty and the
 event layer still uses visible out-of-play balls, missing-ball last edges, and tags.
 
+### Tracking representation
+
+The ATD is an optical-tracking export, not a per-player identity feed. Every one of the 199,319
+rows has exactly **46 player slots**; a slot is `NaN` when that track is not visible. Coordinates
+are normalised and scaled to **105.3 × 68 m**; `frame_id - 1` is the video frame. The XML assigns
+**24 slots to Barcelona and 22 to Athletic Club**, but it contains no reliable jersey identity.
+The median frame has 21 visible slots; the maximum is 35. The active count is not a fixed 11v11:
+there are more than 11 home tracks in 22,859 frames (max 24) and more than 11 away tracks in 8,905
+frames (max 15). These extras are likely substitutes, staff, or provider duplicates. The viewer
+draws every visible slot and labels it with the XML team; the model only uses aggregate
+nearest-player/team distances and never claims an identity.
+
+The ball is observed in **113,488 frames (56.94%)**, estimated for short holes in **4,441
+(2.23%)**, and has no estimate in **81,390 (40.83%)**. `balltrack.py` is causal: source `0` is an
+observation, source `1` is an extrapolation capped at 1.2 s, and source `2` is a long gap where
+the viewer draws no ball. This is why an amber ring can disagree with the video by design, and why
+the top-view map marks observed and estimated balls differently.
+
 ## Pipeline
 
 ```text
@@ -330,14 +348,25 @@ required. `imageio-ffmpeg` is only used by the offline audio extractor, not by t
   stoppages, and ball-gap runs are included. When `outputs/explanations.json` exists it is folded
   in as `switches` and `explanations_available`; the UI degrades quietly without it.
 * **Per-frame explorer.** `GET /api/frame?frame=N` returns one compact payload built by
-  `FrameStore`: projected 1920×1080 player/ball pixels, the ball's raw and tracked state, a
-  ~1 s trail, the feature slice (team/ball speed, edge, gap, near player/team, last touch,
+  `FrameStore`: pitch size, projected 1920×1080 player/ball pixels (`px`/`py` may be `null`),
+  raw pitch coordinates, the ball's raw and tracked state, a ~1 s projected trail and
+  `trail_pitch`, the feature slice (team/ball speed, edge, gap, near player/team, last touch,
   whistle score/envelope, event masks), and active events. The browser never receives the
   199k-frame tracking arrays. If tracking is unavailable the endpoint returns a JSON 404 and the
   viewer still shows the labels and timelines.
 * **Overlay.** Players are projected with the frame's homography; the ball is a white ring when
   observed, a dashed amber ring when the tracker is filling a short hole, and red when beyond the
-  pitch. The `Seguimiento` checkbox toggles the canvas.
+  pitch. The `Seguimiento` checkbox toggles the canvas. The canvas now lives inside a
+  `.video-frame` wrapper that contains the video only, so the global `canvas { height: 100% }`
+  rule cannot stretch it over the caption. Measured video and overlay rectangles match
+  (`1139.4 × 640.9` CSS px); before the wrapper the overlay was `1139.4 × 678.5`.
+* **Top-view map.** A second native canvas under the video draws the pitch boundary, halfway
+  line, centre circle, penalty/six-yard boxes, spots, goals, all visible player slots, the
+  observed/estimated ball, and the pitch-space trail. It reads `pitch`, `players[].x/y`,
+  `ball.ex/ey`, and `trail_pitch`; it never calls the homography or the video. The plot is
+  `105.3 × 68 m` with a `660 px` maximum width, a legend, and a live status line
+  (`frame · slots · balón source · gap`). Observed is solid white, estimated is dashed amber,
+  out-of-play is red, and source `2` draws no ball.
 * **Decision annotations.** Every predicted switch is a thin tick on the PRED band of both
   timelines; ticks are hit-tested within 6 px, seeking and opening the decision card on click.
   The card lists every switch with a clickable timestamp, the `from → to` transition, the
@@ -362,14 +391,15 @@ required. `imageio-ffmpeg` is only used by the offline audio extractor, not by t
 
 The reviewer is covered by `tests/test_viewer.py`: payload semantics, public-only GT behavior,
 UT scoring/persistence/editing, range parsing (`normal`, open, suffix, invalid), HTTP
-`206`/`416`/`HEAD`, API payload, per-frame payload/404, and unknown-route rejection.
+`206`/`416`/`HEAD`, API payload, per-frame payload/404, top-view pitch/trail payload, and
+unknown-route rejection.
 
 ## Validation
 
-* Unit tests: **74 stdlib `unittest` tests (+4 subtests)**, all passing — including switch/reason
+* Unit tests: **75 stdlib `unittest` tests (+4 subtests)**, all passing — including switch/reason
   rules (`test_explain.py`), stop-signal parameter neutrality and gating (`test_model.py`),
   tracker/audio/event units (`test_balltrack.py`, `test_audio.py`, `test_events.py`), and
-  annotation/frame-explorer plumbing (`test_viewer.py`).
+  annotation/frame-explorer/top-view plumbing (`test_viewer.py`).
 * Public metrics for the final parameters: spell F1 **0.6519**, macro F1 **0.9466**, D-F1
   **0.9727**, accuracy 0.9417, kappa 0.9083, alive/dead F1 0.9933, team accuracy (both alive)
   0.9404, 10 predicted spells (17 in GT). The 95% spell-F1 bootstrap is [0.430, 0.817].
@@ -382,8 +412,12 @@ UT scoring/persistence/editing, range parsing (`normal`, open, suffix, invalid),
   `video sincronizado`; seeking to frame 46,691 reached `currentTime=1867.66` and displayed
   `GOL · trajectory`; play advanced the frame counter and `currentTime`; frame 157,825 showed
   `GOL · celebration`, frame 15,888 showed `PARADA · whistle`; the overlay canvas and frame
-  explorer rendered. A 5 s virtual-time screenshot stalls media metadata in headless Chrome; the
-  CDP run is the authoritative browser evidence.
+  explorer rendered. After wrapping the video, the measured video and overlay rectangles both
+  read `1139.4 × 640.9` CSS px; a frame-12,000 screenshot placed the projected dots on the
+  players and the ball ring on the ball. The top-view canvas measured `658 × 424`, was non-blank,
+  and reported `22 slots visibles · balón observado` at frame 12,000 and `21 slots visibles ·
+  balón estimado · hueco 0.84 s` at frame 12,851. A 5 s virtual-time screenshot stalls media
+  metadata in headless Chrome; the CDP run is the authoritative browser evidence.
 * Submission: 199,319 rows, frames 0–199,318, official validator `OK`, `n_runs=305`.
 
 ## Full-match reconciliation

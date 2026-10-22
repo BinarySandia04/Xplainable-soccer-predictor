@@ -27,6 +27,9 @@
     video: $("#video"),
     overlay: $("#overlay"),
     overlayToggle: $("#overlayToggle"),
+    pitchMap: $("#pitchMap"),
+    pitchStatus: $("#pitchStatus"),
+    pitchEmpty: $("#pitchEmpty"),
     videoError: $("#videoError"),
     syncState: $("#syncState"),
     clock: $("#clock"),
@@ -384,7 +387,195 @@
     return { ctx, width: rect.width, height: rect.height };
   }
 
+  function fitPitchMap() {
+    const rect = ui.pitchMap.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return null;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const width = Math.round(rect.width * dpr);
+    const height = Math.round(rect.height * dpr);
+    if (ui.pitchMap.width !== width || ui.pitchMap.height !== height) {
+      ui.pitchMap.width = width;
+      ui.pitchMap.height = height;
+    }
+    const ctx = ui.pitchMap.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { ctx, width: rect.width, height: rect.height };
+  }
+
+  function drawPitchMap() {
+    const fitted = fitPitchMap();
+    if (!fitted) return;
+    const { ctx, width, height } = fitted;
+    ctx.clearRect(0, 0, width, height);
+
+    const data = state.data;
+    const frameData =
+      state.frameData && state.frameData.frame === state.frame ? state.frameData : null;
+    const pitch = (frameData && frameData.pitch) || { length: 105.3, width: 68 };
+    const length = Number(pitch.length) || 105.3;
+    const pitchWidth = Number(pitch.width) || 68;
+    const pad = Math.max(12, Math.min(width, height) * 0.035);
+    const scale = Math.min((width - 2 * pad) / length, (height - 2 * pad) / pitchWidth);
+    const drawWidth = length * scale;
+    const drawHeight = pitchWidth * scale;
+    const left = (width - drawWidth) / 2;
+    const top = (height - drawHeight) / 2;
+    const xOf = (x) => left + x * scale;
+    const yOf = (y) => top + y * scale;
+    const line = "rgba(220, 238, 228, 0.56)";
+
+    ctx.fillStyle = "#08160e";
+    ctx.fillRect(0, 0, width, height);
+    ctx.fillStyle = "#0d2919";
+    ctx.fillRect(left, top, drawWidth, drawHeight);
+    for (let stripe = 0; stripe < 12; stripe += 2) {
+      ctx.fillStyle = "rgba(255, 255, 255, 0.018)";
+      ctx.fillRect(left + (stripe * drawWidth) / 12, top, drawWidth / 12, drawHeight);
+    }
+
+    ctx.save();
+    ctx.strokeStyle = line;
+    ctx.lineWidth = 1.2;
+    ctx.strokeRect(left + 0.5, top + 0.5, drawWidth - 1, drawHeight - 1);
+    ctx.beginPath();
+    ctx.moveTo(xOf(length / 2), top);
+    ctx.lineTo(xOf(length / 2), top + drawHeight);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(xOf(length / 2), yOf(pitchWidth / 2), 9.15 * scale, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(xOf(length / 2), yOf(pitchWidth / 2), 0.7 * scale, 0, Math.PI * 2);
+    ctx.fillStyle = line;
+    ctx.fill();
+
+    const box = (x, boxWidth, boxHeight) => {
+      ctx.strokeRect(
+        xOf(x),
+        yOf((pitchWidth - boxHeight) / 2),
+        boxWidth * scale,
+        boxHeight * scale,
+      );
+    };
+    box(0, 16.5, 40.32);
+    box(length - 16.5, 16.5, 40.32);
+    box(0, 5.5, 18.32);
+    box(length - 5.5, 5.5, 18.32);
+    for (const spotX of [11, length - 11]) {
+      ctx.beginPath();
+      ctx.arc(xOf(spotX), yOf(pitchWidth / 2), 0.45 * scale, 0, Math.PI * 2);
+      ctx.fillStyle = line;
+      ctx.fill();
+    }
+    ctx.strokeStyle = "rgba(240, 248, 255, 0.85)";
+    ctx.lineWidth = 2.4;
+    for (const goalX of [0, length]) {
+      ctx.beginPath();
+      ctx.moveTo(xOf(goalX), yOf(pitchWidth / 2 - 3.66));
+      ctx.lineTo(xOf(goalX), yOf(pitchWidth / 2 + 3.66));
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(left, top, drawWidth, drawHeight);
+    ctx.clip();
+
+    const trail = (frameData && frameData.trail_pitch) || [];
+    if (trail.length > 1) {
+      ctx.lineWidth = 1.5;
+      for (let index = 1; index < trail.length; index++) {
+        const previous = trail[index - 1];
+        const current = trail[index];
+        const alpha = 0.12 + (0.5 * index) / trail.length;
+        ctx.strokeStyle =
+          current[2] === 1 ? `rgba(255, 200, 87, ${alpha})` : `rgba(255, 255, 255, ${alpha})`;
+        ctx.beginPath();
+        ctx.moveTo(xOf(previous[0]), yOf(previous[1]));
+        ctx.lineTo(xOf(current[0]), yOf(current[1]));
+        ctx.stroke();
+      }
+    }
+
+    const playerRadius = clamp(width * 0.0042, 3.5, 6);
+    for (const player of (frameData && frameData.players) || []) {
+      const x = xOf(player.x);
+      const y = yOf(player.y);
+      if (x < left - 8 || x > left + drawWidth + 8 || y < top - 8 || y > top + drawHeight + 8) continue;
+      const color = player.team === 0 ? COLORS.H : player.team === 1 ? COLORS.A : "#c8d6e5";
+      ctx.beginPath();
+      ctx.arc(x, y, playerRadius, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.9;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.72)";
+      ctx.stroke();
+    }
+
+    const ball = (frameData && frameData.ball) || {};
+    if (ball.ex !== null && ball.ex !== undefined && ball.ey !== null && ball.ey !== undefined) {
+      const x = xOf(ball.ex);
+      const y = yOf(ball.ey);
+      const estimated = ball.source === 1;
+      const outside = ball.out_of_play;
+      const radius = clamp(width * 0.0068, 6, 10);
+      ctx.beginPath();
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = outside ? "#ff6b5f" : estimated ? "#ffc857" : "rgba(255, 255, 255, 0.96)";
+      if (estimated) ctx.setLineDash([3, 2]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.arc(x, y, 2.6, 0, Math.PI * 2);
+      ctx.fillStyle = outside ? "#ff6b5f" : "#ffffff";
+      ctx.fill();
+    }
+    ctx.restore();
+
+    if (!data) {
+      ui.pitchEmpty.textContent = "Cargando datos del partido…";
+      ui.pitchEmpty.classList.remove("hidden");
+      ui.pitchStatus.textContent = "Cargando seguimiento…";
+    } else if (!data.tracking_available) {
+      ui.pitchEmpty.textContent = "Seguimiento no disponible: faltan el ATD o sus metadatos.";
+      ui.pitchEmpty.classList.remove("hidden");
+      ui.pitchStatus.textContent = "Seguimiento no disponible";
+    } else if (!frameData) {
+      ui.pitchEmpty.textContent = `Cargando frame ${formatFrame(state.frame)}…`;
+      ui.pitchEmpty.classList.remove("hidden");
+      ui.pitchStatus.textContent = `frame ${formatFrame(state.frame)} · cargando seguimiento…`;
+    } else {
+      ui.pitchEmpty.classList.add("hidden");
+      const ballState = sourceText((frameData.ball || {}).source);
+      const gap = Number((frameData.ball || {}).gap_s);
+      const gapText = Number.isFinite(gap) && gap > 0 ? ` · hueco ${gap.toFixed(2)} s` : "";
+      ui.pitchStatus.textContent = `frame ${formatFrame(frameData.frame)} · ${frameData.players.length} slots visibles · balón ${ballState}${gapText}`;
+      ui.pitchMap.setAttribute(
+        "aria-label",
+        `Vista cenital frame ${frameData.frame}: ${frameData.players.length} slots, balón ${ballState}.`,
+      );
+    }
+
+    const lengthLabel = length.toFixed(1).replace(".", ",");
+    const widthLabel = pitchWidth.toFixed(1).replace(".", ",");
+    drawText(ctx, `x: 0 → ${lengthLabel} m`, left + 5, top + 12, {
+      size: 8,
+      weight: 500,
+      color: "rgba(220, 238, 228, 0.48)",
+    });
+    drawText(ctx, `y: 0 → ${widthLabel} m`, left + 5, top + drawHeight - 7, {
+      size: 8,
+      weight: 500,
+      color: "rgba(220, 238, 228, 0.48)",
+    });
+  }
+
   function drawOverlay() {
+    drawPitchMap();
     const fitted = fitOverlay();
     if (!fitted) return;
     const { ctx, width, height } = fitted;
@@ -417,6 +608,9 @@
     }
 
     for (const player of frameData.players || []) {
+      if (player.px === null || player.px === undefined || player.py === null || player.py === undefined) {
+        continue;
+      }
       const color =
         player.team === 0 ? COLORS.H : player.team === 1 ? COLORS.A : "#c8d6e5";
       ctx.beginPath();

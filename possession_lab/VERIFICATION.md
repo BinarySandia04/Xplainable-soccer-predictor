@@ -7,7 +7,7 @@ Unless noted, commands run from the repository root.
 
 ```text
 $ .venv/bin/python -m pytest -q possession_lab/tests
-74 passed, 4 subtests passed in 6.28s
+75 passed, 4 subtests passed in 4.79s
 
 $ .venv/bin/python -m compileall -q possession_lab
 $ node --check possession_lab/viewer_assets/viewer.js
@@ -18,8 +18,9 @@ The suite covers ATD/tag/homography parsing, feature geometry and gap state, bal
 whistle scoring/cache fallbacks, goal/stoppage detection and overrides, HMM emissions and
 Viterbi/posterior consistency, sparse tracking, official metric wiring, stress masks, full-match
 structure, CSV writing, preflight validation, the explanation layer, and the local viewer
-(payload, public-only GT band, per-frame `/api/frame`, UT scoring/editing/persistence and boundary
-moves, byte ranges, HTTP 206/416/HEAD, API, and route whitelist).
+(payload, public-only GT band, per-frame `/api/frame`, top-view pitch/trail payload, UT
+scoring/editing/persistence and boundary moves, byte ranges, HTTP 206/416/HEAD, API, and route
+whitelist).
 
 ## Regenerated outputs
 
@@ -145,7 +146,12 @@ changes / disagreements    304 changes
 tags                       638 intervals
 events / ball gaps          70 / 149
 switches / explanations    298 / true
-GET /api/frame?frame=12851 200
+GET /api/frame?frame=12851 200  3,230 bytes
+  keys                      active_events, available, ball, features, fps, frame,
+                            pitch, players, trail, trail_pitch, time_s,
+                            video_height, video_width
+  pitch / players           105.3 × 68.0 m / 21 slots
+  trails                    25 projected / 25 pitch-space points
 GET /video Range: bytes=0-1023
                            206  1,024 bytes
 Content-Range              bytes 0-1023/5222307334
@@ -158,8 +164,17 @@ Browser checks:
 
 * Metadata loaded: `readyState=4`, duration `7972.76 s`; initial frame 12,851 at
   `currentTime=514.06` with status `video sincronizado`.
-* Overlay: canvas `1139×641`; frame 12,851 showed 21 projected players and the estimated ball at
-  `30.98, 55.79 m`; the ball gap was `0.84 s (21 f)`, ball state `estimado`.
+* Overlay: video and overlay rectangles both measured `1139.4 × 640.9` CSS px after moving the
+  canvas into the `.video-frame` wrapper. Before the fix the overlay was `1139.4 × 678.5` because
+  the global `canvas { height: 100% }` filled the whole video card, including the caption.
+* Frame 12,000: 22 projected players, observed ball; a screenshot showed the projected dots on
+  the players and the white ball ring on the ball.
+* Frame 12,851: 21 projected players and the estimated ball at `30.98, 55.79 m`; the ball gap was
+  `0.84 s (21 f)`, ball state `estimado`.
+* Top-view map: canvas `658 × 424` CSS px, non-blank; frame 12,000 status `22 slots visibles ·
+  balón observado`, frame 12,851 status `21 slots visibles · balón estimado · hueco 0.84 s`.
+  The map uses `pitch`, `players[].x/y`, `ball.ex/ey`, and `trail_pitch`; it does not read video
+  pixels or call the homography.
 * Explorer at 12,851: `Jugador cerca —`, `Dist. a línea —`, `Vel. equipos 3.79 m/s`, last touch
   `Barcelona · 0.84 s`, event `juego abierto` (the stop begins on 12,852).
 * Seeking through the UI's own Go button to frame 46,691 moved video `currentTime` to `1867.66`
@@ -171,6 +186,26 @@ Browser checks:
   both timelines.
 * A headless screenshot with only a short virtual-time budget stalls video metadata (media time
   does not advance under virtual time); the CDP run is the authoritative browser evidence.
+
+## Tracking data audit
+
+The audit is deliberately about the supplied ATD, not about the viewer's rendering:
+
+```text
+rows                        199,319; every row has exactly 46 player tokens
+team slots                  24 Barcelona, 22 Athletic Club
+visible slots (median)      21; min 1; max 35
+home > 11 in                22,859 frames (max 24)
+away > 11 in                 8,905 frames (max 15)
+ball observed               113,488 (56.94%)
+ball estimated               4,441 (2.23%)
+ball without estimate       81,390 (40.83%)
+```
+
+The viewer therefore shows anonymous tracking slots, not a guaranteed active XI. The extra slots
+are not filtered; the model's nearest-player/team features use every present slot. No ReID,
+jersey OCR, or identity assignment is performed. This is the main reason a dot can occasionally
+look like the “wrong” player, and why the GUI must not be read as a named-player tracker.
 
 ## Data / privacy check
 

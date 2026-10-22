@@ -16,6 +16,7 @@ import numpy as np
 from possession_lab.config import A, D, H, X
 from possession_lab.data import TagEvent
 from possession_lab.viewer import (
+    FrameStore,
     build_user_truth_data,
     build_viewer_data,
     load_user_truth,
@@ -151,6 +152,69 @@ class ViewerDataTest(unittest.TestCase):
         self.assertEqual(data["pred_spells"], [[2, 8, H]])
         self.assertEqual(data["disagreements"], [])
         self.assertEqual(data["start_frame"], 5)
+
+
+class FrameStoreTopViewTest(unittest.TestCase):
+    def test_payload_carries_pitch_coordinates_and_trail_for_top_view(self):
+        tracking = SimpleNamespace(
+            n_frames=3,
+            ball=np.array([[10.0, 20.0], [np.nan, np.nan], [np.nan, np.nan]], dtype=np.float32),
+            ball_present=np.array([True, False, False]),
+            players=np.array(
+                [
+                    [[10.0, 20.0], [30.0, 40.0]],
+                    [[11.0, 21.0], [np.nan, np.nan]],
+                    [[12.0, 22.0], [np.nan, np.nan]],
+                ],
+                dtype=np.float32,
+            ),
+            speeds=np.zeros((3, 2), dtype=np.float32),
+            player_present=np.array([[True, True], [True, False], [True, False]]),
+            teams=np.array([0, 1], dtype=np.int8),
+            pitch=(105.3, 68.0),
+        )
+        homography = SimpleNamespace(
+            matrices=np.repeat(
+                np.array([[[1920.0, 0.0, 0.0], [0.0, 1080.0, 0.0], [0.0, 0.0, 1.0]]]),
+                3,
+                axis=0,
+            )
+        )
+        track = SimpleNamespace(
+            source=np.array([0, 1, 2], dtype=np.int8),
+            estimate=np.array([[10.0, 20.0], [11.0, 21.0], [np.nan, np.nan]], dtype=np.float32),
+            confidence=np.array([1.0, 0.4, 0.0], dtype=np.float32),
+            gap_s=np.array([0.0, 0.04, 0.08], dtype=np.float32),
+            out_of_play=np.zeros(3, dtype=bool),
+        )
+        store = FrameStore(
+            tracking,
+            homography,
+            track,
+            SimpleNamespace(goals=(), stoppages=()),
+            SimpleNamespace(start=0),
+            trail_frames=3,
+        )
+        payload = store.frame_payload(1)
+        self.assertAlmostEqual(payload["pitch"]["length"], 105.3)
+        self.assertAlmostEqual(payload["pitch"]["width"], 68.0)
+        self.assertEqual(payload["players"][0]["x"], 11.0)
+        self.assertEqual(payload["players"][0]["y"], 21.0)
+        self.assertAlmostEqual(payload["players"][0]["px"], 11.0 / 105.3 * 1920.0, places=1)
+        self.assertAlmostEqual(payload["players"][0]["py"], 21.0 / 68.0 * 1080.0, places=1)
+        self.assertEqual(payload["ball"]["ex"], 11.0)
+        self.assertEqual(payload["trail_pitch"], [[10.0, 20.0, 0], [11.0, 21.0, 1]])
+
+        # The map is independent of video projection: a broken homography removes pixels
+        # but keeps the pitch coordinates and pitch-space trail intact.
+        homography.matrices[1] = np.nan
+        payload = store.frame_payload(1)
+        self.assertIsNone(payload["players"][0]["px"])
+        self.assertIsNone(payload["players"][0]["py"])
+        self.assertIsNone(payload["ball"]["px"])
+        self.assertEqual(payload["players"][0]["x"], 11.0)
+        self.assertEqual(payload["ball"]["ex"], 11.0)
+        self.assertEqual(payload["trail_pitch"], [[10.0, 20.0, 0], [11.0, 21.0, 1]])
 
 
 class UserTruthTest(unittest.TestCase):

@@ -110,6 +110,12 @@ What is shown:
   causal tracker is extrapolating a short hole, and a red ring when it is beyond the pitch. The
   last ~1 s of ball positions is drawn as a fading trail. The `Seguimiento` checkbox toggles the
   overlay.
+* **Mapa cenital.** A separate pitch canvas under the video draws the same frame directly from
+  ATD metres, with **no homography and no video dependency**: pitch lines, blue/red player slots,
+  observed ball, estimated ball, and the ~1 s trail. It is the honest view of what the model sees
+  when the broadcast projection does not match. The 46 slots are anonymous; colour is the team in
+  the XML, not a player identity. A solid white ring is an observation; a dashed amber ring is a
+  causal estimate of at most 1.2 s; no ring means a long gap.
 * **Dataset explorer.** A frame card shows the ball source/coordinates, ball and team speed,
   nearest player and distance, distance to the line, ball gap, last touch and age, and the active
   goal/stoppage event. This is computed from the same full-match feature arrays the model used,
@@ -143,9 +149,28 @@ The tactical timeline is exact: `frame i` is row `i`, `currentTime = (i + 0.5) /
 uses the synchronized tactical video only; the unsynchronized broadcast is excluded. The 5 GB MP4
 is streamed with HTTP byte ranges, so only the requested header/tail and playback ranges are read.
 The server (`/api/frame?frame=N`) returns one compact JSON frame with projected player/ball
-positions, the trail, the feature slice, and active events. The frontend is plain HTML/CSS/JS; the
+positions (`px`/`py` are nullable), pitch size, the projected trail, the pitch-space trail
+(`trail_pitch`), the feature slice, and active events. The map uses `pitch` and `trail_pitch`
+only, so it remains usable if a homography is missing. The frontend is plain HTML/CSS/JS; the
 server is Python's standard library HTTP server. `imageio-ffmpeg` is only needed by the offline
 audio extractor, not by the viewer page.
+
+## Tracking representation
+
+The viewer and the model consume Metrica's ATD export, not an in-browser detector. `data.py`
+reads **46 fixed player slots** per frame, scales the ATD's normalised coordinates to a
+**105.3 × 68 m** pitch, and maps `frame_id - 1` to the video frame. Team labels come from the XML
+metadata; the slots are anonymous and no jersey/identity is inferred. The file has 24 Barcelona
+slots and 22 Athletic slots, and the active count varies (median 21); some frames contain more
+than 11 tracks per team, so the viewer shows every visible slot rather than pretending to know
+the active XI. The model only uses aggregate nearest-player/team geometry from those slots.
+
+The ball is observed directly from the ATD; `balltrack.py` adds a causal tracker. Source `0` is
+an observation, source `1` a short-gap extrapolation capped at 1.2 s, and source `2` a long gap
+with no estimate. Over the full file: **113,488 observed (56.94%)**, **4,441 estimated (2.23%)**,
+and **81,390 without an estimate (40.83%)**. That missing/estimated fraction is why the ball can
+look “wrong” against the video even when the code is working: an amber ring is a guess and no ring
+is an explicit refusal to guess.
 
 ## What the model does
 
@@ -342,11 +367,22 @@ possession_lab/
 * `writing-plans` — implementation plan and acceptance criteria
 * `test-driven-development` — tests for loaders, features, tracker, audio, events, HMM, metrics
 * `verification-before-completion` — official validator, browser smoke test, and test evidence
+* `systematic-debugging` — isolated the overlay stretch to `canvas { height: 100% }` filling the
+  whole video card (including the caption), instead of guessing at the tracker
+* `frontend-ui-engineering` — the native top-view canvas card, responsive layout, legend, and
+  keyboard/touch-safe viewer wiring
+* `browser-testing-with-devtools` — measured video/overlay rectangles and checked the map at
+  frames 12,000 and 12,851 with Chrome DevTools
 
 ## Limitations
 
 * The public GT has 17 possessions; the confidence interval is wide.
-* The ATD has 46 anonymous player slots. The model never infers player identity.
+* The ATD has 46 anonymous player slots (24 Barcelona / 22 Athletic). It is not a guaranteed
+  11v11 active lineup: some frames contain more than 11 tracks per team (extra/substitute/staff
+  tracks or provider duplicates; up to 35 visible slots). The viewer shows all visible slots, and
+  the model's nearest-team distances use all present slots. The model never infers player identity.
+* The ball is not observed for 43.06% of the full file (2.23% estimated, 40.83% no estimate), so
+  an overlay comparison on those frames is testing the tracker's gap policy, not its projection.
 * Smart tags cover 70.1% of the full recording (75.5% of the public window), and their team vote is
   weak; every throw-in is `N/A`.
 * The model is tuned on the public window. The full match is a generalization check, not a
