@@ -29,7 +29,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 
@@ -44,12 +44,14 @@ from .config import (
     H,
     LABEL_TO_CODE,
     N_FRAMES,
+    PITCH,
     PUBLIC_GT_PATH,
     PUBLIC_START,
     PUBLIC_STOP,
     ROOT,
     SOURCE,
     USER_TRUTH_PATH,
+    WHISTLE_CACHE,
     X,
     asset_paths,
 )
@@ -96,6 +98,19 @@ def _metrics_payload(metrics: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _event_payload(events: Any | None) -> list[dict[str, Any]]:
+    """Compact goal/stoppage markers for the timelines."""
+    if events is None:
+        return []
+    payload: list[dict[str, Any]] = []
+    for goal in getattr(events, "goals", ()):
+        payload.append(goal.to_dict())
+    for stop in getattr(events, "stoppages", ()):
+        payload.append(stop.to_dict())
+    payload.sort(key=lambda item: int(item.get("frame", item.get("start", 0))))
+    return payload
+
+
 def build_viewer_data(
     pred: np.ndarray,
     gt: np.ndarray | None = None,
@@ -107,6 +122,9 @@ def build_viewer_data(
     public: tuple[int, int] = (PUBLIC_START, PUBLIC_STOP),
     start_frame: int | None = None,
     explanations: dict[str, Any] | None = None,
+    events: Any | None = None,
+    ball_gaps: list[list[int]] | None = None,
+    tracking_available: bool = False,
 ) -> dict[str, Any]:
     """Build the compact payload consumed by the browser.
 
@@ -210,6 +228,9 @@ def build_viewer_data(
         "metrics": metric_payload,
         "switches": switches,
         "explanations_available": bool(switches),
+        "tracking_available": bool(tracking_available),
+        "events": _event_payload(events),
+        "ball_gaps": [[int(a), int(b)] for a, b in (ball_gaps or ())],
     }
 
 
@@ -310,6 +331,9 @@ def load_viewer_data(
     user_truth_path: str | Path | None = USER_TRUTH_PATH,
     explanations_path: str | Path | None = EXPLANATIONS_PATH,
     start_frame: int | None = None,
+    events: Any | None = None,
+    ball_gaps: list[list[int]] | None = None,
+    tracking_available: bool = False,
 ) -> dict[str, Any]:
     """Read the generated CSV outputs and build the viewer payload."""
     pred = load_submission(predictions_path)
@@ -341,6 +365,9 @@ def load_viewer_data(
         metrics=metrics,
         start_frame=start_frame,
         explanations=explanations,
+        events=events,
+        ball_gaps=ball_gaps,
+        tracking_available=tracking_available,
     )
     data.update(build_user_truth_data(pred, load_user_truth(user_truth_path, pred.size)))
     return data
@@ -349,6 +376,228 @@ def load_viewer_data(
 def tactical_video_path(data_dir: str | Path | None = None) -> Path:
     """Return the tactical MP4 next to the gated ATD files."""
     return asset_paths(data_dir)["atd_raw"].with_name(f"{GAME}_{SOURCE}.mp4")
+
+
+# The tactical broadcast is 1920x1080.  The homography maps normalised pitch coordinates
+# (x / length, y / width) to these pixels, so one projection works for every frame.
+VIDEO_WIDTH = 1920
+VIDEO_HEIGHT = 1080
+
+
+def _finite(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
+def _project(
+    homography: Any,
+    frame: int,
+    x: float,
+    y: float,
+    pitch: tuple[float, float] = PITCH,
+) -> list[float] | None:
+    """Project a pitch position to video pixels with that frame's homography."""
+    matrices = getattr(homography, "matrices", None)
+    if matrices is None or frame < 0 or frame >= len(matrices):
+        return None
+    matrix = np.asarray(matrices[frame], dtype=np.float64)
+    if matrix.shape != (3, 3):
+        return None
+    length, width = pitch
+    xn, yn = float(x) / length, float(y) / width
+    denominator = matrix[2, 0] * xn + matrix[2, 1] * yn + matrix[2, 2]
+    if abs(denominator) < 1e-9:
+        return None
+    px = (matrix[0, 0] * xn + matrix[0, 1] * yn + matrix[0, 2]) / denominator
+    py = (matrix[1, 0] * xn + matrix[1, 1] * yn + matrix[1, 2]) / denominator
+    if not (np.isfinite(px) and np.isfinite(py)):
+        return None
+    return [round(float(px), 1), round(float(py), 1)]
+
+
+def ball_gap_runs(track: Any, min_frames: int = 1) -> list[list[int]]:
+    """Half-open runs where the tracker has no ball observation."""
+    observed = np.asarray(getattr(track, "observed", ()), dtype=bool)
+    if observed.size == 0:
+        return []
+    edges = np.flatnonzero(np.diff(np.r_[False, ~observed, False]))
+    return [
+        [int(start), int(stop)]
+        for start, stop in zip(edges[::2], edges[1::2])
+        if int(stop) - int(start) >= int(min_frames)
+    ]
+
+
+class FrameStore:
+    """Per-frame tracking, feature, and event lookup for the video overlay.
+
+    The full-match arrays are already in memory for the model; keeping them here means one compact
+    request per displayed frame instead of shipping 199k frames of tracking to the browser.
+    """
+
+    def __init__(
+        self,
+        tracking: Any,
+        homography: Any,
+        track: Any,
+        events: Any,
+        features: Any,
+        *,
+        trail_frames: int = 25,
+    ) -> None:
+        self.tracking = tracking
+        self.homography = homography
+        self.track = track
+        self.events = events
+        self.features = features
+        self.trail_frames = max(1, int(trail_frames))
+        self.n_frames = int(tracking.n_frames)
+        if getattr(features, "start", 0) != 0:
+            raise ValueError("FrameStore needs full-match features starting at frame 0")
+
+    def _feature(self, name: str, frame: int) -> Any:
+        values = getattr(self.features, name, None)
+        if values is None or len(values) != self.n_frames:
+            return None
+        return values[frame]
+
+    def _features_payload(self, frame: int) -> dict[str, Any]:
+        names = (
+            "team_speed",
+            "ball_speed",
+            "edge",
+            "last_edge",
+            "gap",
+            "near_distance",
+            "near_team",
+            "last_touch",
+            "last_touch_age",
+            "d_home",
+            "d_away",
+            "whistle_env",
+            "whistle_score",
+        )
+        payload: dict[str, Any] = {}
+        for name in names:
+            value = self._feature(name, frame)
+            if value is None:
+                payload[name] = None
+            elif isinstance(value, (bool, np.bool_)):
+                payload[name] = bool(value)
+            elif isinstance(value, (int, np.integer)):
+                payload[name] = int(value)
+            else:
+                payload[name] = _finite(value)
+        for name in ("out_of_play", "parked_edge", "stop_dead", "goal_dead", "tag_live"):
+            value = self._feature(name, frame)
+            payload[name] = bool(value) if value is not None else False
+        return payload
+
+    def _active_events(self, frame: int) -> list[dict[str, Any]]:
+        active: list[dict[str, Any]] = []
+        for goal in getattr(self.events, "goals", ()):
+            if int(goal.frame) <= frame < int(goal.restart):
+                active.append(
+                    {
+                        "type": "goal",
+                        "frame": int(goal.frame),
+                        "kind": str(goal.kind),
+                        "confidence": float(goal.confidence),
+                    }
+                )
+        for stop in getattr(self.events, "stoppages", ()):
+            if int(stop.start) <= frame < int(stop.end):
+                active.append(
+                    {
+                        "type": "stoppage",
+                        "start": int(stop.start),
+                        "end": int(stop.end),
+                        "trigger": str(stop.trigger),
+                        "confidence": float(stop.confidence),
+                    }
+                )
+        return active
+
+    def frame_payload(self, frame: int) -> dict[str, Any]:
+        frame = max(0, min(int(frame), self.n_frames - 1))
+        raw_present = bool(self.tracking.ball_present[frame])
+        source = int(self.track.source[frame])
+        estimate = self.track.estimate[frame]
+        raw = self.tracking.ball[frame]
+        ex, ey = float(estimate[0]), float(estimate[1])
+        has_estimate = np.isfinite(ex) and np.isfinite(ey)
+        ball_pixel = _project(self.homography, frame, ex, ey, self.tracking.pitch) if has_estimate else None
+
+        trail: list[list[float | int]] = []
+        start = max(0, frame - self.trail_frames + 1)
+        for k in range(start, frame + 1):
+            if int(self.track.source[k]) == 2:
+                trail = []
+                continue
+            point = self.track.estimate[k]
+            if not (np.isfinite(point[0]) and np.isfinite(point[1])):
+                continue
+            pixel = _project(
+                self.homography, k, float(point[0]), float(point[1]), self.tracking.pitch
+            )
+            if pixel is not None:
+                trail.append([pixel[0], pixel[1], int(self.track.source[k])])
+
+        players: list[dict[str, Any]] = []
+        players_xy = self.tracking.players[frame]
+        speeds = self.tracking.speeds[frame]
+        present = self.tracking.player_present[frame]
+        teams = self.tracking.teams
+        for index in range(players_xy.shape[0]):
+            if not bool(present[index]):
+                continue
+            x, y = float(players_xy[index, 0]), float(players_xy[index, 1])
+            if not (np.isfinite(x) and np.isfinite(y)):
+                continue
+            pixel = _project(self.homography, frame, x, y, self.tracking.pitch)
+            if pixel is None:
+                continue
+            players.append(
+                {
+                    "x": round(x, 2),
+                    "y": round(y, 2),
+                    "px": pixel[0],
+                    "py": pixel[1],
+                    "team": int(teams[index]) if index < len(teams) else -1,
+                    "speed": _finite(speeds[index]) if np.isfinite(speeds[index]) else None,
+                }
+            )
+
+        return {
+            "available": True,
+            "frame": frame,
+            "fps": FPS,
+            "time_s": round(frame / FPS, 3),
+            "video_width": VIDEO_WIDTH,
+            "video_height": VIDEO_HEIGHT,
+            "ball": {
+                "present": raw_present,
+                "source": source,
+                "x": _finite(raw[0]) if raw_present else None,
+                "y": _finite(raw[1]) if raw_present else None,
+                "ex": _finite(ex) if has_estimate else None,
+                "ey": _finite(ey) if has_estimate else None,
+                "px": ball_pixel[0] if ball_pixel is not None else None,
+                "py": ball_pixel[1] if ball_pixel is not None else None,
+                "confidence": _finite(self.track.confidence[frame]),
+                "gap_s": _finite(self.track.gap_s[frame]),
+                "out_of_play": bool(
+                    self.track.out_of_play[frame] or self._feature("out_of_play", frame)
+                ),
+            },
+            "trail": trail,
+            "players": players,
+            "features": self._features_payload(frame),
+            "active_events": self._active_events(frame),
+        }
 
 
 def parse_byte_range(header: str, size: int) -> tuple[int, int] | None:
@@ -395,6 +644,7 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
     pred: np.ndarray | None = None
     user_truth: np.ndarray | None = None
     user_truth_path: Path | None = None
+    frame_store: FrameStore | None = None
     ut_lock = threading.Lock()
     verbose = False
 
@@ -495,6 +745,9 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
                 cache="no-store",
             )
             return
+        if path == "/api/frame":
+            self._serve_frame(send_body=send_body)
+            return
         if path == "/video":
             self._serve_video(send_body=send_body)
             return
@@ -508,6 +761,32 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         self._send_error(HTTPStatus.NOT_FOUND, "not found", send_body=send_body)
+
+    def _serve_frame(self, *, send_body: bool) -> None:
+        store = self.frame_store
+        if store is None:
+            self._send_bytes(
+                json.dumps({"available": False, "reason": "tracking not loaded"}).encode("utf-8"),
+                "application/json; charset=utf-8",
+                send_body=send_body,
+                cache="no-store",
+                status=HTTPStatus.NOT_FOUND,
+            )
+            return
+        query = parse_qs(urlsplit(self.path).query)
+        try:
+            frame = int(query.get("frame", ["0"])[0])
+        except (TypeError, ValueError):
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid frame", send_body=send_body)
+            return
+        payload = store.frame_payload(frame)
+        body = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        self._send_bytes(
+            body.encode("utf-8"),
+            "application/json; charset=utf-8",
+            send_body=send_body,
+            cache="no-store",
+        )
 
     def _send_bytes(
         self,
@@ -622,6 +901,7 @@ def make_server(
     pred: np.ndarray | None = None,
     user_truth: np.ndarray | None = None,
     user_truth_path: str | Path | None = None,
+    frame_store: FrameStore | None = None,
 ) -> ViewerHTTPServer:
     """Create the local reviewer server.  ``port=0`` chooses an ephemeral port."""
     assets = _load_assets(Path(assets_dir))
@@ -638,8 +918,42 @@ def make_server(
                 "user_truth_path": Path(user_truth_path),
             }
         )
+    if frame_store is not None:
+        attributes["frame_store"] = frame_store
     handler = type("BoundViewerRequestHandler", (ViewerRequestHandler,), attributes)
     return ViewerHTTPServer((host, port), handler)
+
+
+def build_frame_store(
+    video_path: str | Path,
+    *,
+    data_dir: str | Path | None = None,
+) -> tuple[FrameStore, Any, list[list[int]]]:
+    """Load the gated tracking once and prepare the per-frame explorer products.
+
+    Audio is used only when its cache already exists.  The viewer must stay fast to open; a first
+    run without ``whistle.npz`` still gets geometry/out-of-play events, and ``predict``/``all``
+    builds the cache.
+    """
+    from .audio import load_or_extract
+    from .balltrack import track_ball
+    from .events import build_events
+    from .features import extract_features
+    from .pipeline import load_lab
+
+    lab = load_lab(data_dir, load_gt=False)
+    track = track_ball(lab.tracking)
+    whistle = None
+    if Path(WHISTLE_CACHE).is_file():
+        whistle = load_or_extract(video_path, lab.tracking.n_frames)
+    features = extract_features(
+        lab.tracking, lab.tags, ball_track=track, whistle=whistle
+    )
+    events = build_events(
+        lab.tracking, lab.tags, track=track, whistle=whistle, features=features
+    )
+    store = FrameStore(lab.tracking, lab.homography, track, events, features)
+    return store, events, ball_gap_runs(track, min_frames=max(1, int(0.4 * FPS)))
 
 
 def serve_viewer(
@@ -672,6 +986,21 @@ def serve_viewer(
             "Run `python -m possession_lab all` first or pass --predictions."
         )
 
+    frame_store = None
+    events = None
+    gaps: list[list[int]] = []
+    try:
+        frame_store, events, gaps = build_frame_store(video, data_dir=data_dir)
+        print(
+            f"tracking: {len(frame_store.tracking.ball):,} frames | "
+            f"{len(getattr(events, 'goals', ()))} goles | "
+            f"{len(getattr(events, 'stoppages', ()))} paradas | "
+            f"{len(gaps):,} huecos de balón",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - the overlay is an optional aid
+        print(f"tracking: no disponible ({exc})", flush=True)
+
     data = load_viewer_data(
         predictions,
         gt_path=gt_path,
@@ -680,6 +1009,9 @@ def serve_viewer(
         user_truth_path=user_truth_path,
         explanations_path=explanations_path,
         start_frame=start_frame,
+        events=events,
+        ball_gaps=gaps,
+        tracking_available=frame_store is not None,
     )
     pred = load_submission(predictions)
     user_truth = load_user_truth(user_truth_path, pred.size)
@@ -694,6 +1026,7 @@ def serve_viewer(
         pred=pred,
         user_truth=user_truth,
         user_truth_path=user_truth_path,
+        frame_store=frame_store,
     )
     ViewerRequestHandler.verbose = verbose
     url = f"http://{host}:{server.server_address[1]}/"

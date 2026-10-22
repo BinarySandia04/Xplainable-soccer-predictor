@@ -28,9 +28,14 @@
           <video id="video" preload="metadata" controls playsinline>
             Tu navegador no puede reproducir este video.
           </video>
+          <canvas id="overlay" class="video-overlay" aria-label="Balón y jugadores proyectados sobre el video"></canvas>
           <div id="videoError" class="video-error hidden" role="alert"></div>
           <div class="video-caption">
             <span>Video táctico sincronizado · 25 fps</span>
+            <label class="overlay-toggle">
+              <input id="overlayToggle" type="checkbox" checked>
+              Seguimiento
+            </label>
             <span id="videoDuration" class="mono">duración —</span>
           </div>
         </div>
@@ -47,6 +52,9 @@
               <span><i class="swatch swatch-D"></i>Balón muerto</span>
               <span><i class="swatch swatch-X"></i>Sin evaluar</span>
               <span><i class="marker marker-tick"></i>Cambio anotado</span>
+              <span><i class="marker marker-goal"></i>Gol</span>
+              <span><i class="marker marker-stop"></i>Parada</span>
+              <span><i class="marker marker-gap"></i>Sin balón</span>
             </div>
           </div>
 
@@ -107,6 +115,23 @@
             <div><dt>Detalle tag</dt><dd id="tagDetail" class="muted">—</dd></div>
             <div><dt>Ventana GT</dt><dd id="gtWindow" class="muted">—</dd></div>
           </dl>
+        </section>
+
+        <section id="explorerCard" class="card data-card" aria-label="Explorador de datos del frame">
+          <div class="eyebrow">Explorador de datos · frame</div>
+          <div id="trackingStatus" class="muted small">Cargando seguimiento…</div>
+          <dl class="facts data-facts">
+            <div><dt>Balón</dt><dd id="ballState">—</dd></div>
+            <div><dt>Posición</dt><dd id="ballPosition" class="mono">—</dd></div>
+            <div><dt>Vel. balón</dt><dd id="ballSpeed">—</dd></div>
+            <div><dt>Vel. equipos</dt><dd id="teamSpeed">—</dd></div>
+            <div><dt>Jugador cerca</dt><dd id="nearPlayer">—</dd></div>
+            <div><dt>Dist. a línea</dt><dd id="ballEdge">—</dd></div>
+            <div><dt>Hueco balón</dt><dd id="ballGap">—</dd></div>
+            <div><dt>Último toque</dt><dd id="touchState">—</dd></div>
+            <div><dt>Evento</dt><dd id="eventState">—</dd></div>
+          </dl>
+          <p class="fine-print">Proyección del ATD sobre el video con la homografía del frame. El aro ámbar indica una posición estimada por el tracker causal; un hueco mayor de 1,2 s no se rellena.</p>
         </section>
 
         <section id="explainCard" class="card explain-card" aria-label="Por qué el modelo cambió de estado">

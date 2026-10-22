@@ -261,6 +261,28 @@ video {
   outline: none;
 }
 
+.video-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.overlay-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.overlay-toggle input {
+  accent-color: var(--h);
+}
+
 .video-caption {
   display: flex;
   justify-content: space-between;
@@ -502,6 +524,19 @@ video {
   min-width: 0;
   font-size: 0.82rem;
   overflow-wrap: anywhere;
+}
+
+.data-facts {
+  margin-top: 0.55rem;
+}
+
+.data-facts > div {
+  grid-template-columns: 6.8rem minmax(0, 1fr);
+  padding-top: 0.35rem;
+}
+
+.data-facts dd {
+  font-size: 0.78rem;
 }
 
 .transport,
@@ -810,6 +845,24 @@ canvas {
   height: 10px;
   background: var(--ink);
   opacity: 0.7;
+}
+
+.marker-goal {
+  width: 2px;
+  height: 10px;
+  background: #4ee68b;
+}
+
+.marker-stop {
+  width: 2px;
+  height: 10px;
+  background: var(--d);
+}
+
+.marker-gap {
+  width: 2px;
+  height: 10px;
+  background: rgba(140, 160, 180, 0.6);
 }
 
 .explain-card .switch-detail {

@@ -1,19 +1,23 @@
 # Reproducible runtime for the possession_lab solution.
 #
-# Validated with Python 3.12.3 on Linux CPU. The viewer uses only the Python standard
-# library, so no frontend build step or extra package is required.
+# Validated with Python 3.12.3 on Linux CPU. The viewer itself uses only the Python standard
+# library; imageio-ffmpeg is used by the offline whistle extractor.
 #
 #   python3.12 -m venv .venv
 #   .venv/bin/python -m pip install -r requirements-possession.txt
 #
 # The challenge scorer intentionally keeps its own minimal contract in requirements.txt
-# (numpy + pandas only). This file adds matplotlib and pins the full transitive closure
-# used by the validated run so figures and metrics are reproduced from the same versions.
+# (numpy + pandas only). This file adds matplotlib and imageio-ffmpeg, and pins the full
+# transitive closure used by the validated run so figures, metrics, and whistle detection are
+# reproduced from the same versions.
 numpy==2.5.4
 pandas==3.0.6
 matplotlib==3.11.2
+# Static ffmpeg binary used to decode the tactical MP4 audio track for whistle detection.
+# The viewer itself remains stdlib-only; this dependency is only for the audio/event pipeline.
+imageio-ffmpeg==0.6.0
 
-# Transitive dependencies of the three packages above.
+# Transitive dependencies of the packages above.
 contourpy==1.4.0
 cycler==0.12.1
 fonttools==4.67.0

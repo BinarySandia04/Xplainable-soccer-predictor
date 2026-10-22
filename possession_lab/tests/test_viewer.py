@@ -94,6 +94,27 @@ class ViewerDataTest(unittest.TestCase):
         data = build_viewer_data(pred, fps=25, halves=((0, 10),), public=(0, 10))
         self.assertEqual(data["switches"], [])
         self.assertFalse(data["explanations_available"])
+        self.assertFalse(data["tracking_available"])
+        self.assertEqual(data["events"], [])
+        self.assertEqual(data["ball_gaps"], [])
+
+    def test_event_and_gap_markers_ride_the_payload(self):
+        pred = np.full(10, H, dtype=np.int8)
+        goal = SimpleNamespace(to_dict=lambda: {"type": "goal", "frame": 3})
+        stop = SimpleNamespace(to_dict=lambda: {"type": "stoppage", "start": 5, "end": 8})
+        data = build_viewer_data(
+            pred,
+            tags=None,
+            fps=25,
+            halves=((0, 10),),
+            public=(0, 10),
+            events=SimpleNamespace(goals=(goal,), stoppages=(stop,)),
+            ball_gaps=[[1, 2], [8, 10]],
+            tracking_available=True,
+        )
+        self.assertTrue(data["tracking_available"])
+        self.assertEqual([event["type"] for event in data["events"]], ["goal", "stoppage"])
+        self.assertEqual(data["ball_gaps"], [[1, 2], [8, 10]])
 
     def test_prediction_spans_graded_halves_when_gt_is_public_only(self):
         pred = np.full(20, H, dtype=np.int8)
@@ -250,6 +271,46 @@ class ViewerServerTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as raised:
             urlopen(self.base + "/static/../index.html")
         self.assertEqual(raised.exception.code, 404)
+
+    def test_frame_endpoint_is_unavailable_without_tracking(self):
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(self.base + "/api/frame?frame=1")
+        self.assertEqual(raised.exception.code, 404)
+
+    def test_frame_endpoint_returns_compact_tracking_payload(self):
+        root = Path(self.temp.name)
+        store = SimpleNamespace(
+            frame_payload=lambda frame: {
+                "available": True,
+                "frame": int(frame),
+                "players": [],
+                "ball": {"source": 2},
+            }
+        )
+        server = make_server(
+            "127.0.0.1",
+            0,
+            payload=self.payload,
+            video_path=self.video,
+            assets_dir=root,
+            frame_store=store,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            with urlopen(base + "/api/frame?frame=17") as response:
+                self.assertEqual(response.status, 200)
+                payload = json.loads(response.read())
+            self.assertEqual(payload["frame"], 17)
+            self.assertEqual(payload["ball"]["source"], 2)
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(base + "/api/frame?frame=oops")
+            self.assertEqual(raised.exception.code, 400)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_user_truth_post_is_rejected_when_not_configured(self):
         request = Request(

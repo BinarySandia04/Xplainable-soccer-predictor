@@ -25,6 +25,8 @@
 
   const ui = {
     video: $("#video"),
+    overlay: $("#overlay"),
+    overlayToggle: $("#overlayToggle"),
     videoError: $("#videoError"),
     syncState: $("#syncState"),
     clock: $("#clock"),
@@ -44,6 +46,16 @@
     tagText: $("#tagText"),
     tagDetail: $("#tagDetail"),
     gtWindow: $("#gtWindow"),
+    trackingStatus: $("#trackingStatus"),
+    ballState: $("#ballState"),
+    ballPosition: $("#ballPosition"),
+    ballSpeed: $("#ballSpeed"),
+    teamSpeed: $("#teamSpeed"),
+    nearPlayer: $("#nearPlayer"),
+    ballEdge: $("#ballEdge"),
+    ballGap: $("#ballGap"),
+    touchState: $("#touchState"),
+    eventState: $("#eventState"),
     videoDuration: $("#videoDuration"),
     metricsCard: $("#metricsCard"),
     metrics: $("#metrics"),
@@ -96,6 +108,11 @@
     selectedSwitch: -1,
     switchFilter: "all",
     switchFrames: [],
+    overlayEnabled: true,
+    frameData: null,
+    frameDataRequest: null,
+    frameCache: new Map(),
+    frameDataError: false,
   };
 
   const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
@@ -211,6 +228,238 @@
   function metricText(value) {
     if (typeof value !== "number") return String(value);
     return Number.isInteger(value) ? value.toLocaleString("es-ES") : value.toFixed(3);
+  }
+
+  function numberText(value, digits = 2, suffix = "") {
+    if (value === null || value === undefined || !Number.isFinite(Number(value))) return "—";
+    return `${Number(value).toFixed(digits)}${suffix}`;
+  }
+
+  function teamText(team) {
+    return TEAM_NAMES[String(team)] || "N/A";
+  }
+
+  function sourceText(source) {
+    if (source === 0) return "observado";
+    if (source === 1) return "estimado";
+    return "perdido";
+  }
+
+  function frameCachePut(frame, payload) {
+    state.frameCache.set(frame, payload);
+    while (state.frameCache.size > 400) {
+      state.frameCache.delete(state.frameCache.keys().next().value);
+    }
+  }
+
+  function clearExplorer(message) {
+    ui.trackingStatus.textContent = message;
+    for (const element of [
+      ui.ballState,
+      ui.ballPosition,
+      ui.ballSpeed,
+      ui.teamSpeed,
+      ui.nearPlayer,
+      ui.ballEdge,
+      ui.ballGap,
+      ui.touchState,
+      ui.eventState,
+    ]) {
+      element.textContent = "—";
+    }
+  }
+
+  function updateExplorer() {
+    const data = state.data;
+    if (!data) return;
+    if (!data.tracking_available) {
+      clearExplorer("Seguimiento no disponible: faltan los datos gated o el ATD.");
+      return;
+    }
+    const frameData = state.frameData;
+    if (!frameData || frameData.frame !== state.frame) {
+      ui.trackingStatus.textContent = `frame ${formatFrame(state.frame)} · cargando seguimiento…`;
+      return;
+    }
+    const ball = frameData.ball || {};
+    const features = frameData.features || {};
+    ui.trackingStatus.textContent = `frame ${formatFrame(frameData.frame)} · ${frameData.players.length} jugadores proyectados · balón ${sourceText(ball.source)}`;
+    ui.ballState.textContent = `${sourceText(ball.source)}${ball.out_of_play ? " · fuera" : ""}`;
+    ui.ballPosition.textContent =
+      ball.ex === null || ball.ex === undefined
+        ? "—"
+        : `${numberText(ball.ex, 2)} , ${numberText(ball.ey, 2)} m`;
+    ui.ballSpeed.textContent = numberText(features.ball_speed, 2, " m/s");
+    ui.teamSpeed.textContent = numberText(features.team_speed, 2, " m/s");
+    ui.nearPlayer.textContent =
+      features.near_distance === null || features.near_distance === undefined
+        ? "—"
+        : `${teamText(features.near_team)} · ${numberText(features.near_distance, 2, " m")}`;
+    ui.ballEdge.textContent =
+      features.edge === null || features.edge === undefined
+        ? "—"
+        : numberText(features.edge, 2, " m");
+    ui.ballGap.textContent =
+      features.gap === null || features.gap === undefined
+        ? "—"
+        : features.gap > 0
+          ? `${numberText(features.gap / data.fps, 2, " s")} (${features.gap} f)`
+          : "sin hueco";
+    ui.touchState.textContent =
+      features.last_touch === null || features.last_touch === undefined || features.last_touch < 0
+        ? "sin toque"
+        : `${teamText(features.last_touch)} · ${numberText(features.last_touch_age / data.fps, 2, " s")}`;
+    const events = frameData.active_events || [];
+    ui.eventState.textContent =
+      events.length === 0
+        ? "juego abierto"
+        : events
+            .map((event) =>
+              event.type === "goal"
+                ? `GOL · ${event.kind}`
+                : `PARADA · ${event.trigger}`,
+            )
+            .join(" · ");
+  }
+
+  function requestFrameData(frame) {
+    const data = state.data;
+    if (!data || !data.tracking_available) {
+      updateExplorer();
+      return;
+    }
+    const cached = state.frameCache.get(frame);
+    if (cached) {
+      state.frameData = cached;
+      updateExplorer();
+      drawOverlay();
+      return;
+    }
+    if (state.frameData && state.frameData.frame === frame) {
+      updateExplorer();
+      drawOverlay();
+      return;
+    }
+    if (state.frameDataRequest) state.frameDataRequest.abort();
+    const controller = new AbortController();
+    state.frameDataRequest = controller;
+    ui.trackingStatus.textContent = `frame ${formatFrame(frame)} · cargando seguimiento…`;
+    fetch(`/api/frame?frame=${frame}`, { signal: controller.signal, cache: "no-store" })
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      })
+      .then((payload) => {
+        frameCachePut(frame, payload);
+        if (state.frame !== frame) return;
+        state.frameData = payload;
+        state.frameDataError = false;
+        updateExplorer();
+        drawOverlay();
+      })
+      .catch((error) => {
+        if (error && error.name === "AbortError") return;
+        if (state.frame !== frame) return;
+        state.frameDataError = true;
+        clearExplorer(`No se pudo cargar el seguimiento del frame (${error instanceof Error ? error.message : String(error)}).`);
+        drawOverlay();
+      })
+      .finally(() => {
+        if (state.frameDataRequest === controller) state.frameDataRequest = null;
+      });
+  }
+
+  function fitOverlay() {
+    const rect = ui.video.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return null;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const width = Math.round(rect.width * dpr);
+    const height = Math.round(rect.height * dpr);
+    if (ui.overlay.width !== width || ui.overlay.height !== height) {
+      ui.overlay.width = width;
+      ui.overlay.height = height;
+    }
+    const ctx = ui.overlay.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { ctx, width: rect.width, height: rect.height };
+  }
+
+  function drawOverlay() {
+    const fitted = fitOverlay();
+    if (!fitted) return;
+    const { ctx, width, height } = fitted;
+    ctx.clearRect(0, 0, width, height);
+    if (!state.overlayEnabled || !state.data || !state.data.tracking_available) return;
+    const frameData = state.frameData;
+    if (!frameData || frameData.frame !== state.frame) return;
+    const scaleX = width / (frameData.video_width || 1920);
+    const scaleY = height / (frameData.video_height || 1080);
+    const xOf = (px) => px * scaleX;
+    const yOf = (py) => py * scaleY;
+
+    const trail = frameData.trail || [];
+    if (trail.length > 1) {
+      ctx.save();
+      ctx.lineWidth = 1.5;
+      for (let index = 1; index < trail.length; index++) {
+        const previous = trail[index - 1];
+        const current = trail[index];
+        ctx.strokeStyle =
+          current[2] === 1
+            ? `rgba(255,200,87,${0.12 + (0.5 * index) / trail.length})`
+            : `rgba(255,255,255,${0.1 + (0.5 * index) / trail.length})`;
+        ctx.beginPath();
+        ctx.moveTo(xOf(previous[0]), yOf(previous[1]));
+        ctx.lineTo(xOf(current[0]), yOf(current[1]));
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    for (const player of frameData.players || []) {
+      const color =
+        player.team === 0 ? COLORS.H : player.team === 1 ? COLORS.A : "#c8d6e5";
+      ctx.beginPath();
+      ctx.arc(xOf(player.px), yOf(player.py), 3.6, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.82;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "rgba(0,0,0,0.7)";
+      ctx.stroke();
+    }
+
+    const ball = frameData.ball || {};
+    if (ball.px !== null && ball.px !== undefined && ball.py !== null && ball.py !== undefined) {
+      const estimated = ball.source === 1;
+      const outside = ball.out_of_play;
+      ctx.beginPath();
+      ctx.arc(xOf(ball.px), yOf(ball.py), outside ? 9 : 7, 0, Math.PI * 2);
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = outside
+        ? "#ff6b5f"
+        : estimated
+          ? "#ffc857"
+          : "rgba(255,255,255,0.95)";
+      if (estimated) ctx.setLineDash([3, 2]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.arc(xOf(ball.px), yOf(ball.py), 2.6, 0, Math.PI * 2);
+      ctx.fillStyle = outside ? "#ff6b5f" : "#ffffff";
+      ctx.fill();
+    } else if (ball.source === 2) {
+      const label = "balón perdido";
+      ctx.save();
+      ctx.font = `600 11px ${MONO}`;
+      const textWidth = ctx.measureText(label).width;
+      ctx.fillStyle = "rgba(8,16,24,0.72)";
+      ctx.fillRect(10, 10, textWidth + 14, 22);
+      ctx.fillStyle = "#8ca0b4";
+      ctx.fillText(label, 17, 25);
+      ctx.restore();
+    }
   }
 
   function updateUTStatus(prefix) {
@@ -515,6 +764,60 @@
     ctx.restore();
   }
 
+  function drawEventMarkers(ctx, xOf, width, height, source) {
+    const data = state.data;
+    if (!data) return;
+    const minGap = data.fps * (source === "overview" ? 1.0 : 0.4);
+    const gapLimit = source === "overview" ? 600 : 2000;
+    let gapCount = 0;
+    ctx.save();
+    for (const gap of data.ball_gaps || []) {
+      if (gapCount >= gapLimit) break;
+      if (gap[1] - gap[0] < minGap) continue;
+      const x1 = xOf(gap[0]);
+      const x2 = xOf(gap[1]);
+      if (x2 < 0 || x1 > width) continue;
+      ctx.strokeStyle = "rgba(140,160,180,0.22)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(Math.max(0, x1) + 0.5, 0);
+      ctx.lineTo(Math.max(0, x1) + 0.5, height);
+      ctx.stroke();
+      gapCount += 1;
+    }
+    for (const event of data.events || []) {
+      if (event.type === "stoppage") {
+        const x = xOf(event.start);
+        if (x < 0 || x > width) continue;
+        ctx.strokeStyle = "rgba(255,200,87,0.5)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 4]);
+        ctx.beginPath();
+        ctx.moveTo(x + 0.5, 0);
+        ctx.lineTo(x + 0.5, height);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      } else if (event.type === "goal") {
+        const x = xOf(event.frame);
+        if (x < 0 || x > width) continue;
+        ctx.strokeStyle = "rgba(78,230,139,0.8)";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(x + 0.5, 0);
+        ctx.lineTo(x + 0.5, height);
+        ctx.stroke();
+        ctx.fillStyle = "#4ee68b";
+        ctx.beginPath();
+        ctx.moveTo(x - 4, 0);
+        ctx.lineTo(x + 4, 0);
+        ctx.lineTo(x, 6);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
   function drawOverview() {
     const fitted = fitCanvas(ui.overview);
     if (!fitted) return;
@@ -549,6 +852,7 @@
     ctx.fillRect(0, 60, width, 16);
     paintSegments(ctx, data.ut_segments, xOf, 60, 16, width);
     drawAnchors(ctx, xOf, 60, 76, width);
+    drawEventMarkers(ctx, xOf, width, height, "overview");
     drawDecisionMarkers(ctx, xOf, width, "overview");
 
     drawText(ctx, "PRED", 6, 8, { size: 8, color: "#8ca0b4" });
@@ -686,6 +990,7 @@
     ctx.fillRect(0, 88, width, 24);
     paintSegments(ctx, data.ut_segments, xOf, 88, 24, width);
     drawAnchors(ctx, xOf, 88, 112, width);
+    drawEventMarkers(ctx, xOf, width, height, "detail");
     drawDecisionMarkers(ctx, xOf, width, "detail");
 
     drawText(ctx, "PRED", 6, 18, { size: 8, color: "rgba(232,240,247,0.72)" });
@@ -740,7 +1045,11 @@
     const changed = next !== state.frame;
     state.frame = next;
     updateUI();
-    if (changed || force) drawTimelines();
+    requestFrameData(next);
+    if (changed || force) {
+      drawTimelines();
+      drawOverlay();
+    }
   }
 
   function renderFromTime(seconds) {
@@ -1304,6 +1613,11 @@
     }
 
     ui.playBtn.addEventListener("click", togglePlay);
+    ui.overlayToggle.checked = state.overlayEnabled;
+    ui.overlayToggle.addEventListener("change", () => {
+      state.overlayEnabled = ui.overlayToggle.checked;
+      drawOverlay();
+    });
     for (const button of document.querySelectorAll("[data-seek]")) {
       button.addEventListener("click", () => jump(Number(button.dataset.seek)));
     }
@@ -1412,11 +1726,15 @@
       }
     });
 
-    const resize = () => drawTimelines();
+    const resize = () => {
+      drawTimelines();
+      drawOverlay();
+    };
     if (window.ResizeObserver) {
       const observer = new ResizeObserver(resize);
       observer.observe(ui.overview.parentElement);
       observer.observe(ui.detail.parentElement);
+      observer.observe(ui.video);
     }
     window.addEventListener("resize", resize);
 
