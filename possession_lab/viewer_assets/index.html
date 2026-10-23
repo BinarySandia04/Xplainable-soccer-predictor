@@ -25,12 +25,19 @@
     <section class="stage-grid" aria-label="Inspección de video y predicción">
       <div class="left-column">
         <div class="video-card">
-          <video id="video" preload="metadata" controls playsinline>
+          <video id="video" preload="auto" controls playsinline>
             Tu navegador no puede reproducir este video.
           </video>
+          <div id="videoBuffer" class="video-buffer" role="status" aria-live="polite">
+            <span class="video-buffer-pill">
+              <span class="spinner" aria-hidden="true"></span>
+              <span id="videoBufferText">Cargando video…</span>
+            </span>
+          </div>
           <div id="videoError" class="video-error hidden" role="alert"></div>
           <div class="video-caption">
             <span>Video táctico sincronizado · 25 fps</span>
+            <span id="videoBuffered" class="mono">buffer —</span>
             <span id="videoDuration" class="mono">duración —</span>
           </div>
         </div>
@@ -145,7 +152,7 @@
             <button type="button" data-ut-label="D" class="ut-D" title="Etiquetar D">D</button>
             <button type="button" data-ut-label="X" class="ut-X" title="Borrar UT en el tramo">X</button>
             <button id="utAnchor" type="button" class="wide" title="Fijar el inicio del tramo en este frame">Ancla aquí</button>
-            <button id="utClear" type="button" class="wide" title="Borrar toda la UT">Borrar UT</button>
+            <button id="utClear" type="button" class="wide" title="Borrar el tramo UT más cercano al frame actual">Borrar UT</button>
           </div>
           <div id="utStatus" class="muted small ut-status">Sin etiquetas UT.</div>
           <p class="fine-print">Pulsa <kbd>H</kbd><kbd>A</kbd><kbd>D</kbd><kbd>X</kbd> en cualquier parte de la página para etiquetar el frame actual o el tramo ancla → frame actual; cada pulsación deja un ancla al final del tramo. Las anclas se muestran en las líneas temporales y se arrastran para ajustar los cortes. La UT se guarda en <code>outputs/user_truth.json</code> y el modelo nunca la usa.</p>

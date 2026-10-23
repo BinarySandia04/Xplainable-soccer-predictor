@@ -26,6 +26,9 @@
   const ui = {
     video: $("#video"),
     videoError: $("#videoError"),
+    videoBuffer: $("#videoBuffer"),
+    videoBufferText: $("#videoBufferText"),
+    videoBuffered: $("#videoBuffered"),
     syncState: $("#syncState"),
     clock: $("#clock"),
     frameMeta: $("#frameMeta"),
@@ -85,6 +88,10 @@
     syncWarning: false,
     lastRenderAt: 0,
     pendingSeekFrame: null,
+    scrubRaf: null,
+    pendingScrubFrame: null,
+    utAnchors: [],
+    utAnchorsSrc: null,
     utAnchor: null,
     utSaving: false,
     anchorDrag: null,
@@ -217,12 +224,17 @@
   }
 
   function utAnchorFrames() {
-    const frames = new Set();
-    for (const [start, stop] of state.data ? state.data.ut_segments : []) {
-      frames.add(start);
-      frames.add(stop);
+    const segments = state.data ? state.data.ut_segments : null;
+    if (state.utAnchorsSrc !== segments) {
+      const frames = new Set();
+      for (const [start, stop] of segments || []) {
+        frames.add(start);
+        frames.add(stop);
+      }
+      state.utAnchors = Array.from(frames).sort((a, b) => a - b);
+      state.utAnchorsSrc = segments;
     }
-    return Array.from(frames).sort((a, b) => a - b);
+    return state.utAnchors;
   }
 
   function frameToX(canvas, source, frame) {
@@ -419,7 +431,11 @@
     if (document.activeElement !== ui.frameInput) {
       ui.frameInput.value = String(frame);
     }
+  }
 
+  function renderMetrics() {
+    const data = state.data;
+    if (!data) return;
     if (data.metrics) {
       const m = data.metrics;
       ui.metricsCard.classList.remove("hidden");
@@ -795,6 +811,19 @@
     return clamp(start + Math.floor(fraction * (stop - start)), 0, state.data.n_frames - 1);
   }
 
+  function scheduleScrub(frame) {
+    state.pendingScrubFrame = frame;
+    if (state.scrubRaf !== null) return;
+    state.scrubRaf = requestAnimationFrame(() => {
+      state.scrubRaf = null;
+      const target = state.pendingScrubFrame;
+      state.pendingScrubFrame = null;
+      if (target !== null && state.scrubbing) {
+        seekToFrame(target, { pause: true, updateHistory: false });
+      }
+    });
+  }
+
   function attachScrubber(canvas, source) {
     canvas.addEventListener("pointerdown", (event) => {
       if (!state.data) return;
@@ -828,7 +857,7 @@
         drawTimelines();
       } else if (state.scrubbing && event.pointerId === state.pointerId) {
         updateHover(frame, source);
-        seekToFrame(frame, { pause: true, updateHistory: false });
+        scheduleScrub(frame);
       } else if (!state.scrubbing) {
         canvas.style.cursor = findDraggableAnchor(event.clientX, event.clientY, source) ? "ew-resize" : "crosshair";
         updateHover(frame, source);
@@ -845,6 +874,11 @@
       state.scrubbing = false;
       state.pointerId = null;
       state.scrubSource = null;
+      if (state.scrubRaf !== null) {
+        cancelAnimationFrame(state.scrubRaf);
+        state.scrubRaf = null;
+      }
+      state.pendingScrubFrame = null;
       try {
         canvas.releasePointerCapture(event.pointerId);
       } catch (error) {
@@ -863,7 +897,13 @@
         }
         return;
       }
-      if (wasScrubbing) updateURL(state.frame);
+      if (wasScrubbing) {
+        if (event.type === "pointerup") {
+          const frame = eventFrame(event, source);
+          if (frame !== null) seekToFrame(frame, { pause: true, updateHistory: false });
+        }
+        updateURL(state.frame);
+      }
     };
     canvas.addEventListener("pointerup", finish);
     canvas.addEventListener("pointercancel", finish);
@@ -881,6 +921,28 @@
 
   function setPlayButton() {
     ui.playBtn.textContent = state.video.paused ? "Reproducir" : "Pausa";
+  }
+
+  function setBuffering(visible, text) {
+    if (text) ui.videoBufferText.textContent = text;
+    ui.videoBuffer.classList.toggle("hidden", !visible);
+  }
+
+  function bufferedAhead() {
+    const video = state.video;
+    const time = video.currentTime;
+    let ahead = 0;
+    for (let index = 0; index < video.buffered.length; index++) {
+      if (video.buffered.start(index) <= time + 0.5 && video.buffered.end(index) > time) {
+        ahead = video.buffered.end(index) - time;
+      }
+    }
+    return ahead;
+  }
+
+  function updateBufferedLabel() {
+    const ahead = bufferedAhead();
+    ui.videoBuffered.textContent = ahead > 0 ? `buffer ${formatShort(ahead)}` : "buffer —";
   }
 
   function togglePlay() {
@@ -904,7 +966,7 @@
     setSync("error", "error");
   }
 
-  async function postUserTruth(body) {
+  async function postUserTruth(body, message) {
     if (!state.data || state.utSaving) return;
     state.utSaving = true;
     try {
@@ -917,13 +979,19 @@
       Object.assign(state.data, await response.json());
       if (body.clear || body.boundary !== undefined) {
         state.utAnchor = null;
-      } else {
+      } else if (body.stop !== undefined) {
         state.utAnchor = clamp(body.stop, 0, state.data.n_frames);
       }
       drawTimelines();
       updateUI();
+      renderMetrics();
       updateUTStatus(
-        body.clear ? "UT borrada. " : body.boundary !== undefined ? "Ancla movida. " : "Ancla añadida. ",
+        message ||
+          (body.clear
+            ? "UT borrada. "
+            : body.boundary !== undefined
+              ? "Ancla movida. "
+              : "Ancla añadida. ")
       );
     } catch (error) {
       ui.utStatus.textContent = `No se pudo guardar la UT: ${error instanceof Error ? error.message : String(error)}`;
@@ -976,11 +1044,45 @@
     attachScrubber(ui.overview, "overview");
     attachScrubber(ui.detail, "detail");
 
+    let seekTimer = null;
+    const clearSeekTimer = () => {
+      if (seekTimer !== null) {
+        window.clearTimeout(seekTimer);
+        seekTimer = null;
+      }
+    };
+
+    state.video.addEventListener("loadstart", () => {
+      setBuffering(true, "Cargando video…");
+      ui.videoBuffered.textContent = "buffer —";
+    });
+    state.video.addEventListener("waiting", () => setBuffering(true, "Buffering…"));
+    state.video.addEventListener("stalled", () => setBuffering(true, "Buffering…"));
+    state.video.addEventListener("canplay", () => {
+      clearSeekTimer();
+      setBuffering(false);
+    });
+    state.video.addEventListener("playing", () => {
+      clearSeekTimer();
+      setBuffering(false);
+    });
+    state.video.addEventListener("seeking", () => {
+      clearSeekTimer();
+      seekTimer = window.setTimeout(() => setBuffering(true, "Buscando…"), 300);
+    });
+    state.video.addEventListener("seeked", () => {
+      clearSeekTimer();
+      setBuffering(false);
+    });
+    state.video.addEventListener("progress", updateBufferedLabel);
+    state.video.addEventListener("timeupdate", updateBufferedLabel);
+
     state.video.addEventListener("loadedmetadata", () => {
       state.loadedMetadata = true;
       const duration = state.video.duration;
       const durationText = Number.isFinite(duration) ? formatTime(duration) : "—";
       ui.videoDuration.textContent = `duración ${durationText} · ${data.fps} fps`;
+      updateBufferedLabel();
       if (Number.isFinite(duration) && Math.abs(duration - data.duration_s) > 0.15) {
         state.syncWarning = true;
         setSync("duración distinta", "warn");
@@ -995,13 +1097,17 @@
     });
 
     state.video.addEventListener("play", setPlayButton);
-    state.video.addEventListener("pause", setPlayButton);
+    state.video.addEventListener("pause", () => {
+      setPlayButton();
+      updateBufferedLabel();
+    });
     state.video.addEventListener("ended", setPlayButton);
     state.video.addEventListener("timeupdate", () => renderFromTime(state.video.currentTime));
     state.video.addEventListener("seeked", () => {
       if (!state.scrubbing) renderFromTime(state.video.currentTime);
     });
     state.video.addEventListener("error", () => {
+      setBuffering(false);
       const code = state.video.error ? state.video.error.code : "?";
       ui.videoError.textContent = `No se pudo reproducir el MP4 táctico (código ${code}). Comprueba que el servidor y el archivo existen.`;
       ui.videoError.classList.remove("hidden");
@@ -1043,7 +1149,9 @@
       button.addEventListener("click", () => paintUserTruth(button.dataset.utLabel));
     }
     ui.utAnchor.addEventListener("click", toggleUserTruthAnchor);
-    ui.utClear.addEventListener("click", () => postUserTruth({ clear: true }));
+    ui.utClear.addEventListener("click", () =>
+      postUserTruth({ eraseNearest: state.frame }, "Tramo UT borrado. "),
+    );
 
     window.addEventListener("keydown", (event) => {
       const target = event.target;
@@ -1108,6 +1216,8 @@
     setPlayButton();
     drawTimelines();
     updateUI();
+    renderMetrics();
+    updateBufferedLabel();
     updateUTStatus();
   }
 
