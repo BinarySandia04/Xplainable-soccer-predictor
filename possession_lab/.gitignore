@@ -2,4 +2,4 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 outputs/*
-!outputs/.gitignore
+!outputs/user_truth.json

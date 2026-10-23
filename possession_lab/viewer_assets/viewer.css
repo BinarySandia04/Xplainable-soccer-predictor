@@ -261,6 +261,50 @@ video {
   outline: none;
 }
 
+.video-buffer {
+  position: absolute;
+  inset: 0 0 2.2rem;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  background: rgba(8, 13, 18, 0.42);
+  transition: opacity 160ms ease;
+}
+
+.video-buffer-pill {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.7rem 1.1rem;
+  color: var(--ink-soft);
+  font-size: 0.88rem;
+  background: rgba(10, 15, 20, 0.88);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  box-shadow: var(--shadow);
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.18);
+  border-top-color: var(--h);
+  border-radius: 50%;
+  animation: spin 900ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 2.4s;
+  }
+}
+
 .video-caption {
   display: flex;
   justify-content: space-between;
