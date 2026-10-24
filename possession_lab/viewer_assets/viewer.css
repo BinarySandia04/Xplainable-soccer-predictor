@@ -325,6 +325,66 @@ video {
   flex-wrap: wrap;
 }
 
+.pitch-heading {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.pitch-status {
+  min-height: 1.35em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.35;
+}
+
+.layer-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.75rem;
+  margin-top: 0.65rem;
+  padding: 0.42rem 0.55rem;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: rgba(8, 13, 18, 0.32);
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.layer-bar-label {
+  color: var(--muted-2);
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.layer-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.layer-toggle input {
+  margin: 0;
+  accent-color: var(--h);
+}
+
+.layer-toggle input[data-layer="raw"] {
+  accent-color: #f4f8fb;
+}
+
+.layer-toggle input[data-layer="kalman"] {
+  accent-color: #9ad0ff;
+}
+
+.layer-toggle input[data-layer="combined"] {
+  accent-color: var(--warn);
+}
+
 .pitch-legend {
   display: flex;
   flex-wrap: wrap;
@@ -350,9 +410,10 @@ video {
 
 .pitch-dot.dot-H { background: var(--h); }
 .pitch-dot.dot-A { background: var(--a); }
-.pitch-dot.dot-observed { background: #f4f8fb; }
-.pitch-dot.dot-estimated {
-  background: transparent;
+.pitch-dot.dot-atd { background: #f4f8fb; }
+.pitch-dot.dot-kalman { background: #9ad0ff; }
+.pitch-dot.dot-combined {
+  background: #f4f8fb;
   border: 1.5px dashed var(--warn);
 }
 
@@ -618,6 +679,19 @@ video {
 
 .data-facts dd {
   font-size: 0.78rem;
+}
+
+/* The status changes every frame.  Reserving two lines here keeps the card, and therefore the
+   page below it, from reflowing when the text changes between one and two lines. */
+#trackingStatus {
+  display: -webkit-box;
+  min-height: 2.7em;
+  max-height: 2.7em;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .transport,

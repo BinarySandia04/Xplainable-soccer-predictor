@@ -447,10 +447,12 @@ class FrameStore:
         features: Any,
         *,
         trail_frames: int = 25,
+        kalman: Any | None = None,
     ) -> None:
         self.tracking = tracking
         self.homography = homography
         self.track = track
+        self.kalman = kalman
         self.events = events
         self.features = features
         self.trail_frames = max(1, int(trail_frames))
@@ -521,6 +523,107 @@ class FrameStore:
                 )
         return active
 
+    def _outside_pitch(self, x: float, y: float) -> bool:
+        length, width = self.tracking.pitch
+        return x < -1.0 or x > length + 1.0 or y < -1.0 or y > width + 1.0
+
+    def _layer_payload(self, frame: int, layer: str) -> dict[str, Any]:
+        """Describe one ball layer at one frame without changing the model tracker."""
+        raw_present = bool(self.tracking.ball_present[frame])
+        raw = self.tracking.ball[frame]
+        if layer == "raw":
+            available = raw_present and np.isfinite(raw[0]) and np.isfinite(raw[1])
+            x = float(raw[0]) if available else np.nan
+            y = float(raw[1]) if available else np.nan
+            source = 0 if available else 2
+            confidence = 1.0 if available else 0.0
+            gap = 0.0 if available else None
+            observed = available
+            outside = self._outside_pitch(x, y) if available else False
+        else:
+            track = self.kalman if layer == "kalman" else self.track
+            if track is None:
+                available = False
+                x = y = float("nan")
+                source = 2
+                confidence = 0.0
+                gap = None
+                observed = False
+                outside = False
+            else:
+                source = int(track.source[frame])
+                point = track.estimate[frame]
+                available = source != 2 and np.isfinite(point[0]) and np.isfinite(point[1])
+                x = float(point[0]) if available else np.nan
+                y = float(point[1]) if available else np.nan
+                confidence = _finite(track.confidence[frame])
+                gap = _finite(track.gap_s[frame])
+                observed = bool(getattr(track, "observed", np.zeros(self.n_frames, dtype=bool))[frame])
+                outside = bool(track.out_of_play[frame]) if available else False
+
+        pixel = _project(self.homography, frame, x, y, self.tracking.pitch) if available else None
+        return {
+            "source": int(source),
+            "observed": bool(observed),
+            "x": _finite(x) if available else None,
+            "y": _finite(y) if available else None,
+            "px": pixel[0] if pixel is not None else None,
+            "py": pixel[1] if pixel is not None else None,
+            "confidence": confidence if confidence is not None else 0.0,
+            "gap_s": gap,
+            "out_of_play": bool(outside),
+        }
+
+    def _trail_series(
+        self, frame: int, layer: str
+    ) -> list[tuple[int, float, float, int]]:
+        """Trail points as ``(frame, x, y, source)``; the frame is needed for projection.
+
+        The broadcast camera moves, so each historical pitch point must use the homography of its
+        own frame on the video overlay, not the homography of the current frame.
+        """
+        if layer == "raw":
+            points: list[tuple[int, float, float, int]] = []
+            start = max(0, frame - self.trail_frames + 1)
+            for k in range(start, frame + 1):
+                if not bool(self.tracking.ball_present[k]):
+                    points = []
+                    continue
+                point = self.tracking.ball[k]
+                if not (np.isfinite(point[0]) and np.isfinite(point[1])):
+                    points = []
+                    continue
+                points.append((k, float(point[0]), float(point[1]), 0))
+            return points
+
+        track = self.kalman if layer == "kalman" else self.track
+        if track is None:
+            return []
+        points = []
+        start = max(0, frame - self.trail_frames + 1)
+        for k in range(start, frame + 1):
+            source_k = int(track.source[k])
+            if source_k == 2:
+                points = []
+                continue
+            point = track.estimate[k]
+            if not (np.isfinite(point[0]) and np.isfinite(point[1])):
+                continue
+            points.append((k, float(point[0]), float(point[1]), source_k))
+        return points
+
+    def _trail_payload(self, frame: int, layer: str) -> dict[str, list[list[float | int]]]:
+        series = self._trail_series(frame, layer)
+        pitch: list[list[float | int]] = [
+            [round(x, 2), round(y, 2), source] for _, x, y, source in series
+        ]
+        video: list[list[float | int]] = []
+        for k, x, y, source in series:
+            pixel = _project(self.homography, k, x, y, self.tracking.pitch)
+            if pixel is not None:
+                video.append([pixel[0], pixel[1], source])
+        return {"pitch": pitch, "video": video}
+
     def frame_payload(self, frame: int) -> dict[str, Any]:
         frame = max(0, min(int(frame), self.n_frames - 1))
         raw_present = bool(self.tracking.ball_present[frame])
@@ -531,24 +634,16 @@ class FrameStore:
         has_estimate = np.isfinite(ex) and np.isfinite(ey)
         ball_pixel = _project(self.homography, frame, ex, ey, self.tracking.pitch) if has_estimate else None
 
-        trail: list[list[float | int]] = []
-        trail_pitch: list[list[float | int]] = []
-        start = max(0, frame - self.trail_frames + 1)
-        for k in range(start, frame + 1):
-            if int(self.track.source[k]) == 2:
-                trail = []
-                trail_pitch = []
-                continue
-            point = self.track.estimate[k]
-            if not (np.isfinite(point[0]) and np.isfinite(point[1])):
-                continue
-            source_k = int(self.track.source[k])
-            trail_pitch.append([round(float(point[0]), 2), round(float(point[1]), 2), source_k])
-            pixel = _project(
-                self.homography, k, float(point[0]), float(point[1]), self.tracking.pitch
-            )
-            if pixel is not None:
-                trail.append([pixel[0], pixel[1], source_k])
+        trails = {
+            layer: self._trail_payload(frame, layer)
+            for layer in ("raw", "kalman", "combined")
+        }
+        trail = trails["combined"]["video"]
+        trail_pitch = trails["combined"]["pitch"]
+        layers = {
+            layer: self._layer_payload(frame, layer)
+            for layer in ("raw", "kalman", "combined")
+        }
 
         players: list[dict[str, Any]] = []
         players_xy = self.tracking.players[frame]
@@ -599,6 +694,8 @@ class FrameStore:
                     self.track.out_of_play[frame] or self._feature("out_of_play", frame)
                 ),
             },
+            "layers": layers,
+            "trails": trails,
             "trail": trail,
             "trail_pitch": trail_pitch,
             "players": players,
@@ -946,10 +1043,12 @@ def build_frame_store(
     from .balltrack import track_ball
     from .events import build_events
     from .features import extract_features
+    from .kalman import kalman_ball_track
     from .pipeline import load_lab
 
     lab = load_lab(data_dir, load_gt=False)
     track = track_ball(lab.tracking)
+    kalman = kalman_ball_track(lab.tracking)
     whistle = None
     if Path(WHISTLE_CACHE).is_file():
         whistle = load_or_extract(video_path, lab.tracking.n_frames)
@@ -959,7 +1058,14 @@ def build_frame_store(
     events = build_events(
         lab.tracking, lab.tags, track=track, whistle=whistle, features=features
     )
-    store = FrameStore(lab.tracking, lab.homography, track, events, features)
+    store = FrameStore(
+        lab.tracking,
+        lab.homography,
+        track,
+        events,
+        features,
+        kalman=kalman,
+    )
     return store, events, ball_gap_runs(track, min_frames=max(1, int(0.4 * FPS)))
 
 

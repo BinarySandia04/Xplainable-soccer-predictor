@@ -22,11 +22,22 @@
     1: "Athletic Club",
   };
   const MONO = '"SFMono-Regular", "Cascadia Code", "Roboto Mono", monospace';
-
+  const BALL_LAYERS = ["raw", "kalman", "combined"];
+  const LAYER_NAMES = {
+    raw: "ATD bruto",
+    kalman: "Kalman",
+    combined: "Combinado",
+  };
+  const LAYER_SHORT_NAMES = {
+    raw: "ATD",
+    kalman: "Kalman",
+    combined: "comb.",
+  };
   const ui = {
     video: $("#video"),
     overlay: $("#overlay"),
     overlayToggle: $("#overlayToggle"),
+    layerToggles: Array.from(document.querySelectorAll("[data-layer]")),
     pitchMap: $("#pitchMap"),
     pitchStatus: $("#pitchStatus"),
     pitchEmpty: $("#pitchEmpty"),
@@ -112,6 +123,7 @@
     switchFilter: "all",
     switchFrames: [],
     overlayEnabled: true,
+    layers: { raw: true, kalman: true, combined: true },
     frameData: null,
     frameDataRequest: null,
     frameCache: new Map(),
@@ -248,6 +260,44 @@
     return "perdido";
   }
 
+  function setText(element, text, title) {
+    if (element.textContent !== text) element.textContent = text;
+    if (title !== undefined && element.title !== title) element.title = title;
+  }
+
+  function layerData(frameData, layer) {
+    if (!frameData) return null;
+    if (frameData.layers && frameData.layers[layer]) return frameData.layers[layer];
+    if (layer === "combined") return frameData.ball || null;
+    return null;
+  }
+
+  function layerSummary(frameData, compact = false, includeGap = true) {
+    if (!frameData) return "cargando seguimiento…";
+    const parts = [];
+    for (const layer of ["combined", "kalman", "raw"]) {
+      if (!state.layers[layer]) continue;
+      const data = layerData(frameData, layer);
+      const source = data ? Number(data.source) : 2;
+      const gap = data ? Number(data.gap_s) : NaN;
+      const gapText =
+        includeGap && Number.isFinite(gap) && gap > 0 && source !== 0
+          ? ` (${gap.toFixed(2)} s)`
+          : "";
+      const name = compact ? LAYER_SHORT_NAMES[layer] : LAYER_NAMES[layer];
+      parts.push(`${name} ${sourceText(source)}${gapText}`);
+    }
+    return parts.length ? parts.join(" · ") : "sin capas de balón";
+  }
+
+  function layerColor(layer, source, alpha = 1) {
+    if (layer === "raw") return `rgba(244, 248, 251, ${alpha})`;
+    if (layer === "kalman") return `rgba(154, 208, 255, ${alpha})`;
+    return source === 1
+      ? `rgba(255, 200, 87, ${alpha})`
+      : `rgba(244, 248, 251, ${alpha})`;
+  }
+
   function frameCachePut(frame, payload) {
     state.frameCache.set(frame, payload);
     while (state.frameCache.size > 400) {
@@ -256,7 +306,7 @@
   }
 
   function clearExplorer(message) {
-    ui.trackingStatus.textContent = message;
+    setText(ui.trackingStatus, message, message);
     for (const element of [
       ui.ballState,
       ui.ballPosition,
@@ -281,12 +331,14 @@
     }
     const frameData = state.frameData;
     if (!frameData || frameData.frame !== state.frame) {
-      ui.trackingStatus.textContent = `frame ${formatFrame(state.frame)} · cargando seguimiento…`;
+      const loading = `frame ${formatFrame(state.frame)} · cargando seguimiento…`;
+      setText(ui.trackingStatus, loading, loading);
       return;
     }
     const ball = frameData.ball || {};
     const features = frameData.features || {};
-    ui.trackingStatus.textContent = `frame ${formatFrame(frameData.frame)} · ${frameData.players.length} jugadores proyectados · balón ${sourceText(ball.source)}`;
+    const status = `frame ${formatFrame(frameData.frame)} · ${frameData.players.length} jugadores · ${layerSummary(frameData, false, false)}`;
+    setText(ui.trackingStatus, status, status);
     ui.ballState.textContent = `${sourceText(ball.source)}${ball.out_of_play ? " · fuera" : ""}`;
     ui.ballPosition.textContent =
       ball.ex === null || ball.ex === undefined
@@ -335,18 +387,17 @@
     if (cached) {
       state.frameData = cached;
       updateExplorer();
-      drawOverlay();
       return;
     }
     if (state.frameData && state.frameData.frame === frame) {
       updateExplorer();
-      drawOverlay();
       return;
     }
     if (state.frameDataRequest) state.frameDataRequest.abort();
     const controller = new AbortController();
     state.frameDataRequest = controller;
-    ui.trackingStatus.textContent = `frame ${formatFrame(frame)} · cargando seguimiento…`;
+    const loading = `frame ${formatFrame(frame)} · cargando seguimiento…`;
+    setText(ui.trackingStatus, loading, loading);
     fetch(`/api/frame?frame=${frame}`, { signal: controller.signal, cache: "no-store" })
       .then((response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -365,7 +416,6 @@
         if (state.frame !== frame) return;
         state.frameDataError = true;
         clearExplorer(`No se pudo cargar el seguimiento del frame (${error instanceof Error ? error.message : String(error)}).`);
-        drawOverlay();
       })
       .finally(() => {
         if (state.frameDataRequest === controller) state.frameDataRequest = null;
@@ -402,15 +452,121 @@
     return { ctx, width: rect.width, height: rect.height };
   }
 
+  function visibleBallLayers() {
+    return BALL_LAYERS.filter((layer) => state.layers[layer]);
+  }
+
+  function layerTrail(frameData, layer, coordinates) {
+    if (!frameData) return [];
+    const trails = frameData.trails && frameData.trails[layer];
+    if (trails && Array.isArray(trails[coordinates])) return trails[coordinates];
+    if (layer === "combined") {
+      const legacy = coordinates === "pitch" ? frameData.trail_pitch : frameData.trail;
+      return Array.isArray(legacy) ? legacy : [];
+    }
+    return [];
+  }
+
+  function drawLayerTrails(ctx, frameData, xOf, yOf, coordinates) {
+    for (const layer of visibleBallLayers()) {
+      const points = layerTrail(frameData, layer, coordinates);
+      if (points.length < 2) continue;
+      ctx.save();
+      ctx.lineWidth = layer === "combined" ? 1.8 : 1.3;
+      if (layer === "kalman") ctx.setLineDash([3, 3]);
+      for (let index = 1; index < points.length; index++) {
+        const previous = points[index - 1];
+        const current = points[index];
+        const alpha = 0.1 + (0.45 * index) / points.length;
+        ctx.strokeStyle = layerColor(layer, current[2], alpha);
+        ctx.beginPath();
+        ctx.moveTo(xOf(previous[0]), yOf(previous[1]));
+        ctx.lineTo(xOf(current[0]), yOf(current[1]));
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+  }
+
+  function drawLayerBall(ctx, x, y, layer, data, scale = 1) {
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !data) return;
+    const source = Number(data.source);
+    if (source === 2) return;
+    const outside = Boolean(data.out_of_play);
+    const color = outside ? "#ff6b5f" : layerColor(layer, source, 0.96);
+    if (layer === "raw") {
+      ctx.beginPath();
+      ctx.arc(x, y, 2.6 * scale, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.7)";
+      ctx.stroke();
+      return;
+    }
+    const radius = (layer === "kalman" ? 6.2 : 8.2) * scale;
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.lineWidth = layer === "combined" ? 2 : 1.7;
+    if (source === 1) ctx.setLineDash([3, 2]);
+    ctx.strokeStyle = color;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.arc(x, y, 2.2 * scale, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+
+  function updatePitchStatus(frameData) {
+    const data = state.data;
+    if (!data) {
+      ui.pitchEmpty.textContent = "Cargando datos del partido…";
+      ui.pitchEmpty.classList.remove("hidden");
+      setText(ui.pitchStatus, "Cargando seguimiento…", "Cargando seguimiento…");
+      return;
+    }
+    if (!data.tracking_available) {
+      ui.pitchEmpty.textContent = "Seguimiento no disponible: faltan el ATD o sus metadatos.";
+      ui.pitchEmpty.classList.remove("hidden");
+      setText(ui.pitchStatus, "Seguimiento no disponible", "Seguimiento no disponible");
+      return;
+    }
+    if (!frameData) {
+      // Do not flash a loading overlay on every ordinary frame fetch.  During playback the
+      // previous map stays visible until the matching payload arrives.
+      if (!state.frameData) {
+        ui.pitchEmpty.textContent = `Cargando frame ${formatFrame(state.frame)}…`;
+        ui.pitchEmpty.classList.remove("hidden");
+      } else {
+        ui.pitchEmpty.classList.add("hidden");
+      }
+      const loading = `frame ${formatFrame(state.frame)} · cargando seguimiento…`;
+      setText(ui.pitchStatus, loading, loading);
+      return;
+    }
+
+    ui.pitchEmpty.classList.add("hidden");
+    const status = `frame ${formatFrame(frameData.frame)} · ${frameData.players.length} slots · ${layerSummary(frameData, true)}`;
+    setText(ui.pitchStatus, status, status);
+    ui.pitchMap.setAttribute(
+      "aria-label",
+      `Vista cenital frame ${frameData.frame}: ${frameData.players.length} slots, ${layerSummary(frameData)}.`,
+    );
+  }
+
   function drawPitchMap() {
+    const data = state.data;
+    const frameData =
+      state.frameData && state.frameData.frame === state.frame ? state.frameData : null;
+    updatePitchStatus(frameData);
+    if (data && data.tracking_available && !frameData) return;
+
     const fitted = fitPitchMap();
     if (!fitted) return;
     const { ctx, width, height } = fitted;
     ctx.clearRect(0, 0, width, height);
 
-    const data = state.data;
-    const frameData =
-      state.frameData && state.frameData.frame === state.frame ? state.frameData : null;
     const pitch = (frameData && frameData.pitch) || { length: 105.3, width: 68 };
     const length = Number(pitch.length) || 105.3;
     const pitchWidth = Number(pitch.width) || 68;
@@ -482,21 +638,7 @@
     ctx.rect(left, top, drawWidth, drawHeight);
     ctx.clip();
 
-    const trail = (frameData && frameData.trail_pitch) || [];
-    if (trail.length > 1) {
-      ctx.lineWidth = 1.5;
-      for (let index = 1; index < trail.length; index++) {
-        const previous = trail[index - 1];
-        const current = trail[index];
-        const alpha = 0.12 + (0.5 * index) / trail.length;
-        ctx.strokeStyle =
-          current[2] === 1 ? `rgba(255, 200, 87, ${alpha})` : `rgba(255, 255, 255, ${alpha})`;
-        ctx.beginPath();
-        ctx.moveTo(xOf(previous[0]), yOf(previous[1]));
-        ctx.lineTo(xOf(current[0]), yOf(current[1]));
-        ctx.stroke();
-      }
-    }
+    drawLayerTrails(ctx, frameData, xOf, yOf, "pitch");
 
     const playerRadius = clamp(width * 0.0042, 3.5, 6);
     for (const player of (frameData && frameData.players) || []) {
@@ -515,48 +657,30 @@
       ctx.stroke();
     }
 
-    const ball = (frameData && frameData.ball) || {};
-    if (ball.ex !== null && ball.ex !== undefined && ball.ey !== null && ball.ey !== undefined) {
-      const x = xOf(ball.ex);
-      const y = yOf(ball.ey);
-      const estimated = ball.source === 1;
-      const outside = ball.out_of_play;
-      const radius = clamp(width * 0.0068, 6, 10);
-      ctx.beginPath();
-      ctx.arc(x, y, radius, 0, Math.PI * 2);
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = outside ? "#ff6b5f" : estimated ? "#ffc857" : "rgba(255, 255, 255, 0.96)";
-      if (estimated) ctx.setLineDash([3, 2]);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.beginPath();
-      ctx.arc(x, y, 2.6, 0, Math.PI * 2);
-      ctx.fillStyle = outside ? "#ff6b5f" : "#ffffff";
-      ctx.fill();
-    }
     ctx.restore();
 
-    if (!data) {
-      ui.pitchEmpty.textContent = "Cargando datos del partido…";
-      ui.pitchEmpty.classList.remove("hidden");
-      ui.pitchStatus.textContent = "Cargando seguimiento…";
-    } else if (!data.tracking_available) {
-      ui.pitchEmpty.textContent = "Seguimiento no disponible: faltan el ATD o sus metadatos.";
-      ui.pitchEmpty.classList.remove("hidden");
-      ui.pitchStatus.textContent = "Seguimiento no disponible";
-    } else if (!frameData) {
-      ui.pitchEmpty.textContent = `Cargando frame ${formatFrame(state.frame)}…`;
-      ui.pitchEmpty.classList.remove("hidden");
-      ui.pitchStatus.textContent = `frame ${formatFrame(state.frame)} · cargando seguimiento…`;
-    } else {
-      ui.pitchEmpty.classList.add("hidden");
-      const ballState = sourceText((frameData.ball || {}).source);
-      const gap = Number((frameData.ball || {}).gap_s);
-      const gapText = Number.isFinite(gap) && gap > 0 ? ` · hueco ${gap.toFixed(2)} s` : "";
-      ui.pitchStatus.textContent = `frame ${formatFrame(frameData.frame)} · ${frameData.players.length} slots visibles · balón ${ballState}${gapText}`;
-      ui.pitchMap.setAttribute(
-        "aria-label",
-        `Vista cenital frame ${frameData.frame}: ${frameData.players.length} slots, balón ${ballState}.`,
+    // Draw ball markers after the pitch clip so an out-of-play ball remains visible in the
+    // padding around the pitch instead of disappearing at the touchline.
+    const markerScale = clamp(width / 620, 0.8, 1.25);
+    for (const layer of visibleBallLayers()) {
+      const layerInfo = layerData(frameData, layer);
+      if (
+        !layerInfo ||
+        layerInfo.source === 2 ||
+        layerInfo.x === null ||
+        layerInfo.y === null ||
+        !Number.isFinite(Number(layerInfo.x)) ||
+        !Number.isFinite(Number(layerInfo.y))
+      ) {
+        continue;
+      }
+      drawLayerBall(
+        ctx,
+        xOf(layerInfo.x),
+        yOf(layerInfo.y),
+        layer,
+        layerInfo,
+        markerScale,
       );
     }
 
@@ -579,33 +703,19 @@
     const fitted = fitOverlay();
     if (!fitted) return;
     const { ctx, width, height } = fitted;
+    const frameData =
+      state.frameData && state.frameData.frame === state.frame ? state.frameData : null;
+    // During playback the matching payload can arrive a few milliseconds after the video frame.
+    // Keep the previous drawing in that interval instead of clearing to an empty overlay.
+    if (state.data && state.data.tracking_available && !frameData) return;
     ctx.clearRect(0, 0, width, height);
-    if (!state.overlayEnabled || !state.data || !state.data.tracking_available) return;
-    const frameData = state.frameData;
-    if (!frameData || frameData.frame !== state.frame) return;
+    if (!state.overlayEnabled || !state.data || !state.data.tracking_available || !frameData) return;
     const scaleX = width / (frameData.video_width || 1920);
     const scaleY = height / (frameData.video_height || 1080);
     const xOf = (px) => px * scaleX;
     const yOf = (py) => py * scaleY;
 
-    const trail = frameData.trail || [];
-    if (trail.length > 1) {
-      ctx.save();
-      ctx.lineWidth = 1.5;
-      for (let index = 1; index < trail.length; index++) {
-        const previous = trail[index - 1];
-        const current = trail[index];
-        ctx.strokeStyle =
-          current[2] === 1
-            ? `rgba(255,200,87,${0.12 + (0.5 * index) / trail.length})`
-            : `rgba(255,255,255,${0.1 + (0.5 * index) / trail.length})`;
-        ctx.beginPath();
-        ctx.moveTo(xOf(previous[0]), yOf(previous[1]));
-        ctx.lineTo(xOf(current[0]), yOf(current[1]));
-        ctx.stroke();
-      }
-      ctx.restore();
-    }
+    drawLayerTrails(ctx, frameData, xOf, yOf, "video");
 
     for (const player of frameData.players || []) {
       if (player.px === null || player.px === undefined || player.py === null || player.py === undefined) {
@@ -624,26 +734,30 @@
       ctx.stroke();
     }
 
-    const ball = frameData.ball || {};
-    if (ball.px !== null && ball.px !== undefined && ball.py !== null && ball.py !== undefined) {
-      const estimated = ball.source === 1;
-      const outside = ball.out_of_play;
-      ctx.beginPath();
-      ctx.arc(xOf(ball.px), yOf(ball.py), outside ? 9 : 7, 0, Math.PI * 2);
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = outside
-        ? "#ff6b5f"
-        : estimated
-          ? "#ffc857"
-          : "rgba(255,255,255,0.95)";
-      if (estimated) ctx.setLineDash([3, 2]);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.beginPath();
-      ctx.arc(xOf(ball.px), yOf(ball.py), 2.6, 0, Math.PI * 2);
-      ctx.fillStyle = outside ? "#ff6b5f" : "#ffffff";
-      ctx.fill();
-    } else if (ball.source === 2) {
+    for (const layer of visibleBallLayers()) {
+      const layerInfo = layerData(frameData, layer);
+      if (
+        !layerInfo ||
+        layerInfo.source === 2 ||
+        layerInfo.px === null ||
+        layerInfo.py === null ||
+        !Number.isFinite(Number(layerInfo.px)) ||
+        !Number.isFinite(Number(layerInfo.py))
+      ) {
+        continue;
+      }
+      drawLayerBall(
+        ctx,
+        xOf(layerInfo.px),
+        yOf(layerInfo.py),
+        layer,
+        layerInfo,
+        0.9,
+      );
+    }
+
+    const combined = layerData(frameData, "combined");
+    if (state.layers.combined && (!combined || combined.source === 2)) {
       const label = "balón perdido";
       ctx.save();
       ctx.font = `600 11px ${MONO}`;
@@ -1242,7 +1356,9 @@
     requestFrameData(next);
     if (changed || force) {
       drawTimelines();
-      drawOverlay();
+      if (!state.data.tracking_available || (state.frameData && state.frameData.frame === next)) {
+        drawOverlay();
+      }
     }
   }
 
@@ -1812,6 +1928,16 @@
       state.overlayEnabled = ui.overlayToggle.checked;
       drawOverlay();
     });
+    for (const toggle of ui.layerToggles) {
+      const layer = toggle.dataset.layer;
+      if (!Object.prototype.hasOwnProperty.call(state.layers, layer)) continue;
+      state.layers[layer] = toggle.checked;
+      toggle.addEventListener("change", () => {
+        state.layers[layer] = toggle.checked;
+        drawOverlay();
+        updateExplorer();
+      });
+    }
     for (const button of document.querySelectorAll("[data-seek]")) {
       button.addEventListener("click", () => jump(Number(button.dataset.seek)));
     }

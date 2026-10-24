@@ -302,7 +302,10 @@ def detect_goals(
         if not candidates:
             # Fallback: a tagged, very long ball loss whose last position is in the goal mouth,
             # with no observation of the ball behind the line and outside the posts.  The latter
-            # is what rejects the two false GOALS tags in this match (shots wide / out of play).
+            # keeps precision: it rejects the false tag at 57,283 (shot wide), and it also misses
+            # the real 73,935 penalty because the ATD loses that ball for 55 s and reacquires it
+            # behind the line and wide.  A real goal without a tracked trajectory is not enough
+            # evidence to loosen this rule without also accepting the 57,283 false positive.
             wide = False
             for k in range(max(0, tag.start_frame), min(n, cutoff)):
                 if track.observed[k] and _behind_line_wide(

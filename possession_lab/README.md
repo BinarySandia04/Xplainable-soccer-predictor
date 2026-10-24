@@ -106,20 +106,31 @@ What is shown:
 * Video, current frame, timecode, predicted label, public GT (only inside frames
   `[11,185, 18,685)`; outside it the GT is shown as `X` / “sin evaluar”), and the UT.
 * **Tracking overlay.** Player slots and the ball are projected onto the video with the frame's
-  homography (1920×1080). The ball is a white ring when observed, a dashed amber ring when the
-  causal tracker is extrapolating a short hole, and a red ring when it is beyond the pitch. The
-  last ~1 s of ball positions is drawn as a fading trail. The `Seguimiento` checkbox toggles the
-  overlay.
+  homography (1920×1080). The three ball layers can be toggled independently under **Capas de
+  balón**: **ATD bruto** draws only ATD observations (white solid ring); **Kalman** is a causal
+  constant-velocity filter that rejects isolated jumps and predicts through holes up to 5 s (cyan
+  ring, dashed while predicting); **Combinado** is the production tracker, ATD observations plus
+  damped extrapolation for holes of at most 1.2 s (white ring when observed, dashed amber when
+  estimating). A red ring means the point is beyond the pitch. The last ~1 s of each enabled
+  layer is drawn as a fading trail. The `Seguimiento` checkbox toggles the whole overlay; the
+  layer checkboxes select which estimates are drawn.
 * **Mapa cenital.** A separate pitch canvas under the video draws the same frame directly from
   ATD metres, with **no homography and no video dependency**: pitch lines, blue/red player slots,
-  observed ball, estimated ball, and the ~1 s trail. It is the honest view of what the model sees
+  the enabled ball layers, and their ~1 s trails. It is the honest view of what the model sees
   when the broadcast projection does not match. The 46 slots are anonymous; colour is the team in
-  the XML, not a player identity. A solid white ring is an observation; a dashed amber ring is a
-  causal estimate of at most 1.2 s; no ring means a long gap.
+  the XML, not a player identity. The layer checkboxes affect both canvases; the map status line
+  reports each enabled layer and its gap. A ball outside the touchline is drawn in the map
+  padding in red instead of disappearing at the clip boundary.
 * **Dataset explorer.** A frame card shows the ball source/coordinates, ball and team speed,
   nearest player and distance, distance to the line, ball gap, last touch and age, and the active
-  goal/stoppage event. This is computed from the same full-match feature arrays the model used,
-  sliced per frame by the local server; the browser never receives the 199k-frame tracking table.
+  goal/stoppage event. The header also reports the state of each enabled ball layer. This is
+  computed from the same full-match feature arrays the model used, sliced per frame by the local
+  server; the browser never receives the 199k-frame tracking table.
+  The Kalman layer is **diagnostic only**: it does not feed `features.py`, the HMM, the event
+  detector, or the submission. A video-domain MOSSE/GrayDiff/NanoTrack fusion was evaluated on
+  paper but not implemented: this workspace has no tracker code or weights and no OpenCV/SciPy/
+  filterpy runtime, and the tactical video still needs frame-accurate alignment to make a pixel
+  tracker comparable with the ATD. The dataset-native Kalman layer is the implemented alternative.
 * **Event markers.** The full-match and detail timelines mark goals (green), confirmed stoppages
   (amber dashes), and ball-tracking gaps (grey). Hovering a timeline shows the frame, time, pred,
   GT, and UT.
@@ -244,9 +255,11 @@ raised spell F1 by ~0.005 but lowered macro F1 by ~0.019 and created a false H s
 Measured alternatives that were rejected: a fully split two-state alive/dead + H/A decode reached
 only 0.547 spell F1 and 0.686 macro F1; decaying the last-ball memory with gap length lowered macro
 F1 to 0.846; a walk/run fraction, a smart-tag team vote, and ball-speed gating of the dead-ball
-evidence each lowered public spell F1 by 0.03–0.07. A Kalman/RTS smoother is unnecessary for the
-public window: the causal tracker already fills the 0.4–1.2 s holes for goal geometry and the
-viewer, while the HMM keeps short gaps uniform; long holes should not be bridged.
+evidence each lowered public spell F1 by 0.03–0.07. An offline Kalman/RTS smoother is unnecessary
+for the model: the causal tracker already fills the 0.4–1.2 s holes for goal geometry and the
+production overlay, while the HMM keeps short gaps uniform and long holes are not bridged. The
+causal Kalman filter in `kalman.py` is a **viewer diagnostic** only; it is not blended into the
+HMM or the event detector.
 
 ## Results
 
@@ -311,8 +324,14 @@ holes remove most of the public window's possession evidence.
 Predictions, metric values, and seeded bootstrap intervals are reproducible from the same data
 and pinned dependencies. Wall-clock timings in `timings.json` and the HTML report naturally vary
 by machine. The detected goals are at frames **46,691** (`trajectory`) and **157,825**
-(`celebration`); the two tagged goal candidates at 57,283 and 73,710 are rejected because the ball
-was observed behind the line but wide of the posts.
+(`celebration`). The tagged candidate at **57,283** is a false positive: the ball is observed
+behind the line but wide before its gap. The **73,935** penalty (tag opens at 73,710) is a real
+goal that the conservative detector misses: the ATD loses the ball for **55 s** across the kick,
+so there is no tracked trajectory; its first re-observation at 73,951 is already behind the line
+and wide, and the last pre-gap point is 13.5 m from the line, outside the 12 m fallback. The
+fallback therefore rejects it. Loosening that rule would also accept the 57,283 false tag, so the
+miss is documented rather than hidden. This is a known recall limitation of the
+high-precision event layer.
 
 ## Data and privacy
 
@@ -347,6 +366,7 @@ possession_lab/
   config.py       match constants, labels, paths, exact parameters
   data.py         ATD / smart-tag / homography / GT loaders
   balltrack.py    causal short-gap ball tracker
+  kalman.py       causal constant-velocity Kalman viewer layer (diagnostic)
   audio.py        ffmpeg audio decode, whistle score, cache
   events.py       goal/stoppage detection and hard D overrides
   features.py     distances, gap, edge, last touch, tags, tracker/whistle/event features

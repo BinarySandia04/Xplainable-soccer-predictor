@@ -7,7 +7,7 @@ Unless noted, commands run from the repository root.
 
 ```text
 $ .venv/bin/python -m pytest -q possession_lab/tests
-75 passed, 4 subtests passed in 4.79s
+81 passed, 4 subtests passed in 5.32s
 
 $ .venv/bin/python -m compileall -q possession_lab
 $ node --check possession_lab/viewer_assets/viewer.js
@@ -18,9 +18,11 @@ The suite covers ATD/tag/homography parsing, feature geometry and gap state, bal
 whistle scoring/cache fallbacks, goal/stoppage detection and overrides, HMM emissions and
 Viterbi/posterior consistency, sparse tracking, official metric wiring, stress masks, full-match
 structure, CSV writing, preflight validation, the explanation layer, and the local viewer
-(payload, public-only GT band, per-frame `/api/frame`, top-view pitch/trail payload, UT
-scoring/editing/persistence and boundary moves, byte ranges, HTTP 206/416/HEAD, API, and route
-whitelist).
+(payload, public-only GT band, per-frame `/api/frame`, top-view pitch/trail payload, the three
+raw/Kalman/combined layer payloads and trails, UT scoring/editing/persistence and boundary moves,
+byte ranges, HTTP 206/416/HEAD, API, and route whitelist). `test_kalman.py` adds five tests for
+the constant-velocity fit, short-hole prediction, long-hole refusal, outlier rejection, missing
+observations, and gap age.
 
 ## Regenerated outputs
 
@@ -97,8 +99,18 @@ Goal evidence:
 157,825 celebration 157,825–163,000
 ```
 
-The tagged candidates at 57,283 and 73,710 are rejected: the ball was observed behind the goal
-line but wide of the posts.
+The tagged candidate at **57,283** is a false positive: the ball was observed behind the goal line
+but wide of the posts before its gap. The **73,935** penalty (tag opens at 73,710) is a real goal
+that the conservative detector misses: the ball is absent from the ATD for **72,560–73,950**
+(**1,391 frames, 55.64 s**), so the tag has no tracked trajectory. The last pre-gap point at
+**72,559** is `(13.52, 34.31) m`, **13.5 m** from the nearest goal line (outside the **12 m**
+fallback allowance); the first post-gap observation at **73,951** is `(-3.05, 25.37) m`, behind
+the line and wide, and `_behind_line_wide()` also rejects the fallback. The smart tags around it
+(`GOALS` 73,710–75,483, `SET PIECES | Free Kick`
+73,614–74,490, `PLAYERS IN THE BOX` 72,232–74,325, `Kick Off (After Goal)` 75,457–75,583) and the
+burned-in 41:48 / 1–0 clock identify it as Oihan Sancet's 42' penalty in Barcelona 2–1 Athletic
+(24 Aug 2024). The miss is retained because relaxing the fallback would also accept the 57,283
+false tag.
 
 Confirmed public stoppages after the kick-off trim (hard `D` overrides):
 
@@ -146,12 +158,15 @@ changes / disagreements    304 changes
 tags                       638 intervals
 events / ball gaps          70 / 149
 switches / explanations    298 / true
-GET /api/frame?frame=12851 200  3,230 bytes
+GET /api/frame?frame=12851 200  6,285 bytes
   keys                      active_events, available, ball, features, fps, frame,
-                            pitch, players, trail, trail_pitch, time_s,
-                            video_height, video_width
+                            layers, pitch, players, time_s, trail, trail_pitch,
+                            trails, video_height, video_width
   pitch / players           105.3 × 68.0 m / 21 slots
-  trails                    25 projected / 25 pitch-space points
+  layers                    raw lost; Kalman estimated 30.99, 58.09 m, gap 0.84 s;
+                            combined estimated 30.98, 55.79 m, gap 0.84 s
+  trails                    raw 0; Kalman 25 projected / 25 pitch-space;
+                            combined 25 projected / 25 pitch-space
 GET /video Range: bytes=0-1023
                            206  1,024 bytes
 Content-Range              bytes 0-1023/5222307334
@@ -167,16 +182,31 @@ Browser checks:
 * Overlay: video and overlay rectangles both measured `1139.4 × 640.9` CSS px after moving the
   canvas into the `.video-frame` wrapper. Before the fix the overlay was `1139.4 × 678.5` because
   the global `canvas { height: 100% }` filled the whole video card, including the caption.
-* Frame 12,000: 22 projected players, observed ball; a screenshot showed the projected dots on
-  the players and the white ball ring on the ball.
-* Frame 12,851: 21 projected players and the estimated ball at `30.98, 55.79 m`; the ball gap was
-  `0.84 s (21 f)`, ball state `estimado`.
-* Top-view map: canvas `658 × 424` CSS px, non-blank; frame 12,000 status `22 slots visibles ·
-  balón observado`, frame 12,851 status `21 slots visibles · balón estimado · hueco 0.84 s`.
-  The map uses `pitch`, `players[].x/y`, `ball.ex/ey`, and `trail_pitch`; it does not read video
-  pixels or call the homography.
+* Frame 12,000: 22 projected players, all three layers observed; a screenshot showed the
+  projected dots on the players and the white ball ring on the ball.
+* Frame 12,851: 21 projected players; raw was lost, Kalman estimated at `30.99, 58.09 m`, and
+  combined estimated at `30.98, 55.79 m`, both with gap `0.84 s (21 f)`. The cyan Kalman ring and
+  the dashed amber combined ring were both visible; their separation was `2.3 m`.
+* Top-view map: canvas `658 × 424` CSS px, non-blank. At 12,000 status was `frame 12.000 · 22
+  slots · comb. observado · Kalman observado · ATD observado`; at 12,851 it was `frame 12.851 ·
+  21 slots · comb. estimado (0.84 s) · Kalman estimado (0.84 s) · ATD perdido`. The map uses
+  `pitch`, `players[].x/y`, `layers[layer].x/y`, and `trails[layer].pitch`; it does not read
+  video pixels or call the homography.
+* Frame 73,935 (the missed Sancet penalty): all three layers were `source=2` with gap `55.04 s`;
+  the map drew no ball. At 73,951 all three layers were observed at `-3.05, 25.37 m`,
+  `out_of_play=true`; the red ring was visible in the map's left padding, outside the pitch clip.
 * Explorer at 12,851: `Jugador cerca —`, `Dist. a línea —`, `Vel. equipos 3.79 m/s`, last touch
   `Barcelona · 0.84 s`, event `juego abierto` (the stop begins on 12,852).
+* Layout during playback: the explorer card stayed `472.7 px` high, `#trackingStatus` stayed
+  `35.4 px` (two reserved lines), `#pitchStatus` stayed `17.7 px` (one line with ellipsis), the
+  pitch card stayed `981.4 × 593.9 px`, and `body.scrollHeight` stayed `2881 px` across frames
+  12,000/12,851/73,935/73,951. The long frame-73,935 status is clamped to two lines with the full
+  text in `title`; it no longer pushes the card or page.
+* Playback instrumentation over frames 12,001–12,048 recorded exactly `35` `clearRect` calls on
+  `pitchMap` and `35` on `overlay` for 35 drawn frames — one clear per canvas per draw, not the
+  old doubled clear. The layer toggles unchecked/restored raw, Kalman, and combined; each change
+  updated both the map and the explorer status, and “sin capas de balón” appeared when all were
+  off. No blank map frame was observed while waiting for a payload.
 * Seeking through the UI's own Go button to frame 46,691 moved video `currentTime` to `1867.66`
   and displayed `GOL · trajectory`.
 * Frame 157,825 displayed `GOL · celebration`; frame 15,888 displayed `PARADA · whistle`.

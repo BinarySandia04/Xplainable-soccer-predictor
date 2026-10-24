@@ -180,6 +180,8 @@ class FrameStoreTopViewTest(unittest.TestCase):
                 axis=0,
             )
         )
+        # A moving camera: the historical point must use its own frame's homography.
+        homography.matrices[0, 0, 2] = 100.0
         track = SimpleNamespace(
             source=np.array([0, 1, 2], dtype=np.int8),
             estimate=np.array([[10.0, 20.0], [11.0, 21.0], [np.nan, np.nan]], dtype=np.float32),
@@ -204,6 +206,10 @@ class FrameStoreTopViewTest(unittest.TestCase):
         self.assertAlmostEqual(payload["players"][0]["py"], 21.0 / 68.0 * 1080.0, places=1)
         self.assertEqual(payload["ball"]["ex"], 11.0)
         self.assertEqual(payload["trail_pitch"], [[10.0, 20.0, 0], [11.0, 21.0, 1]])
+        self.assertAlmostEqual(
+            payload["trail"][0][0], 100.0 + 10.0 / 105.3 * 1920.0, places=1
+        )
+        self.assertAlmostEqual(payload["trail"][1][0], 11.0 / 105.3 * 1920.0, places=1)
 
         # The map is independent of video projection: a broken homography removes pixels
         # but keeps the pitch coordinates and pitch-space trail intact.
@@ -215,6 +221,71 @@ class FrameStoreTopViewTest(unittest.TestCase):
         self.assertEqual(payload["players"][0]["x"], 11.0)
         self.assertEqual(payload["ball"]["ex"], 11.0)
         self.assertEqual(payload["trail_pitch"], [[10.0, 20.0, 0], [11.0, 21.0, 1]])
+
+
+class FrameStoreLayersTest(unittest.TestCase):
+    def test_payload_separates_raw_kalman_and_combined_layers(self):
+        tracking = SimpleNamespace(
+            n_frames=3,
+            ball=np.array([[10.0, 20.0], [np.nan, np.nan], [12.0, 22.0]], dtype=np.float32),
+            ball_present=np.array([True, False, True]),
+            players=np.array(
+                [
+                    [[10.0, 20.0], [30.0, 40.0]],
+                    [[11.0, 21.0], [np.nan, np.nan]],
+                    [[12.0, 22.0], [np.nan, np.nan]],
+                ],
+                dtype=np.float32,
+            ),
+            speeds=np.zeros((3, 2), dtype=np.float32),
+            player_present=np.array([[True, True], [True, False], [True, False]]),
+            teams=np.array([0, 1], dtype=np.int8),
+            pitch=(105.3, 68.0),
+        )
+        homography = SimpleNamespace(
+            matrices=np.repeat(
+                np.array([[[1920.0, 0.0, 0.0], [0.0, 1080.0, 0.0], [0.0, 0.0, 1.0]]]),
+                3,
+                axis=0,
+            )
+        )
+        combined = SimpleNamespace(
+            source=np.array([0, 1, 0], dtype=np.int8),
+            estimate=np.array([[10.0, 20.0], [11.0, 21.0], [12.0, 22.0]], dtype=np.float32),
+            confidence=np.array([1.0, 0.4, 1.0], dtype=np.float32),
+            gap_s=np.array([0.0, 0.04, 0.0], dtype=np.float32),
+            out_of_play=np.zeros(3, dtype=bool),
+        )
+        kalman = SimpleNamespace(
+            source=np.array([0, 1, 0], dtype=np.int8),
+            estimate=np.array([[10.5, 20.5], [11.5, 21.5], [12.5, 22.5]], dtype=np.float32),
+            confidence=np.array([0.9, 0.6, 0.9], dtype=np.float32),
+            gap_s=np.array([0.0, 0.04, 0.0], dtype=np.float32),
+            out_of_play=np.zeros(3, dtype=bool),
+        )
+        store = FrameStore(
+            tracking,
+            homography,
+            combined,
+            SimpleNamespace(goals=(), stoppages=()),
+            SimpleNamespace(start=0),
+            trail_frames=3,
+            kalman=kalman,
+        )
+        payload = store.frame_payload(1)
+
+        self.assertIsNone(payload["layers"]["raw"]["x"])
+        self.assertEqual(payload["layers"]["raw"]["source"], 2)
+        self.assertEqual(payload["layers"]["kalman"]["x"], 11.5)
+        self.assertEqual(payload["layers"]["kalman"]["source"], 1)
+        self.assertEqual(payload["layers"]["combined"]["x"], 11.0)
+        self.assertEqual(payload["layers"]["combined"]["source"], 1)
+        self.assertEqual(payload["trails"]["raw"]["pitch"], [])
+        self.assertEqual(payload["trails"]["kalman"]["pitch"], [[10.5, 20.5, 0], [11.5, 21.5, 1]])
+        self.assertEqual(
+            payload["trails"]["combined"]["pitch"],
+            [[10.0, 20.0, 0], [11.0, 21.0, 1]],
+        )
 
 
 class UserTruthTest(unittest.TestCase):

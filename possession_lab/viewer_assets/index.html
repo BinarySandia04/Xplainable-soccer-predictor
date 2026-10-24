@@ -44,22 +44,38 @@
 
         <section class="pitch-card" aria-label="Mapa cenital de jugadores y balón">
           <div class="pitch-head">
-            <div>
+            <div class="pitch-heading">
               <div class="eyebrow">Mapa cenital · coordenadas de cancha</div>
-              <div id="pitchStatus" class="muted small">Cargando seguimiento…</div>
+              <div id="pitchStatus" class="muted small pitch-status">Cargando seguimiento…</div>
             </div>
             <div class="pitch-legend" aria-label="Leyenda del mapa cenital">
               <span><i class="pitch-dot dot-H"></i>Barcelona</span>
               <span><i class="pitch-dot dot-A"></i>Athletic</span>
-              <span><i class="pitch-dot dot-observed"></i>Balón observado</span>
-              <span><i class="pitch-dot dot-estimated"></i>Estimado</span>
+              <span><i class="pitch-dot dot-atd"></i>ATD bruto</span>
+              <span><i class="pitch-dot dot-kalman"></i>Kalman</span>
+              <span><i class="pitch-dot dot-combined"></i>Combinado</span>
             </div>
+          </div>
+          <div class="layer-bar" role="group" aria-label="Capas de balón visibles">
+            <span class="layer-bar-label">Capas de balón · video y mapa</span>
+            <label class="layer-toggle" title="Solo posiciones observadas por el ATD; no rellena huecos">
+              <input type="checkbox" data-layer="raw" checked>
+              ATD bruto
+            </label>
+            <label class="layer-toggle" title="Filtro Kalman causal; predice huecos cortos y rechaza saltos aislados">
+              <input type="checkbox" data-layer="kalman" checked>
+              Kalman
+            </label>
+            <label class="layer-toggle" title="ATD observado + extrapolación causal de ≤ 1,2 s; es la capa del modelo">
+              <input type="checkbox" data-layer="combined" checked>
+              Combinado
+            </label>
           </div>
           <div class="pitch-wrap">
             <canvas id="pitchMap" class="pitch-canvas" role="img" aria-label="Vista cenital del balón y los slots de jugadores en metros de cancha"></canvas>
             <div id="pitchEmpty" class="pitch-empty hidden">Seguimiento no disponible</div>
           </div>
-          <p class="fine-print">Vista directa del ATD en metros (105,3 × 68 m), sin homografía ni video. Los 46 slots son anónimos: el color indica el equipo del XML, no una identidad. El aro ámbar es una extrapolación causal de ≤ 1,2 s; sin aro no hay estimación.</p>
+          <p class="fine-print">Vista directa del ATD en metros (105,3 × 68 m), sin homografía ni video. Los 46 slots son anónimos: el color indica el equipo del XML, no una identidad. <strong>ATD bruto</strong> solo dibuja observaciones; <strong>Kalman</strong> filtra y predice hasta 5 s; <strong>combinado</strong> usa ATD y rellena solo huecos de ≤ 1,2 s. Los puntos tenues son estimaciones, no observaciones.</p>
         </section>
 
         <section class="timeline-card" aria-label="Línea temporal del partido">
@@ -153,7 +169,7 @@
             <div><dt>Último toque</dt><dd id="touchState">—</dd></div>
             <div><dt>Evento</dt><dd id="eventState">—</dd></div>
           </dl>
-          <p class="fine-print">Proyección del ATD sobre el video con la homografía del frame. El aro ámbar indica una posición estimada por el tracker causal; un hueco mayor de 1,2 s no se rellena.</p>
+          <p class="fine-print">Proyección del ATD sobre el video con la homografía del frame. El explorador muestra el tracker combinado del modelo: ATD observado y extrapolación causal de ≤ 1,2 s. El mapa añade las capas Kalman y ATD bruto para comparar, pero no cambia el modelo ni los eventos.</p>
         </section>
 
         <section id="explainCard" class="card explain-card" aria-label="Por qué el modelo cambió de estado">

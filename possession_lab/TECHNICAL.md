@@ -44,8 +44,9 @@ nearest-player/team distances and never claims an identity.
 The ball is observed in **113,488 frames (56.94%)**, estimated for short holes in **4,441
 (2.23%)**, and has no estimate in **81,390 (40.83%)**. `balltrack.py` is causal: source `0` is an
 observation, source `1` is an extrapolation capped at 1.2 s, and source `2` is a long gap where
-the viewer draws no ball. This is why an amber ring can disagree with the video by design, and why
-the top-view map marks observed and estimated balls differently.
+the production layer draws no ball. The optional diagnostic Kalman layer may still predict for up
+to 5 s and is reported separately. This is why an amber ring can disagree with the video by
+design, and why the top-view map marks observed and estimated balls differently.
 
 ## Pipeline
 
@@ -92,6 +93,30 @@ parameter set the HMM's short-gap emission is **uniform** (`est_blend=0.0`); the
 is not blended into the HMM emission. This is deliberate: blending a short extrapolation into the
 emission improved some public frames but created false possession changes in longer gaps, so the
 short-gap prior remains the validated behaviour.
+
+## Diagnostic Kalman layer (`kalman.py`)
+
+The viewer can show a second, independent ball estimate. It exists to make the cost of the
+conservative production tracker visible; it does not change the model, the event layer, or the
+submission.
+
+* State `[x, y, vx, vy]`, constant-velocity transition at 25 fps. Process noise is `1.2 m/s²`
+  (acceleration), measurement noise is `0.6 m`, and speed is capped at 38 m/s.
+* A measurement is accepted only inside a squared Mahalanobis gate of `25`; a single large jump
+  is ignored. Three consecutive rejects, or a hole longer than 1 s, reset the filter to the new
+  observation so it cannot stay locked to a stale track.
+* It predicts through holes up to **5 s** (`source=1`), then reports no estimate (`source=2`).
+  Confidence is `exp(-(gap/1.0)²)` while predicting, and estimates more than 1 m outside the pitch
+  are flagged out of play.
+* It is causal: frame `k` only uses ATD observations at frames `<= k`. It never reads the video,
+  the homography, the HMM, the event detector, or the UT.
+* The production layer remains `balltrack.py` (maximum 1.2 s). `combined` is that tracker; `raw`
+  is ATD observations only; `kalman` is this diagnostic filter.
+
+A pixel-domain tracker (MOSSE, GrayDiff, NanoTrack, or a fusion) is not implemented. The workspace
+has no tracker code or weights and no OpenCV/SciPy/filterpy runtime, and the tactical video would
+need frame-accurate alignment before a pixel track could be compared with the ATD. Adding one is
+future work, not part of this viewer change.
 
 ## Features (`features.py`)
 
@@ -226,9 +251,18 @@ ball-loss run before the restart:
   missing for at least 8 s, and a celebration/kick-off tag backs it. A ball observed behind the
   line but outside the posts (`_behind_line_wide`) rejects the goal.
 
-Accepted goals: frame **46,691** (`trajectory`) and frame **157,825** (`celebration`). The tagged
-candidates at 57,283 and 73,710 are rejected because the ball was observed behind the line but
-wide. Goal intervals extend to the restart: 46,691–49,631 and 157,825–163,000.
+Accepted goals: frame **46,691** (`trajectory`) and frame **157,825** (`celebration`). Goal
+intervals extend to the restart: 46,691–49,631 and 157,825–163,000.
+
+The tag at **57,283** is a false positive and is correctly rejected: the ball is observed behind
+the line but wide before its gap. The tag at **73,710** covers a real goal (Oihan Sancet's 42'
+penalty, burned-in clock 41:48) but is missed. The ATD loses the ball from **72,560 to 73,950**
+(55.64 s) across the kick; there is no trajectory. The last pre-gap point at **72,559** is
+`(13.52, 34.31) m`, **13.5 m** from the nearest goal line, outside the **12 m** fallback
+allowance; the first re-observation at **73,951** is `(-3.05, 25.37) m`, behind the line and wide,
+so `_behind_line_wide()` also rejects the fallback. This is a deliberate precision/recall
+trade-off: weakening the rule to accept 73,935 would also accept 57,283. The miss is documented
+rather than hidden.
 
 ### Stoppages
 
@@ -348,25 +382,36 @@ required. `imageio-ffmpeg` is only used by the offline audio extractor, not by t
   stoppages, and ball-gap runs are included. When `outputs/explanations.json` exists it is folded
   in as `switches` and `explanations_available`; the UI degrades quietly without it.
 * **Per-frame explorer.** `GET /api/frame?frame=N` returns one compact payload built by
-  `FrameStore`: pitch size, projected 1920×1080 player/ball pixels (`px`/`py` may be `null`),
-  raw pitch coordinates, the ball's raw and tracked state, a ~1 s projected trail and
-  `trail_pitch`, the feature slice (team/ball speed, edge, gap, near player/team, last touch,
-  whistle score/envelope, event masks), and active events. The browser never receives the
+  `FrameStore`: pitch size, projected 1920×1080 player pixels (`px`/`py` may be `null`), the
+  feature slice (team/ball speed, edge, gap, near player/team, last touch, whistle
+  score/envelope, event masks), active events, and three ball layers. Each layer
+  (`raw`, `kalman`, `combined`) carries `source` (`0` observed, `1` estimated, `2` lost),
+  `observed`, metres `x/y`, projected `px/py`, `confidence`, `gap_s`, and `out_of_play`.
+  `trails[layer].pitch` and `trails[layer].video` hold a ~1 s trail; the legacy `ball`, `trail`,
+  and `trail_pitch` fields remain as aliases for `combined`. The browser never receives the
   199k-frame tracking arrays. If tracking is unavailable the endpoint returns a JSON 404 and the
   viewer still shows the labels and timelines.
-* **Overlay.** Players are projected with the frame's homography; the ball is a white ring when
-  observed, a dashed amber ring when the tracker is filling a short hole, and red when beyond the
-  pitch. The `Seguimiento` checkbox toggles the canvas. The canvas now lives inside a
-  `.video-frame` wrapper that contains the video only, so the global `canvas { height: 100% }`
-  rule cannot stretch it over the caption. Measured video and overlay rectangles match
-  (`1139.4 × 640.9` CSS px); before the wrapper the overlay was `1139.4 × 678.5`.
+* **Overlay.** Players are projected with the frame's homography. The `Seguimiento` checkbox
+  toggles the whole canvas; the **Capas de balón** checkboxes choose `raw`, `kalman`, and
+  `combined`. Raw observations are solid white, Kalman is cyan (dashed while predicting), and the
+  combined production layer is white when observed or dashed amber when extrapolating; an
+  out-of-play point is red. The canvas lives inside a `.video-frame` wrapper that contains the
+  video only, so the global `canvas { height: 100% }` rule cannot stretch it over the caption.
+  Measured video and overlay rectangles match (`1139.4 × 640.9` CSS px); before the wrapper the
+  overlay was `1139.4 × 678.5`.
 * **Top-view map.** A second native canvas under the video draws the pitch boundary, halfway
-  line, centre circle, penalty/six-yard boxes, spots, goals, all visible player slots, the
-  observed/estimated ball, and the pitch-space trail. It reads `pitch`, `players[].x/y`,
-  `ball.ex/ey`, and `trail_pitch`; it never calls the homography or the video. The plot is
-  `105.3 × 68 m` with a `660 px` maximum width, a legend, and a live status line
-  (`frame · slots · balón source · gap`). Observed is solid white, estimated is dashed amber,
-  out-of-play is red, and source `2` draws no ball.
+  line, centre circle, penalty/six-yard boxes, spots, goals, all visible player slots, the enabled
+  ball layers, and their pitch-space trails. It reads `pitch`, `players[].x/y`,
+  `layers[layer].x/y`, and `trails[layer].pitch`; it never calls the homography or the video. The
+  plot is `105.3 × 68 m` with a `660 px` maximum width, a legend, layer toggles, and a single-line
+  status (`frame · slots · layer state · gap`). Ball markers are drawn after the pitch clip, so an
+  out-of-play ball remains visible in the padding; source `2` draws no ball.
+* **Layout stability.** `#trackingStatus` reserves exactly two lines (`min-height`/`max-height`
+  2.7em, `line-clamp: 2`); `#pitchStatus` is one line with ellipsis. The explorer card and the
+  pitch card therefore keep their height while text changes during playback, and the map does not
+  clear to a blank frame when an async `/api/frame` payload is still in flight. The overlay and
+  pitch map are redrawn only when the payload's frame matches the displayed frame; a cached
+  response is not drawn twice.
 * **Decision annotations.** Every predicted switch is a thin tick on the PRED band of both
   timelines; ticks are hit-tested within 6 px, seeking and opening the decision card on click.
   The card lists every switch with a clickable timestamp, the `from → to` transition, the
@@ -391,15 +436,18 @@ required. `imageio-ffmpeg` is only used by the offline audio extractor, not by t
 
 The reviewer is covered by `tests/test_viewer.py`: payload semantics, public-only GT behavior,
 UT scoring/persistence/editing, range parsing (`normal`, open, suffix, invalid), HTTP
-`206`/`416`/`HEAD`, API payload, per-frame payload/404, top-view pitch/trail payload, and
-unknown-route rejection.
+`206`/`416`/`HEAD`, API payload, per-frame payload/404, top-view pitch/trail payload, the three
+layer payloads and trails, and unknown-route rejection. `tests/test_kalman.py` covers the
+constant-velocity fit, short-hole prediction, long-hole refusal, outlier rejection, missing
+observations, and gap age.
 
 ## Validation
 
-* Unit tests: **75 stdlib `unittest` tests (+4 subtests)**, all passing — including switch/reason
+* Unit tests: **81 stdlib `unittest` tests (+4 subtests)**, all passing — including switch/reason
   rules (`test_explain.py`), stop-signal parameter neutrality and gating (`test_model.py`),
-  tracker/audio/event units (`test_balltrack.py`, `test_audio.py`, `test_events.py`), and
-  annotation/frame-explorer/top-view plumbing (`test_viewer.py`).
+  tracker/audio/event units (`test_balltrack.py`, `test_audio.py`, `test_events.py`), the Kalman
+  layer (`test_kalman.py`), and annotation/frame-explorer/top-view plumbing
+  (`test_viewer.py`).
 * Public metrics for the final parameters: spell F1 **0.6519**, macro F1 **0.9466**, D-F1
   **0.9727**, accuracy 0.9417, kappa 0.9083, alive/dead F1 0.9933, team accuracy (both alive)
   0.9404, 10 predicted spells (17 in GT). The 95% spell-F1 bootstrap is [0.430, 0.817].
@@ -414,10 +462,16 @@ unknown-route rejection.
   `GOL · celebration`, frame 15,888 showed `PARADA · whistle`; the overlay canvas and frame
   explorer rendered. After wrapping the video, the measured video and overlay rectangles both
   read `1139.4 × 640.9` CSS px; a frame-12,000 screenshot placed the projected dots on the
-  players and the ball ring on the ball. The top-view canvas measured `658 × 424`, was non-blank,
-  and reported `22 slots visibles · balón observado` at frame 12,000 and `21 slots visibles ·
-  balón estimado · hueco 0.84 s` at frame 12,851. A 5 s virtual-time screenshot stalls media
-  metadata in headless Chrome; the CDP run is the authoritative browser evidence.
+  players and the ball ring on the ball. The top-view canvas measured `658 × 424` and was
+  non-blank. At frame 12,851 the three layer payloads separated cleanly: raw had no observation,
+  Kalman estimated at `30.99, 58.09 m`, and combined at `30.98, 55.79 m`, with gap `0.84 s`;
+  cyan (Kalman) and amber (combined) rings were visible. At frame 73,935 all layers were lost
+  with gap `55.04 s`; at 73,951 all were observed at `-3.05, 25.37 m` and the red out-of-play
+  marker was visible in the map padding. The layer checkboxes changed both the map and the
+  explorer status. `#trackingStatus` stayed at `35.4` px (two lines), `#pitchStatus` at `17.7`
+  px (one line), and the explorer card stayed at `472.7` px throughout playback; each canvas had
+  exactly one `clearRect` per drawn frame. A 5 s virtual-time screenshot stalls media metadata in
+  headless Chrome; the CDP run is the authoritative browser evidence.
 * Submission: 199,319 rows, frames 0–199,318, official validator `OK`, `n_runs=305`.
 
 ## Full-match reconciliation
