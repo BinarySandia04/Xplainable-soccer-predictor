@@ -106,6 +106,11 @@ class ModelTest(unittest.TestCase):
 
     def test_slow_players_support_the_dead_ball_state(self):
         f = make_feature_namespace()
+        # A loose ball, not one being controlled: control deliberately suppresses the motion
+        # term, because a player standing with the ball is live possession.
+        f.near_distance[:] = 5.0
+        f.d_home[:] = 5.0
+        f.d_away[:] = 5.5
         params = ModelParams(w_motion=1.0, w_dead=0.0)
         slow = SimpleNamespace(**{**f.__dict__, "team_speed": np.zeros(7)})
         fast = SimpleNamespace(**{**f.__dict__, "team_speed": np.full(7, 4.0)})
@@ -113,6 +118,18 @@ class ModelTest(unittest.TestCase):
         slow_logp = emission_log_probs(slow, params)
         fast_logp = emission_log_probs(fast, params)
         self.assertGreater(slow_logp[0, 2], fast_logp[0, 2])
+
+    def test_controlled_ball_suppresses_the_motion_term(self):
+        f = make_feature_namespace()
+        f.near_distance[:] = 0.4
+        params = ModelParams(w_motion=1.0, w_dead=0.0)
+        slow = SimpleNamespace(**{**f.__dict__, "team_speed": np.zeros(7)})
+        fast = SimpleNamespace(**{**f.__dict__, "team_speed": np.full(7, 4.0)})
+        np.testing.assert_allclose(
+            emission_log_probs(slow, params)[0, 2],
+            emission_log_probs(fast, params)[0, 2],
+            atol=1e-12,
+        )
 
     def test_brief_flip_is_absorbed(self):
         codes = np.array([0] * 10 + [2] * 5 + [0] * 10 + [1] * 40, dtype=np.int8)
@@ -147,14 +164,14 @@ class ModelTest(unittest.TestCase):
         np.testing.assert_allclose(logp[0], np.log(1.0 / 3.0), atol=1e-12)
 
     def test_default_parameters_are_the_documented_reference(self):
-        self.assertEqual(DEFAULT_PARAMS.sigma, 3.5)
-        self.assertEqual(DEFAULT_PARAMS.d_dead, 7.0)
+        self.assertEqual(DEFAULT_PARAMS.sigma, 4.0)
+        self.assertEqual(DEFAULT_PARAMS.d_dead, 8.0)
         self.assertEqual(DEFAULT_PARAMS.miss_mode, "hybrid")
         self.assertEqual(DEFAULT_PARAMS.gap_thresh, 120)
         self.assertAlmostEqual(DEFAULT_PARAMS.p_stay, 0.995)
         self.assertAlmostEqual(DEFAULT_PARAMS.p_ha, 0.0005)
         self.assertAlmostEqual(DEFAULT_PARAMS.p_hd, 0.001)
-        self.assertAlmostEqual(DEFAULT_PARAMS.p_dh, 0.01)
+        self.assertAlmostEqual(DEFAULT_PARAMS.p_dh, 0.007)
         self.assertAlmostEqual(DEFAULT_PARAMS.w_edge, 0.5)
         self.assertAlmostEqual(DEFAULT_PARAMS.w_motion, 1.0)
         self.assertAlmostEqual(DEFAULT_PARAMS.w_dead, 0.02)

@@ -240,7 +240,8 @@ button:disabled {
 
 .video-card,
 .card,
-.timeline-card {
+.timeline-card,
+.pitch-card {
   background: linear-gradient(180deg, rgba(22, 34, 48, 0.92), rgba(18, 28, 38, 0.96));
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -249,7 +250,12 @@ button:disabled {
 
 .video-card {
   overflow: hidden;
+  min-width: 0;
+}
+
+.video-frame {
   position: relative;
+  overflow: hidden;
   min-width: 0;
 }
 
@@ -261,48 +267,25 @@ video {
   outline: none;
 }
 
-.video-buffer {
+.video-overlay {
   position: absolute;
-  inset: 0 0 2.2rem;
-  display: grid;
-  place-items: center;
+  inset: 0;
+  width: 100%;
+  height: 100%;
   pointer-events: none;
-  background: rgba(8, 13, 18, 0.42);
-  transition: opacity 160ms ease;
+  z-index: 2;
 }
 
-.video-buffer-pill {
-  display: flex;
+.overlay-toggle {
+  display: inline-flex;
   align-items: center;
-  gap: 0.65rem;
-  padding: 0.7rem 1.1rem;
-  color: var(--ink-soft);
-  font-size: 0.88rem;
-  background: rgba(10, 15, 20, 0.88);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  box-shadow: var(--shadow);
+  gap: 0.35rem;
+  color: var(--muted);
+  white-space: nowrap;
 }
 
-.spinner {
-  width: 14px;
-  height: 14px;
-  border: 2px solid rgba(255, 255, 255, 0.18);
-  border-top-color: var(--h);
-  border-radius: 50%;
-  animation: spin 900ms linear infinite;
-}
-
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .spinner {
-    animation-duration: 2.4s;
-  }
+.overlay-toggle input {
+  accent-color: var(--h);
 }
 
 .video-caption {
@@ -318,7 +301,7 @@ video {
 
 .video-error {
   position: absolute;
-  inset: 0 0 2.2rem;
+  inset: 0;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -327,6 +310,143 @@ video {
   background: rgba(12, 5, 5, 0.9);
   text-align: center;
   font-size: 0.95rem;
+}
+
+.pitch-card {
+  padding: 0.95rem 1rem 1rem;
+  min-width: 0;
+}
+
+.pitch-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.pitch-heading {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.pitch-status {
+  min-height: 1.35em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.35;
+}
+
+.layer-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.75rem;
+  margin-top: 0.65rem;
+  padding: 0.42rem 0.55rem;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: rgba(8, 13, 18, 0.32);
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.layer-bar-label {
+  color: var(--muted-2);
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.layer-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.layer-toggle input {
+  margin: 0;
+  accent-color: var(--h);
+}
+
+.layer-toggle input[data-layer="raw"] {
+  accent-color: #f4f8fb;
+}
+
+.layer-toggle input[data-layer="kalman"] {
+  accent-color: #9ad0ff;
+}
+
+.layer-toggle input[data-layer="combined"] {
+  accent-color: var(--warn);
+}
+
+.pitch-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.32rem 0.8rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.pitch-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32rem;
+  white-space: nowrap;
+}
+
+.pitch-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55);
+}
+
+.pitch-dot.dot-H { background: var(--h); }
+.pitch-dot.dot-A { background: var(--a); }
+.pitch-dot.dot-atd { background: #f4f8fb; }
+.pitch-dot.dot-kalman { background: #9ad0ff; }
+.pitch-dot.dot-combined {
+  background: #f4f8fb;
+  border: 1.5px dashed var(--warn);
+}
+
+.pitch-wrap {
+  position: relative;
+  width: min(100%, 660px);
+  aspect-ratio: 105.3 / 68;
+  margin: 0.8rem auto 0;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: #08180f;
+}
+
+.pitch-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: default;
+  touch-action: auto;
+}
+
+.pitch-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  color: var(--muted);
+  background: rgba(8, 24, 15, 0.78);
+  font-size: 0.82rem;
+  text-align: center;
+  pointer-events: none;
 }
 
 .side-column {
@@ -546,6 +666,32 @@ video {
   min-width: 0;
   font-size: 0.82rem;
   overflow-wrap: anywhere;
+}
+
+.data-facts {
+  margin-top: 0.55rem;
+}
+
+.data-facts > div {
+  grid-template-columns: 6.8rem minmax(0, 1fr);
+  padding-top: 0.35rem;
+}
+
+.data-facts dd {
+  font-size: 0.78rem;
+}
+
+/* The status changes every frame.  Reserving two lines here keeps the card, and therefore the
+   page below it, from reflowing when the text changes between one and two lines. */
+#trackingStatus {
+  display: -webkit-box;
+  min-height: 2.7em;
+  max-height: 2.7em;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .transport,
@@ -854,6 +1000,24 @@ canvas {
   height: 10px;
   background: var(--ink);
   opacity: 0.7;
+}
+
+.marker-goal {
+  width: 2px;
+  height: 10px;
+  background: #4ee68b;
+}
+
+.marker-stop {
+  width: 2px;
+  height: 10px;
+  background: var(--d);
+}
+
+.marker-gap {
+  width: 2px;
+  height: 10px;
+  background: rgba(140, 160, 180, 0.6);
 }
 
 .explain-card .switch-detail {

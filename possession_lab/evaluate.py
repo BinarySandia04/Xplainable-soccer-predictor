@@ -271,10 +271,22 @@ def features_for_window(
     public: tuple[int, int] = (PUBLIC_START, PUBLIC_STOP),
     context: int = 500,
     observed_mask: np.ndarray | None = None,
+    ball_track: Any | None = None,
+    whistle: Any | None = None,
+    events: Any | None = None,
 ) -> Features:
     lo = max(0, public[0] - context)
     hi = min(tracking.n_frames, public[1] + context)
-    return extract_features(tracking, tags, observed_mask=observed_mask, start=lo, stop=hi)
+    return extract_features(
+        tracking,
+        tags,
+        observed_mask=observed_mask,
+        start=lo,
+        stop=hi,
+        ball_track=ball_track,
+        whistle=whistle,
+        events=events,
+    )
 
 
 def public_prediction_window(pred: np.ndarray, public: tuple[int, int] = (PUBLIC_START, PUBLIC_STOP)) -> np.ndarray:

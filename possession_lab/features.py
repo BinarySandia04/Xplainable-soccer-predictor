@@ -9,20 +9,25 @@ never pretends to know them.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 import warnings
 
 import numpy as np
 
-from .config import FPS, PITCH
+from .balltrack import BallTrack, track_ball
+from .config import FPS, PITCH, STOP_LIVE_TAG_CODES
 from .data import TagTable, TrackingData
 
 # Parked ball near a line: the shape of a throw-in, corner or goal-kick stoppage waiting for the
 # restart.  The thresholds are measured on the public ground truth: the ball sits within a couple
 # of metres of a boundary at under ~1.5 m/s for seconds, while a live ball near the line is on its
 # way through at speed.  ``PARKED_HOLD`` is the time the condition must hold; a ball that flickers
-# in and out of tracking is allowed for up to ``PARKED_FILL`` of the window.
+# in and out of tracking is allowed for up to ``PARKED_FILL`` of the window.  The team-speed gate
+# is essential: a player standing with the ball near the touchline is live possession, not a
+# stoppage, and that false positive was the source of the 15,221 "Balón muerto" run.
 PARKED_NEAR = 2.5
-PARKED_SPEED = 1.5
+PARKED_SPEED = 1.0
+PARKED_TEAM_SPEED = 1.35
 PARKED_HOLD_S = 0.8
 PARKED_FILL = 0.7
 
@@ -70,6 +75,21 @@ class Features:
     tag_coverage: np.ndarray
     player_count: np.ndarray
     parked_edge: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    # Ball-tracker reconstruction and event support.  Defaults keep older callers and tests
+    # working when the tracker/audio are not supplied.
+    ball_est: np.ndarray = field(default_factory=lambda: np.zeros((0, 2), dtype=np.float32))
+    est_confidence: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    est_source: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int8))
+    est_out: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    est_d_home: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    est_d_away: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    est_near_distance: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    est_near_team: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int8))
+    whistle_env: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    whistle_score: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    goal_dead: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    stop_dead: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    tag_live: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
 
     def __len__(self) -> int:
         return int(self.stop - self.start)
@@ -85,12 +105,20 @@ def extract_features(
     observed_mask: np.ndarray | None = None,
     start: int = 0,
     stop: int | None = None,
+    ball_track: BallTrack | None = None,
+    whistle: Any | None = None,
+    events: Any | None = None,
 ) -> Features:
     """Extract features for ``[start, stop)``.
 
     ``observed_mask`` is how stress tests remove the ball without editing the tracking file.  A
     masked frame is treated exactly like a frame where the ATD has no ball: the gap grows, the last
-    known position stays put, and the emission becomes the missing-ball emission.
+    known position stays put, and the emission becomes the missing-ball emission.  The tracker is
+    run with the same mask, so it cannot "see through" a removed ball either.
+
+    ``ball_track``, ``whistle``, and ``events`` are optional precomputed products.  Supplying them
+    is purely an optimisation; omitting them gives the same features with a fresh tracker and no
+    audio/event support.
     """
     n_total = tracking.n_frames
     start = int(start)
@@ -108,6 +136,10 @@ def extract_features(
         observed = np.asarray(observed_mask, dtype=bool)
         if observed.shape != (n_total,):
             raise ValueError("observed_mask must have one boolean per frame")
+    if ball_track is None:
+        ball_track = track_ball(tracking, observed_mask=observed)
+    elif ball_track.estimate.shape[0] != n_total:
+        raise ValueError("ball_track must cover the full tracking sequence")
     present = tracking.ball_present[start:stop] & observed[start:stop]
     n = stop - start
 
@@ -162,6 +194,76 @@ def extract_features(
     d_away[~present] = np.nan
     margin = (second_distance - near_distance).astype(np.float32)
 
+    # Tracker reconstruction.  Distances to the *estimated* ball are what let the HMM keep a
+    # possession through a short occlusion instead of falling back to a uniform emission.
+    est_ball = np.asarray(ball_track.estimate[start:stop], dtype=np.float32).copy()
+    est_confidence = np.asarray(ball_track.confidence[start:stop], dtype=np.float32).copy()
+    est_source = np.asarray(ball_track.source[start:stop], dtype=np.int8).copy()
+    est_out = np.asarray(ball_track.out_of_play[start:stop], dtype=bool).copy()
+    est_valid = est_confidence > 1e-6
+    edx = players[:, :, 0] - est_ball[:, None, 0]
+    edy = players[:, :, 1] - est_ball[:, None, 1]
+    est_distance = np.sqrt(edx * edx + edy * edy)
+    est_safe = np.where(np.isfinite(est_distance), est_distance, np.inf)
+    est_near_player = np.argmin(est_safe, axis=1).astype(np.int16)
+    est_near_distance = est_safe[np.arange(n), est_near_player].astype(np.float32)
+    est_no_player = ~np.isfinite(est_near_distance)
+    est_near_distance[est_no_player] = np.nan
+    est_near_player[est_no_player] = -1
+    est_near_team = np.where(
+        est_no_player,
+        -1,
+        teams[np.clip(est_near_player, 0, max(0, len(teams) - 1))],
+    ).astype(np.int8)
+    est_near_team[~est_valid] = -1
+    est_near_distance[~est_valid] = np.nan
+    with warnings.catch_warnings(), np.errstate(all="ignore"):
+        warnings.simplefilter("ignore", RuntimeWarning)
+        est_d_home = (
+            np.nanmin(est_distance[:, home_mask], axis=1) if home_mask.any() else np.full(n, np.nan)
+        )
+        est_d_away = (
+            np.nanmin(est_distance[:, away_mask], axis=1) if away_mask.any() else np.full(n, np.nan)
+        )
+    est_d_home = np.asarray(est_d_home, dtype=np.float32)
+    est_d_away = np.asarray(est_d_away, dtype=np.float32)
+    est_d_home[~est_valid] = np.nan
+    est_d_away[~est_valid] = np.nan
+
+    # Audio and event support.  Both are optional and zero-filled when unavailable.
+    if whistle is not None and getattr(whistle, "score", None) is not None:
+        w_score = np.asarray(whistle.score, dtype=np.float32)
+        w_env = np.asarray(whistle.env, dtype=np.float32)
+        if w_score.size != n_total:
+            w_score = np.zeros(n_total, dtype=np.float32)
+            w_env = np.zeros(n_total, dtype=np.float32)
+        whistle_score = w_score[start:stop]
+        whistle_env = w_env[start:stop]
+    else:
+        whistle_score = np.zeros(n, dtype=np.float32)
+        whistle_env = np.zeros(n, dtype=np.float32)
+
+    if events is not None and getattr(events, "dead_mask", None) is not None:
+        goal_mask = np.asarray(events.goal_dead, dtype=bool)
+        stop_mask = np.asarray(events.stop_dead, dtype=bool)
+        if goal_mask.size != n_total:
+            goal_mask = np.zeros(n_total, dtype=bool)
+            stop_mask = np.zeros(n_total, dtype=bool)
+        goal_dead = goal_mask[start:stop]
+        stop_dead = stop_mask[start:stop]
+    else:
+        goal_dead = np.zeros(n, dtype=bool)
+        stop_dead = np.zeros(n, dtype=bool)
+
+    tag_live = np.zeros(n, dtype=bool)
+    for event in tags.events:
+        if event.code not in STOP_LIVE_TAG_CODES:
+            continue
+        lo = max(start, int(event.start_frame))
+        hi = min(stop, int(event.stop_frame))
+        if hi > lo:
+            tag_live[lo - start : hi - start] = True
+
     # Team motion energy: mean speed of the tracked players, smoothed over one second.  Players
     # walk or stand still during a stoppage, so this separates dead ball from live play without
     # looking at the ball at all.  Frames with no tracked player fall back to zero.
@@ -214,13 +316,15 @@ def extract_features(
     )
 
     # Parked ball at a boundary: visible, within ``PARKED_NEAR`` metres of a line, moving slower
-    # than ``PARKED_SPEED``, and holding that state for ``PARKED_HOLD_S``.  Frames beyond the line
-    # count too: the restart spot is the same situation with better evidence.
+    # than ``PARKED_SPEED``, and with the *team* also close to stationary.  Frames beyond the line
+    # count too: the restart spot is the same situation with better evidence.  The team-speed gate
+    # is what keeps a player standing with the ball at the touchline from becoming a false D.
     parked = (
         present
         & (edge < PARKED_NEAR)
         & np.isfinite(ball_speed)
         & (ball_speed < PARKED_SPEED)
+        & (team_speed < PARKED_TEAM_SPEED)
     )
     parked_edge = _held(parked, PARKED_HOLD_S, PARKED_FILL) | out_of_play
 
@@ -287,6 +391,19 @@ def extract_features(
         tag_coverage=tags.coverage[start:stop].astype(bool),
         player_count=tracking.player_present[start:stop].sum(axis=1).astype(np.int16),
         parked_edge=parked_edge,
+        ball_est=est_ball,
+        est_confidence=est_confidence,
+        est_source=est_source,
+        est_out=est_out,
+        est_d_home=est_d_home,
+        est_d_away=est_d_away,
+        est_near_distance=est_near_distance,
+        est_near_team=est_near_team,
+        whistle_env=whistle_env,
+        whistle_score=whistle_score,
+        goal_dead=goal_dead,
+        stop_dead=stop_dead,
+        tag_live=tag_live,
     )
 
 

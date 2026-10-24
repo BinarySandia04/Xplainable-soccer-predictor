@@ -40,6 +40,15 @@ class ModelParams:
     w_motion: float = 0.0
     motion0: float = 1.6
     motion_scale: float = 0.35
+    motion_control_R: float = 4.0
+    w_whistle: float = 0.0
+    whistle_control_R: float = 3.0
+    w_est_out: float = 0.0
+    est_blend: float = 0.0
+    est_sigma: float = 4.0
+    flight_R: float = 0.0
+    flight_speed: float = 10.0
+    flight_p: float = 0.55
     w_tag: float = 0.0
     w_sp: float = 0.0
     w_lt: float = 0.0
@@ -98,12 +107,28 @@ def dead_ball_evidence(features: Any, params: ModelParams = DEFAULT_PARAMS) -> n
     during a stoppage, and the ball sits near a touchline for throw-ins, corners and goal kicks.
     ``w_dead`` is a base-rate offset: it keeps the dead-ball prior independent of the scale of the
     team Gaussians.
+
+    Team motion is only evidence when no player is actually controlling the ball.  A player
+    standing still with the ball is live possession, and the old ungated term called that "Balón
+    muerto" (the 18,389 false D is the clearest example).
     """
     edge = np.where(np.isfinite(features.edge), features.edge, features.last_edge)
     edge = np.where(np.isfinite(edge), edge, 20.0)
+    present = np.asarray(features.present, dtype=bool)
+    near_distance = np.asarray(features.near_distance, dtype=np.float64)
+    edge_now = np.where(np.isfinite(features.edge), features.edge, np.inf)
+    stop = np.asarray(getattr(features, "stop_dead", np.zeros(present.size, dtype=bool)), dtype=bool)
+    controlled = (
+        present
+        & np.isfinite(near_distance)
+        & (near_distance <= params.motion_control_R)
+        & (edge_now > 2.5)
+        & ~stop
+    )
     motion = _sigmoid(
         (params.motion0 - np.asarray(features.team_speed, dtype=np.float64)) / params.motion_scale
     )
+    motion = np.where(controlled, 0.0, motion)
     return (
         params.w_dead
         + params.w_motion * motion
@@ -226,6 +251,15 @@ def emission_log_probs(features: Any, params: ModelParams = DEFAULT_PARAMS) -> n
         sparse = missing & (np.asarray(features.player_count) < params.min_players)
         log_emission[sparse] = np.log(1.0 / 3.0)
 
+    # A live-play smart tag is evidence that the game is continuing, even if the ball tracker has
+    # lost the ball.  Using the last position here is what changed possession in the 17,230 hole:
+    # the ball was last seen near Barcelona players but Atletic still had it.  Persist the previous
+    # state instead of reading team shape through a live-play gap.  Confirmed stoppages are applied
+    # as hard overrides after decoding, so this does not hide a real dead ball.
+    if hasattr(features, "tag_live"):
+        live_missing = missing & np.asarray(features.tag_live, dtype=bool)
+        log_emission[live_missing] = np.log(1.0 / 3.0)
+
     # A ball that is far from every player is loose or in flight, not evidence of a dead ball.
     # Let the prior carry the possession instead of letting the distance term vote `D`.  When
     # that loose ball is also slow, its only possession evidence is the team that touched it
@@ -249,7 +283,88 @@ def emission_log_probs(features: Any, params: ModelParams = DEFAULT_PARAMS) -> n
                 q[np.arange(touched.size), touched] = params.touch_p
                 log_emission[recent] = np.log(q)
 
+    # A fast ball away from every player is in flight.  Distance-to-player is then not evidence
+    # that the *other* team has possession: a 20 m/s pass spends most of its travel time closer to
+    # the receiving team than the passer, and distance-only emissions flip possession in mid-air.
+    # Keep the last-touch team (or the prior when the touch is unknown) instead.
+    if params.flight_R > 0:
+        flight = (
+            present
+            & ~out_of_play
+            & (speed >= params.flight_speed)
+            & (d_min >= params.flight_R)
+        )
+        if flight.any():
+            last_touch = np.asarray(features.last_touch, dtype=np.int8)
+            touch_age = np.asarray(features.last_touch_age, dtype=np.int64)
+            touched = flight & (last_touch >= 0) & (touch_age <= params.touch_age)
+            q = np.full((int(flight.sum()), 3), 0.5)
+            q[:, 2] = 1e-3
+            local_touched = touched[flight]
+            if local_touched.any():
+                q[local_touched, 2] = 1e-3
+                q[local_touched, :2] = (1.0 - params.flight_p) / 2.0
+                q[np.flatnonzero(local_touched), last_touch[touched]] = params.flight_p
+            q /= q.sum(axis=1, keepdims=True)
+            log_emission[flight] = np.log(q)
+
+    # Tracker reconstruction for short holes.  The tracker only fills up to a bounded time and
+    # its confidence decays with age, so this cannot invent possession across a long dead-ball gap.
+    if params.est_blend > 0 and missing.any() and hasattr(features, "est_confidence"):
+        est_conf = np.nan_to_num(
+            np.asarray(features.est_confidence, dtype=np.float64), nan=0.0
+        )
+        blend = np.clip(params.est_blend * est_conf, 0.0, 0.95)
+        valid = missing & (blend > 0.0)
+        if valid.any():
+            est_home = np.nan_to_num(
+                np.asarray(features.est_d_home, dtype=np.float64), nan=1e6
+            )
+            est_away = np.nan_to_num(
+                np.asarray(features.est_d_away, dtype=np.float64), nan=1e6
+            )
+            est_out = np.asarray(features.est_out, dtype=bool)
+            est_q = np.empty((int(valid.sum()), 3), dtype=np.float64)
+            est_q[:, 0] = np.exp(
+                -(est_home[valid] ** 2) / (2.0 * params.est_sigma * params.est_sigma)
+            ) + 1e-9
+            est_q[:, 1] = np.exp(
+                -(est_away[valid] ** 2) / (2.0 * params.est_sigma * params.est_sigma)
+            ) + 1e-9
+            est_q[:, 2] = 1e-4 + 4.0 * est_out[valid] + 0.02
+            est_q /= est_q.sum(axis=1, keepdims=True)
+            base = np.exp(log_emission[valid])
+            base /= fb_sum(base)
+            weight = blend[valid, None]
+            log_emission[valid] = np.log(weight * est_q + (1.0 - weight) * base)
+
+    # Whistle support, only where no player is controlling a visible ball and only as an additive
+    # D nudge.  The confirmed stoppage intervals are applied as a hard override in the pipeline;
+    # this term keeps the Viterbi state sensible around the edges of those intervals.
+    if params.w_whistle > 0 and hasattr(features, "whistle_env"):
+        env = np.asarray(features.whistle_env, dtype=np.float64)
+        controlled = (
+            present
+            & np.isfinite(np.asarray(features.near_distance, dtype=np.float64))
+            & (np.asarray(features.near_distance, dtype=np.float64) <= params.whistle_control_R)
+            & ~out_of_play
+        )
+        low_motion = _sigmoid((1.8 - np.asarray(features.team_speed, dtype=np.float64)) / 0.35)
+        live = np.asarray(getattr(features, "tag_live", np.zeros(n, dtype=bool)), dtype=bool)
+        log_emission[:, 2] += params.w_whistle * env * (~controlled) * low_motion * (1.0 - 0.5 * live)
+
+    if params.w_est_out > 0 and hasattr(features, "est_out"):
+        est_out = np.asarray(features.est_out, dtype=bool)
+        est_conf = np.asarray(features.est_confidence, dtype=np.float64)
+        log_emission[:, 2] += params.w_est_out * est_out * (est_conf > 0.05)
+
     return log_emission
+
+
+def fb_sum(values: np.ndarray) -> np.ndarray:
+    """Row sums with a floor, kept local so model.py has no forward-backward dependency."""
+    total = values.sum(axis=1, keepdims=True)
+    return np.where(total > 0, total, 1.0)
 
 
 def transition_matrix(params: ModelParams = DEFAULT_PARAMS) -> np.ndarray:

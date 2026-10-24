@@ -25,22 +25,58 @@
     <section class="stage-grid" aria-label="Inspección de video y predicción">
       <div class="left-column">
         <div class="video-card">
-          <video id="video" preload="auto" controls playsinline>
-            Tu navegador no puede reproducir este video.
-          </video>
-          <div id="videoBuffer" class="video-buffer" role="status" aria-live="polite">
-            <span class="video-buffer-pill">
-              <span class="spinner" aria-hidden="true"></span>
-              <span id="videoBufferText">Cargando video…</span>
-            </span>
+          <div class="video-frame">
+            <video id="video" preload="metadata" controls playsinline>
+              Tu navegador no puede reproducir este video.
+            </video>
+            <canvas id="overlay" class="video-overlay" aria-label="Balón y jugadores proyectados sobre el video"></canvas>
+            <div id="videoError" class="video-error hidden" role="alert"></div>
           </div>
-          <div id="videoError" class="video-error hidden" role="alert"></div>
           <div class="video-caption">
             <span>Video táctico sincronizado · 25 fps</span>
-            <span id="videoBuffered" class="mono">buffer —</span>
+            <label class="overlay-toggle">
+              <input id="overlayToggle" type="checkbox" checked>
+              Seguimiento
+            </label>
             <span id="videoDuration" class="mono">duración —</span>
           </div>
         </div>
+
+        <section class="pitch-card" aria-label="Mapa cenital de jugadores y balón">
+          <div class="pitch-head">
+            <div class="pitch-heading">
+              <div class="eyebrow">Mapa cenital · coordenadas de cancha</div>
+              <div id="pitchStatus" class="muted small pitch-status">Cargando seguimiento…</div>
+            </div>
+            <div class="pitch-legend" aria-label="Leyenda del mapa cenital">
+              <span><i class="pitch-dot dot-H"></i>Barcelona</span>
+              <span><i class="pitch-dot dot-A"></i>Athletic</span>
+              <span><i class="pitch-dot dot-atd"></i>ATD bruto</span>
+              <span><i class="pitch-dot dot-kalman"></i>Kalman</span>
+              <span><i class="pitch-dot dot-combined"></i>Combinado</span>
+            </div>
+          </div>
+          <div class="layer-bar" role="group" aria-label="Capas de balón visibles">
+            <span class="layer-bar-label">Capas de balón · video y mapa</span>
+            <label class="layer-toggle" title="Solo posiciones observadas por el ATD; no rellena huecos">
+              <input type="checkbox" data-layer="raw" checked>
+              ATD bruto
+            </label>
+            <label class="layer-toggle" title="Filtro Kalman causal; predice huecos cortos y rechaza saltos aislados">
+              <input type="checkbox" data-layer="kalman" checked>
+              Kalman
+            </label>
+            <label class="layer-toggle" title="ATD observado + extrapolación causal de ≤ 1,2 s; es la capa del modelo">
+              <input type="checkbox" data-layer="combined" checked>
+              Combinado
+            </label>
+          </div>
+          <div class="pitch-wrap">
+            <canvas id="pitchMap" class="pitch-canvas" role="img" aria-label="Vista cenital del balón y los slots de jugadores en metros de cancha"></canvas>
+            <div id="pitchEmpty" class="pitch-empty hidden">Seguimiento no disponible</div>
+          </div>
+          <p class="fine-print">Vista directa del ATD en metros (105,3 × 68 m), sin homografía ni video. Los 46 slots son anónimos: el color indica el equipo del XML, no una identidad. <strong>ATD bruto</strong> solo dibuja observaciones; <strong>Kalman</strong> filtra y predice hasta 5 s; <strong>combinado</strong> usa ATD y rellena solo huecos de ≤ 1,2 s. Los puntos tenues son estimaciones, no observaciones.</p>
+        </section>
 
         <section class="timeline-card" aria-label="Línea temporal del partido">
           <div class="timeline-head">
@@ -54,6 +90,9 @@
               <span><i class="swatch swatch-D"></i>Balón muerto</span>
               <span><i class="swatch swatch-X"></i>Sin evaluar</span>
               <span><i class="marker marker-tick"></i>Cambio anotado</span>
+              <span><i class="marker marker-goal"></i>Gol</span>
+              <span><i class="marker marker-stop"></i>Parada</span>
+              <span><i class="marker marker-gap"></i>Sin balón</span>
             </div>
           </div>
 
@@ -114,6 +153,23 @@
             <div><dt>Detalle tag</dt><dd id="tagDetail" class="muted">—</dd></div>
             <div><dt>Ventana GT</dt><dd id="gtWindow" class="muted">—</dd></div>
           </dl>
+        </section>
+
+        <section id="explorerCard" class="card data-card" aria-label="Explorador de datos del frame">
+          <div class="eyebrow">Explorador de datos · frame</div>
+          <div id="trackingStatus" class="muted small">Cargando seguimiento…</div>
+          <dl class="facts data-facts">
+            <div><dt>Balón</dt><dd id="ballState">—</dd></div>
+            <div><dt>Posición</dt><dd id="ballPosition" class="mono">—</dd></div>
+            <div><dt>Vel. balón</dt><dd id="ballSpeed">—</dd></div>
+            <div><dt>Vel. equipos</dt><dd id="teamSpeed">—</dd></div>
+            <div><dt>Jugador cerca</dt><dd id="nearPlayer">—</dd></div>
+            <div><dt>Dist. a línea</dt><dd id="ballEdge">—</dd></div>
+            <div><dt>Hueco balón</dt><dd id="ballGap">—</dd></div>
+            <div><dt>Último toque</dt><dd id="touchState">—</dd></div>
+            <div><dt>Evento</dt><dd id="eventState">—</dd></div>
+          </dl>
+          <p class="fine-print">Proyección del ATD sobre el video con la homografía del frame. El explorador muestra el tracker combinado del modelo: ATD observado y extrapolación causal de ≤ 1,2 s. El mapa añade las capas Kalman y ATD bruto para comparar, pero no cambia el modelo ni los eventos.</p>
         </section>
 
         <section id="explainCard" class="card explain-card" aria-label="Por qué el modelo cambió de estado">

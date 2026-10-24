@@ -7,7 +7,9 @@ possession), `D` (dead ball / out of play), or `X` (ungraded). The submission is
 
 The model is a **data-only, gap-aware 3-state HMM**. It deliberately excludes the earlier
 MOSSE + GrayDiff + NanoTrack video ensemble: the tactical tracking already provides a cleaner,
-synchronised observations stream, and the public window is only a correctness check.
+synchronised observations stream, and the public window is only a correctness check. Around the
+HMM, a causal ball tracker supplies short-hole geometry, a whistle detector reads the tactical
+audio, and a high-precision event layer pins confirmed goals and referee stoppages to `D`.
 
 ## Inputs
 
@@ -15,41 +17,137 @@ synchronised observations stream, and the public window is only a correctness ch
 |---|---|
 | `BAR-ATH_tactical_atd.txt/.xml` | Ball and 46 anonymous player slots, metres, 25 fps |
 | `BAR-ATH_tactical_smart_tagging.xml` | 638 intervals, 14 codes, 6 types, team/type labels |
-| `BAR-ATH_tactical_homography.csv` | Per-frame camera geometry; diagnostics and pitch-space validity |
+| `BAR-ATH_tactical_homography.csv` | Per-frame camera geometry; diagnostics, pitch validity, viewer projection |
+| `BAR-ATH_tactical.mp4` audio | Whistle candidates; 7,972.69 s at 16 kHz mono |
 | `evaluation/gt/...public.csv` | 7,500-frame public GT; evaluation only |
 
 `video_frame = frame_id - 1`. Smart-tag intervals use
 `[round(start*25), round(end*25)+1)`. The tactical homography is valid on 100% of frames (median
 reprojection error 0.24 px, p99 4.81 px).
 
-## Features
+The validated configuration uses the tactical audio through the event layer, not through a
+whistle emission weight. If the MP4 or ffmpeg is unavailable, whistle support is empty and the
+event layer still uses visible out-of-play balls, missing-ball last edges, and tags.
+
+### Tracking representation
+
+The ATD is an optical-tracking export, not a per-player identity feed. Every one of the 199,319
+rows has exactly **46 player slots**; a slot is `NaN` when that track is not visible. Coordinates
+are normalised and scaled to **105.3 × 68 m**; `frame_id - 1` is the video frame. The XML assigns
+**24 slots to Barcelona and 22 to Athletic Club**, but it contains no reliable jersey identity.
+The median frame has 21 visible slots; the maximum is 35. The active count is not a fixed 11v11:
+there are more than 11 home tracks in 22,859 frames (max 24) and more than 11 away tracks in 8,905
+frames (max 15). These extras are likely substitutes, staff, or provider duplicates. The viewer
+draws every visible slot and labels it with the XML team; the model only uses aggregate
+nearest-player/team distances and never claims an identity.
+
+The ball is observed in **113,488 frames (56.94%)**, estimated for short holes in **4,441
+(2.23%)**, and has no estimate in **81,390 (40.83%)**. `balltrack.py` is causal: source `0` is an
+observation, source `1` is an extrapolation capped at 1.2 s, and source `2` is a long gap where
+the production layer draws no ball. The optional diagnostic Kalman layer may still predict for up
+to 5 s and is reported separately. This is why an amber ring can disagree with the video by
+design, and why the top-view map marks observed and estimated balls differently.
+
+## Pipeline
+
+```text
+ATD + tags + homography
+        │
+        ├── causal ball tracker ── short-hole estimate, source, confidence, out-of-play
+        │
+        ├── whistle cache ──────── 2.4–3.8 kHz score, envelope, 274 candidate blasts
+        │
+        └── features ───────────── distances, motion, edge, gap, last touch, tags
+                                      │
+                              goal/stoppage detector
+                                      │
+                              HMM Viterbi decode
+                                      │
+                         merge 1 s flickers + hard D overrides
+                                      │
+                              predictions.csv
+```
+
+The full-match diagnostics are built once, then the two graded halves are decoded independently
+with a leading 500-frame context pad. Stoppages and goals are detected on the full match so an
+event just outside a half is not hidden by the split.
+
+## Causal ball tracker (`balltrack.py`)
+
+The ATD drops the ball for a few frames during passes, deflections, and occlusions, and for many
+seconds during stoppages. The tracker is causal: frame `k` uses observations at frames `<= k`
+only.
+
+* Keeps the last observed position and a least-squares velocity over the last 0.6 s of
+  observations.
+* Extrapolates a short hole with a damped constant-velocity model
+  (`v(t) = v0 * exp(-0.35 t)`), capped at 38 m/s for outliers.
+* Never fills more than **1.2 s**. Longer holes have `source=2` (no estimate), because inventing a
+  position across a dead-ball gap is worse than admitting the gap.
+* Confidence is 1 on observations and decays as `exp(-(gap/0.9)²)` inside a filled hole; an
+  unreliable velocity estimate halves it.
+* Flags an estimate beyond the pitch by more than 1 m as `out_of_play`.
+
+The tracker is used by goal geometry, the viewer overlay, and the gap diagnostics. In the final
+parameter set the HMM's short-gap emission is **uniform** (`est_blend=0.0`); the tracker estimate
+is not blended into the HMM emission. This is deliberate: blending a short extrapolation into the
+emission improved some public frames but created false possession changes in longer gaps, so the
+short-gap prior remains the validated behaviour.
+
+## Diagnostic Kalman layer (`kalman.py`)
+
+The viewer can show a second, independent ball estimate. It exists to make the cost of the
+conservative production tracker visible; it does not change the model, the event layer, or the
+submission.
+
+* State `[x, y, vx, vy]`, constant-velocity transition at 25 fps. Process noise is `1.2 m/s²`
+  (acceleration), measurement noise is `0.6 m`, and speed is capped at 38 m/s.
+* A measurement is accepted only inside a squared Mahalanobis gate of `25`; a single large jump
+  is ignored. Three consecutive rejects, or a hole longer than 1 s, reset the filter to the new
+  observation so it cannot stay locked to a stale track.
+* It predicts through holes up to **5 s** (`source=1`), then reports no estimate (`source=2`).
+  Confidence is `exp(-(gap/1.0)²)` while predicting, and estimates more than 1 m outside the pitch
+  are flagged out of play.
+* It is causal: frame `k` only uses ATD observations at frames `<= k`. It never reads the video,
+  the homography, the HMM, the event detector, or the UT.
+* The production layer remains `balltrack.py` (maximum 1.2 s). `combined` is that tracker; `raw`
+  is ATD observations only; `kalman` is this diagnostic filter.
+
+A pixel-domain tracker (MOSSE, GrayDiff, NanoTrack, or a fusion) is not implemented. The workspace
+has no tracker code or weights and no OpenCV/SciPy/filterpy runtime, and the tactical video would
+need frame-accurate alignment before a pixel track could be compared with the ATD. Adding one is
+future work, not part of this viewer change.
+
+## Features (`features.py`)
 
 For each frame:
 
 * `d_H`, `d_A`: distance from the ball to the nearest home/away tracked player.
-* `near_team`, `near_distance`, `second_distance`.
-* `ball_speed`, `ball_acceleration` (raw, only across consecutive observations).
+* `near_team`, `near_distance`, `second_distance`, `margin`.
+* `near_speed`; `ball_speed`, `ball_acceleration` (only across consecutive observations).
 * `team_speed`: mean speed of the tracked players, smoothed over one second.
-* `gap`: frames since the last observed ball.
-* `edge`, `last_edge`: distance of the ball (or last known ball) from the nearest pitch boundary.
+* `gap`: frames since the last observed ball; `edge`, `last_edge`: distance to the nearest pitch
+  boundary.
 * `out_of_play`: observed ball outside `[0,L] × [0,W]`.
-* `last_touch`, `last_touch_age`: nearest player within 0.8 m.
+* `last_touch`, `last_touch_age`: nearest player within 0.8 m; a team hint, not an identity.
 * `d_H_last`, `d_A_last`: current team shape around the last observed ball.
-* `tag_vote`, `tag_setpiece`, `tag_coverage`.
-* `player_count`: visible player slots, used for the sparse-tracking guard.
-* `parked_edge`: the ball visible within `PARKED_NEAR = 2.5 m` of a boundary at
-  `PARKED_SPEED = 1.5 m/s` or less, held for `PARKED_HOLD_S = 0.8 s` (up to 70% tracking
-  flicker inside the window is tolerated). This is the throw-in / corner / goal-kick signature;
-  observed-out frames (`out_of_play`) are included.
+* `tag_vote`, `tag_setpiece`, `tag_coverage`, `tag_live`.
+* `player_count`: visible slots for the sparse-tracking guard.
+* `parked_edge`: visible ball within `2.5 m` of a line at `<= 1.0 m/s`, with the team also below
+  `1.35 m/s`, meeting the condition in at least 70% of a trailing `0.8 s` window (30% tracking
+  flicker allowed). Observed-out frames count.
+* Tracker diagnostics: `ball_est`, `est_confidence`, `est_source`, `est_out`, `est_d_home`,
+  `est_d_away`.
+* Event/audio support: `whistle_score`, `whistle_env`, `goal_dead`, `stop_dead`.
 
 ## Emissions
 
-At visible frames, with `σ = 3.5 m`, `d_dead = 7 m`:
+At visible frames, with `σ = 4.0 m`, `d_dead = 8.0 m`:
 
-```
+```text
 q_H = exp(-d_H² / (2σ²)) + 1e-12
 q_A = exp(-d_A² / (2σ²)) + 1e-12
-q_D = sigmoid((min(d_H, d_A) - d_dead) / 1.5) + 1e-12
+q_D = sigmoid((min(d_H,d_A) - d_dead) / 1.5) + 1e-12
 q_D += w_dead + w_motion * sigmoid((motion0 - team_speed) / motion_scale)
      + w_edge * sigmoid((edge0 - edge) / edge_scale)
 q_D += w_out * out_of_play
@@ -58,40 +156,50 @@ q   = [q_H, q_A, q_D] / sum(q)
 logB = log(q)
 ```
 
-The validated model sets `w_out = 1`, `w_dead = 0.02`, `w_motion = 1`, `w_edge = 0.5`,
-`w_parked_edge = 1.5`, `motion0 = 1.6 m/s`, `motion_scale = 0.35 m/s`. The motion and edge terms
-are the dead-ball evidence model: they do not look at the ball at all, which is what lets `D`
-separate a stoppage where the ball is visible and a player is standing next to it. The
-`parked_edge` term is the strongest single dead-ball signature measured on the public window
-(spell F1 0.6074 → 0.6857): a ball stopped within 2.5 m of a line for at least 0.8 s is a set
-piece being prepared. `w_dead` is the dead-ball base rate; it keeps the `D` prior independent of
-the scale of the team Gaussians. The speed gate is applied even when `gate = 0`:
+The validated values are `w_out=1`, `w_dead=0.02`, `w_motion=1`, `motion0=1.6 m/s`,
+`motion_scale=0.35`, `w_edge=0.5`, `edge0=5.0 m`, `edge_scale=1.5`, and
+`w_parked_edge=1.5`.
 
-```
+Team motion is only evidence when no player is controlling the ball: if the ball is visible,
+within `motion_control_R=4.0 m` of a player, more than `2.5 m` from a line, and not inside a
+confirmed stop, the motion term is zero. This is what stops a player standing with the ball at
+the touchline from being labelled “Balón muerto”.
+
+The speed gate is applied even when `gate=0`:
+
+```text
 α = 1 - sigmoid((ball_speed - gate) / 2)
 logB = α * logB + (1 - α) * log(1/3)
 ```
 
-so a stationary or unknown-speed ball is blended 50/50 with uniform. This is a deliberate
-regulariser and is required to reproduce the reference metrics.
+A stationary or unknown-speed ball is therefore blended 50/50 with uniform. This is a deliberate
+regulariser and is required to reproduce the validated scores.
 
-Loose-ball rule. A ball far from every player is not evidence of a stoppage: it is loose or in
-flight. When `d_min > loose_R = 7 m` and the ball is not out of play, the emission is uniform and
-the transition prior carries the possession. If the ball is also slower than
-`loose_speed = 2 m/s`, the only possession evidence left is the team that touched it last, so that
-team gets `touch_p = 0.7` of the emission mass, provided the touch is younger than
-`touch_age = 125` frames (5 s). The remaining mass is split evenly over the other two states. This
-removed the false `D` stretches where a rolling or in-flight ball sits 7–10 m from both teams.
-An optional `loose_stop_gate` (off in the validated model, kept for ablations) exempts loose
-frames that carry stoppage support — `parked_edge` — from this flattening: a ball parked near a
-line is a restart waiting to be taken, not a live loose ball.
+### Loose balls and last touch
 
-Missing-ball emissions:
+A ball farther than `loose_R=7 m` from every player is loose or in flight, not a dead ball. Its
+emission is uniform, so distance alone cannot vote `D`. If it is also slower than `loose_speed=2
+m/s`, the team that touched it last receives `touch_p=0.7` of the mass when the touch is younger
+than `touch_age=125` frames (5 s); the remainder is split over the other two states. This removed
+false `D` stretches where a rolling or in-flight ball sits 7–10 m from both teams.
 
-* `persist`: uniform for every missing frame.
-* `hybrid` (recommended): uniform for `gap ≤ 120` frames (4.8 s); for longer holes use
+The validated `loose_stop_gate` is off. The optional gate would exempt a parked ball from the
+loose-ball flattening, which is useful for some ablations but was not selected.
 
-```
+A small last-touch bonus (`w_lt=0.1`) applies when a visible ball is within `lt_R=0.8 m` of the
+player who last touched it. It is intentionally weak: a stronger term improved public spell F1 by
+about 0.005 but invented a long H spell after a single defensive touch at frame 15,656 and lowered
+macro F1 by about 0.019.
+
+The flight rule (`flight_R`, `flight_p`) exists in `model.py` but is disabled in the validated
+configuration (`flight_R=0`). The loose-ball + last-touch path was more stable.
+
+### Missing-ball emissions
+
+* `persist`: uniform for every missing frame (ablation baseline).
+* `hybrid` (validated): uniform for `gap <= 120` frames (4.8 s). For longer holes:
+
+```text
 m_H = exp(-d_H_last² / (2σ_miss²)) + 1e-6
 m_A = exp(-d_A_last² / (2σ_miss²)) + 1e-6
 m_D = 0.15 + sigmoid((5 - last_edge) / 1.5)
@@ -100,24 +208,133 @@ m_A *= 1 + max(-tag_vote, 0)
 m_D *= 1 + 0.2 * tag_setpiece
 ```
 
-with `σ_miss = 6 m`. If fewer than 6 players are visible, the frame is treated as missing
-evidence and the emission is uniform; this avoids reading team shape from a near-empty tracking
-feed. The public window has at least 19 visible players, so this guard does not affect public or
-stress scores.
+with `σ_miss=6 m`. If fewer than `min_players=6` players are visible, the frame is treated as
+missing evidence and the emission is uniform; this prevents a near-empty tracking feed from
+inventing a team. A missing frame covered by a live smart tag (`PROGRESSION`, `ATTACKING
+TRANSITION`) is also uniform, so a live-play gap does not flip possession from the last known
+team shape. Confirmed stoppages are hard overrides after decoding, so this does not hide a real
+dead ball.
 
-## Transition and decode
+## Whistle detection (`audio.py`)
 
+The tactical feed has a quiet, tonal referee whistle; absolute level is not useful. The detector
+uses relative spectral shape:
+
+* Decode the MP4 audio to mono float32 at 16 kHz with ffmpeg (`imageio-ffmpeg`'s static binary or
+  a system ffmpeg).
+* Compute an STFT with a 2,048-sample Hann window and 512-sample hop.
+* For each STFT frame, score the 2.4–3.8 kHz band as
+  `peakiness * band_energy / low_energy`, where low is 0.4–1.8 kHz.
+* Collapse STFT frames onto video frames by taking the maximum; frame 0 is the first video frame.
+* Threshold at `max(4.0, 2.0 * local_median)`, where the local median spans ±120 frames.
+* Join dropouts of at most 1 s inside one blast, reject runs shorter than 0.12 s, and record the
+  peak frame, half-open start/stop, peak score, and width.
+
+The result is cached in `outputs/whistle.npz` (score, envelope, events, metadata). On this match
+it contains **274 candidate blasts**. A candidate is not a stoppage by itself: crowd noise and
+players' shouts can produce similar peaks. It becomes evidence only when followed by sustained low
+player motion and the ball is not visibly controlled.
+
+## Goals and confirmed stoppages (`events.py`)
+
+### Goals
+
+A `GOALS` smart tag is not trusted on its own. For every tag interval, the detector looks at the
+ball-loss run before the restart:
+
+* **Trajectory path.** Extrapolate the last observed ball position with a short-window velocity
+  and require it to reach a goal line within 3 s, inside the posts (`GOAL_HALF_WIDTH=3.66 m` plus
+  a 1.6 m tolerance), at no less than 3 m/s along the line. Confidence combines mouth offset,
+  speed, and travel time.
+* **Tagged-disappearance path.** If no trajectory crosses, accept a long tagged disappearance
+  only when the last position is within 12 m of the goal line and inside the mouth, the ball is
+  missing for at least 8 s, and a celebration/kick-off tag backs it. A ball observed behind the
+  line but outside the posts (`_behind_line_wide`) rejects the goal.
+
+Accepted goals: frame **46,691** (`trajectory`) and frame **157,825** (`celebration`). Goal
+intervals extend to the restart: 46,691–49,631 and 157,825–163,000.
+
+The tag at **57,283** is a false positive and is correctly rejected: the ball is observed behind
+the line but wide before its gap. The tag at **73,710** covers a real goal (Oihan Sancet's 42'
+penalty, burned-in clock 41:48) but is missed. The ATD loses the ball from **72,560 to 73,950**
+(55.64 s) across the kick; there is no trajectory. The last pre-gap point at **72,559** is
+`(13.52, 34.31) m`, **13.5 m** from the nearest goal line, outside the **12 m** fallback
+allowance; the first re-observation at **73,951** is `(-3.05, 25.37) m`, behind the line and wide,
+so `_behind_line_wide()` also rejects the fallback. This is a deliberate precision/recall
+trade-off: weakening the rule to accept 73,935 would also accept 57,283. The miss is documented
+rather than hidden.
+
+### Stoppages
+
+Detected intervals, in order of evidence strength:
+
+1. **Whistle.** A low-motion run (`team_speed < 1.4 m/s` for at least 2 s) with a whistle
+   candidate no more than 2.5 s before the low run starts. A visible ball within 3 m of a player
+   and not out of play suppresses the whistle. If a live smart tag covers the whistle, the start
+   is delayed to the end of the tag (plus one second when the ball is visible) so live play is not
+   cut short.
+2. **Visible out.** A ball observed beyond the touch/goal line for at least 0.5 s; end at the
+   first sustained kicked restart.
+3. **Missing after out.** A missing ball whose last observed edge was beyond the line, for at
+   least 1 s; this covers goalkeeper/throw-in retrieval gaps, not a ball lost near the line during
+   live play.
+
+Overlapping or adjacent candidates merge, preferring the stronger trigger. A `Kick Off` tag trims
+an overlapping interval at the kick-off, so a retrieval gap that began earlier cannot leak a hard
+`D` into the first live frames. The public window contains these confirmed stoppages after the
+trim:
+
+```text
+11,035–11,097   (trimmed at the kick-off; originally longer)
+12,852–12,991   whistle (injury/referee stoppage)
+15,888–16,405   whistle
+17,377–17,828   whistle
+18,025–18,373   out (visible ball beyond the line)
 ```
+
+Full match: 68 stoppages and 2 goals. The goal/stoppage masks are unioned into `dead_mask`.
+
+### Overrides
+
+Confirmed events are applied **after** Viterbi and the 1 s flicker merge. `apply_event_overrides`
+sets every graded frame inside the mask to `D`; outside the graded halves the label remains `X`.
+This is the final authority for referee stops and goals. The HMM is still responsible for ordinary
+possession and ordinary out-of-play, which avoids turning every rolling ball into `D`.
+
+## Transition, decode, and smoothing
+
+```text
 T = [[.995,   .0005, .001],
      [.0005,  .995,  .001],
-     [.01,    .01,   .98]]
+     [.007,   .007,  .986]]
 ```
 
+`p_dh=0.007` is the retuned exit rate from `D`; it is deliberately less sticky than the earlier
+`0.01` because the hard event mask now guarantees confirmed stoppages, while the HMM should enter
+`D` promptly around them. `p_stay=0.995`, `p_ha=0.0005`, `p_hd=0.001`.
+
 Viterbi runs over each graded half with a leading 500-frame context pad. Frames outside
-`(11,185, 90,652)` and `(110,808, 190,198)` are `X`. Forward–backward posterior confidence is
-computed for diagnostics only. After decoding, a run shorter than one second that is flanked by
-the same label is absorbed by it: a few frames of `D` (or of the other team) between two equal
-labels are a tracking or ball-in-flight flicker, not a possession change. `X` is never changed.
+`[11,185, 90,652)` and `[110,808, 190,198)` are `X`. Forward–backward posteriors are computed only
+for diagnostics; they never change the submission. After decoding, a run shorter than one second
+that is flanked by the same label is absorbed by it: a few frames of `D` (or of the other team)
+between two equal labels are a tracking or ball-in-flight flicker, not a possession change. `X`
+is never changed.
+
+The final validated parameters are in `config.py:MODEL_PARAMS`:
+
+```text
+sigma 4.0      d_dead 8.0      dead_scale 1.5
+edge0 5.0      edge_scale 1.5  w_edge 0.5
+w_out 1.0      w_dead 0.02     w_motion 1.0
+motion0 1.6    motion_scale 0.35  motion_control_R 4.0
+w_lt 0.1       lt_R 0.8        p_stay 0.995
+p_ha 0.0005    p_hd 0.001      p_dh 0.007
+gate 0.0       loose_R 7.0     loose_speed 2.0
+touch_age 125  touch_p 0.7     miss_mode hybrid
+sigma_miss 6.0 gap_thresh 120  min_players 6
+w_parked_edge 1.5
+disabled in this run: w_gap, w_tag, w_sp, w_whistle, est_blend, w_est_out, flight_R
+```
 
 ## Explanation layer (`explain.py`)
 
@@ -151,25 +368,56 @@ automatically (`--no-explain` skips; failures never break a run). The model neve
 ## Local synchronized reviewer
 
 `python -m possession_lab viewer` builds a compact JSON payload from `outputs/predictions.csv`, the
-public GT, the smart-tag table, and `metrics_public.json`, then serves it from a local stdlib HTTP
-server. The page is plain HTML/CSS/JS; no frontend build step or extra Python dependency is added.
+public GT, the smart-tag table, `metrics_public.json`, and the tracker/event products, then serves
+it from a local stdlib HTTP server. The page is plain HTML/CSS/JS; no frontend build step is
+required. `imageio-ffmpeg` is only used by the offline audio extractor, not by the viewer page.
 
 * **Synchronization.** `frame i` is exactly row `i` of the submission. Browser seeking uses
   `currentTime = (i + 0.5) / 25`; the displayed frame is
   `clamp(floor(currentTime * 25 + 1e-6), 0, 199318)`. The video duration is checked against
   `199,319 / 25 = 7972.76 s` when metadata loads.
-* **Payload.** Labels are compact `H/A/D/X` strings; prediction segments/spells cover both the full
+* **Payload.** Labels are compact `H/A/D/X` strings; prediction segments/spells cover the full
   graded halves, while GT segments/spells cover only the public window because the public CSV has
-  `X` outside it. Changes, disagreement runs (grouped in the browser), 638 tag intervals, and
-  public metrics are included. When `outputs/explanations.json` exists it is folded in as
-  `switches` and `explanations_available`; the UI degrades quietly without it.
+  `X` outside it. Changes, disagreement runs, 638 tag intervals, public metrics, goals,
+  stoppages, and ball-gap runs are included. When `outputs/explanations.json` exists it is folded
+  in as `switches` and `explanations_available`; the UI degrades quietly without it.
+* **Per-frame explorer.** `GET /api/frame?frame=N` returns one compact payload built by
+  `FrameStore`: pitch size, projected 1920×1080 player pixels (`px`/`py` may be `null`), the
+  feature slice (team/ball speed, edge, gap, near player/team, last touch, whistle
+  score/envelope, event masks), active events, and three ball layers. Each layer
+  (`raw`, `kalman`, `combined`) carries `source` (`0` observed, `1` estimated, `2` lost),
+  `observed`, metres `x/y`, projected `px/py`, `confidence`, `gap_s`, and `out_of_play`.
+  `trails[layer].pitch` and `trails[layer].video` hold a ~1 s trail; the legacy `ball`, `trail`,
+  and `trail_pitch` fields remain as aliases for `combined`. The browser never receives the
+  199k-frame tracking arrays. If tracking is unavailable the endpoint returns a JSON 404 and the
+  viewer still shows the labels and timelines.
+* **Overlay.** Players are projected with the frame's homography. The `Seguimiento` checkbox
+  toggles the whole canvas; the **Capas de balón** checkboxes choose `raw`, `kalman`, and
+  `combined`. Raw observations are solid white, Kalman is cyan (dashed while predicting), and the
+  combined production layer is white when observed or dashed amber when extrapolating; an
+  out-of-play point is red. The canvas lives inside a `.video-frame` wrapper that contains the
+  video only, so the global `canvas { height: 100% }` rule cannot stretch it over the caption.
+  Measured video and overlay rectangles match (`1139.4 × 640.9` CSS px); before the wrapper the
+  overlay was `1139.4 × 678.5`.
+* **Top-view map.** A second native canvas under the video draws the pitch boundary, halfway
+  line, centre circle, penalty/six-yard boxes, spots, goals, all visible player slots, the enabled
+  ball layers, and their pitch-space trails. It reads `pitch`, `players[].x/y`,
+  `layers[layer].x/y`, and `trails[layer].pitch`; it never calls the homography or the video. The
+  plot is `105.3 × 68 m` with a `660 px` maximum width, a legend, layer toggles, and a single-line
+  status (`frame · slots · layer state · gap`). Ball markers are drawn after the pitch clip, so an
+  out-of-play ball remains visible in the padding; source `2` draws no ball.
+* **Layout stability.** `#trackingStatus` reserves exactly two lines (`min-height`/`max-height`
+  2.7em, `line-clamp: 2`); `#pitchStatus` is one line with ellipsis. The explorer card and the
+  pitch card therefore keep their height while text changes during playback, and the map does not
+  clear to a blank frame when an async `/api/frame` payload is still in flight. The overlay and
+  pitch map are redrawn only when the payload's frame matches the displayed frame; a cached
+  response is not drawn twice.
 * **Decision annotations.** Every predicted switch is a thin tick on the PRED band of both
   timelines; ticks are hit-tested within 6 px, seeking and opening the decision card on click.
-  The card lists every switch with a clickable timestamp, the
-  `from → to` transition, the emission confidence bar, and the ordered reason chips from
-  `explain.py` — each reason's evidence frame is itself a seek button. Filters: all / → D /
-  D → / H ↔ A; `j`/`k` jump to the previous/next annotated switch; selection auto-follows
-  playback within ±1.5 s.
+  The card lists every switch with a clickable timestamp, the `from → to` transition, the
+  emission confidence bar, and the ordered reason chips from `explain.py` — each reason's
+  evidence frame is itself a seek button. Filters: all / → D / D → / H ↔ A; `j`/`k` jump to the
+  previous/next annotated switch; selection auto-follows playback within ±1.5 s.
 * **User truth (UT).** The browser can paint `H/A/D/X` on the current frame or an anchored range,
   from the buttons or globally from the keyboard. Each label press leaves an anchor at the end of
   the written span; run boundaries are drawn on both timelines and can be dragged to move a cut.
@@ -181,52 +429,78 @@ server. The page is plain HTML/CSS/JS; no frontend build step or extra Python de
 * **Streaming.** `/video` implements a single-range `Range` parser and returns `206`, `200`, or
   `416` as appropriate. The 5.2 GB tactical MP4 has its `moov` atom at the end; the browser reads
   the tail range for metadata and then fetches playback ranges. Routes are whitelist-only:
-  `/`, `/static/viewer.css`, `/static/viewer.js`, `/api/viewer-data`, `/api/user-truth`, `/video`,
-  `/favicon.ico`.
+  `/`, `/static/viewer.css`, `/static/viewer.js`, `/api/viewer-data`, `/api/frame`,
+  `/api/user-truth`, `/video`, `/favicon.ico`.
 * **Scope.** The UI edits only the UT, has no correction export, and has no broadcast-video path.
   GT is shown only on non-`X` public frames. The page works entirely from `127.0.0.1`; the POST
   endpoint requires `application/json`.
 
 The reviewer is covered by `tests/test_viewer.py`: payload semantics, public-only GT behavior,
 UT scoring/persistence/editing, range parsing (`normal`, open, suffix, invalid), HTTP
-`206`/`416`/`HEAD`, API payload, and unknown-route rejection.
+`206`/`416`/`HEAD`, API payload, per-frame payload/404, top-view pitch/trail payload, the three
+layer payloads and trails, and unknown-route rejection. `tests/test_kalman.py` covers the
+constant-velocity fit, short-hole prediction, long-hole refusal, outlier rejection, missing
+observations, and gap age.
 
 ## Validation
 
-* Unit tests: 53 stdlib `unittest` tests (+4 subtests), all passing — including switch/reason
-  rules (`test_explain.py`), stop-signal parameter neutrality and gating (`test_model.py`), and
-  annotation payload plumbing (`test_viewer.py`).
-* Public metrics for the current parameters: spell F1 0.6857, macro F1 0.8843,
-  D-F1 0.8441, 11 predicted spells (17 in GT).
-* Stress (HMM gap-aware, current parameters): clean 0.6857 / random 0.4615 / long 0.4000 spell F1.
-* Weight-zero neutrality: with `w_parked_edge = 0` the new code
-  reproduces the previous `predictions.csv` bit-for-bit (verified before adopting the tuned row).
-* The files in `reports/data/` were produced by the pre-retune parameter set (`σ=3.0`,
-  `p_dh=0.001`, no dead-ball evidence, no loose-ball rule) and are kept as history, not as an
-  equality target.
-* Submission: 199,319 rows, frames 0–199,318, official validator `OK`.
+* Unit tests: **81 stdlib `unittest` tests (+4 subtests)**, all passing — including switch/reason
+  rules (`test_explain.py`), stop-signal parameter neutrality and gating (`test_model.py`),
+  tracker/audio/event units (`test_balltrack.py`, `test_audio.py`, `test_events.py`), the Kalman
+  layer (`test_kalman.py`), and annotation/frame-explorer/top-view plumbing
+  (`test_viewer.py`).
+* Public metrics for the final parameters: spell F1 **0.6519**, macro F1 **0.9466**, D-F1
+  **0.9727**, accuracy 0.9417, kappa 0.9083, alive/dead F1 0.9933, team accuracy (both alive)
+  0.9404, 10 predicted spells (17 in GT). The 95% spell-F1 bootstrap is [0.430, 0.817].
+* Missing-ball stress suite (HMM core only; **event overrides disabled**, so the clean row is not
+  the final public score): clean 0.6143 / 0.7299 macro / 0.5144 D-F1; random
+  0.3500 / 0.7049 / 0.5209; long 0.3840 / 0.6387 / 0.5602. The full 12-row table is
+  `outputs/stress.csv`; every mask beats both centred baselines on macro F1.
+* Browser smoke test (Chrome headless + CDP, tactical video streamed from the local server):
+  metadata `readyState=4`, duration 7972.76 s; initial frame 12,851 at `currentTime=514.06` with
+  `video sincronizado`; seeking to frame 46,691 reached `currentTime=1867.66` and displayed
+  `GOL · trajectory`; play advanced the frame counter and `currentTime`; frame 157,825 showed
+  `GOL · celebration`, frame 15,888 showed `PARADA · whistle`; the overlay canvas and frame
+  explorer rendered. After wrapping the video, the measured video and overlay rectangles both
+  read `1139.4 × 640.9` CSS px; a frame-12,000 screenshot placed the projected dots on the
+  players and the ball ring on the ball. The top-view canvas measured `658 × 424` and was
+  non-blank. At frame 12,851 the three layer payloads separated cleanly: raw had no observation,
+  Kalman estimated at `30.99, 58.09 m`, and combined at `30.98, 55.79 m`, with gap `0.84 s`;
+  cyan (Kalman) and amber (combined) rings were visible. At frame 73,935 all layers were lost
+  with gap `55.04 s`; at 73,951 all were observed at `-3.05, 25.37 m` and the red out-of-play
+  marker was visible in the map padding. The layer checkboxes changed both the map and the
+  explorer status. `#trackingStatus` stayed at `35.4` px (two lines), `#pitchStatus` at `17.7`
+  px (one line), and the explorer card stayed at `472.7` px throughout playback; each canvas had
+  exactly one `clearRect` per drawn frame. A 5 s virtual-time screenshot stalls media metadata in
+  headless Chrome; the CDP run is the authoritative browser evidence.
+* Submission: 199,319 rows, frames 0–199,318, official validator `OK`, `n_runs=305`.
 
 ## Full-match reconciliation
 
-A previous reference run reported 256 spells and H 41.4% / A 32.5% / D 26.1%; the pre-retune run
-reported 255 spells and H 40.5% / A 32.5% / D 26.9%; the previous parameter set reported 239
-spells and H 44.1% / A 34.6% / D 21.3%. The current run reports 186 spells and
-H 42.3% / A 31.9% / D 25.8%. One part of the earlier difference is frames 89,905–90,651: the ATD
-has no home players and only 1–3 away players, and the ball is missing. The old run's NaN
-emissions effectively reset to H. The sparse-tracking guard treats the stretch as missing evidence
-and predicts D, which the public and stress metrics are insensitive to. The rest is the retune:
-wider team Gaussian, easier exits from D, the dead-ball evidence model, and the loose-ball rule
-that returns a slow ball far from every player to the team that touched it last. This is a
-full-match structural diagnostic, not a score.
+The final run reports **198 spells** (100 first half, 98 second) over 158,857 graded frames,
+mean 21.8 s and median 15.6 s; shares H 41.1% / A 26.7% / D 32.2%. Frame counts are H 65,338 ·
+A 42,387 · D 51,132 · X 40,462.
+
+One structural difference from the earlier reference run is frames 89,905–90,651: the ATD has no
+home players and only 1–3 away players, and the ball is missing. The sparse-tracking guard treats
+the stretch as missing evidence and predicts `D`, which the public and stress metrics are
+insensitive to. The rest is the retune: a wider team Gaussian (`σ=4.0`), a wider dead zone
+(`d_dead=8.0`), easier exits from `D` (`p_dh=0.007`), the dead-ball evidence model, the loose-ball
+rule that returns a slow ball far from every player to its last toucher, and the goal/stoppage
+event layer.
 
 ## Reproducibility and privacy
 
-* `python -m possession_lab all --bootstrap-n 2000` regenerates every output.
-* `python -m unittest discover -s possession_lab/tests -v` runs the tests.
+* `python -m possession_lab all --bootstrap-n 2000` regenerates every output, including the
+  whistle cache on first run.
+* `python -m pytest -q possession_lab/tests` runs the suite.
 * `python evaluation/validate_submission.py possession_lab/outputs/predictions.csv` runs the
   official format gate.
 * `python -m possession_lab explain` rebuilds only `outputs/explanations.json` from an existing
   `predictions.csv`.
-* The gated `data/` bundle and generated `outputs/` are not committed.
-* No private full-match GT and no match video frames are used.
-* CPU is intentional: the 3-state Viterbi pass takes ~1.8 s; a GPU transfer would dominate.
+* The gated `data/` bundle, `outputs/`, and the whistle cache are not committed.
+* Uses the tactical MP4 audio only for whistle detection. Match video frames are not copied into
+  any output. Broadcast video is not used.
+* No private full-match GT is read, written, or inferred.
+* CPU is intentional: the 3-state Viterbi pass plus tracker/event preparation took 4.56 s
+  (load 2.77 s; stress suite 3.24 s) on the validated machine. A GPU transfer would dominate.
