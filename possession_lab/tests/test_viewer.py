@@ -19,6 +19,7 @@ from possession_lab.viewer import (
     FrameStore,
     build_user_truth_data,
     build_viewer_data,
+    erase_nearest_user_truth,
     load_user_truth,
     make_server,
     move_user_truth_boundary,
@@ -333,6 +334,19 @@ class UserTruthTest(unittest.TestCase):
         move_user_truth_boundary(ut, 3, 2)
         self.assertEqual(ut.tolist(), [A, A, X, X])
 
+    def test_erases_only_the_run_nearest_to_the_frame(self):
+        ut = np.array([H, H, X, A, A, X], dtype=np.int8)
+        erase_nearest_user_truth(ut, 1)
+        self.assertEqual(ut.tolist(), [X, X, X, A, A, X])
+        erase_nearest_user_truth(ut, 5)
+        self.assertEqual(ut.tolist(), [X, X, X, X, X, X])
+
+        empty = np.full(3, X, dtype=np.int8)
+        erase_nearest_user_truth(empty, 1)
+        self.assertEqual(empty.tolist(), [X, X, X])
+        with self.assertRaises(ValueError):
+            erase_nearest_user_truth(empty, 3)
+
 
 class RangeTest(unittest.TestCase):
     def test_parses_normal_open_and_suffix_ranges(self):
@@ -537,6 +551,17 @@ class ViewerUserTruthServerTest(unittest.TestCase):
         self.assertEqual(load_user_truth(self.truth_path, 4).tolist(), [H, H, H, X])
         with self.assertRaises(HTTPError) as raised:
             self.post({"boundary": 1, "to": 0})
+        self.assertEqual(raised.exception.code, 400)
+
+    def test_erases_the_nearest_ut_run_and_persists(self):
+        self.post({"start": 0, "stop": 2, "label": "H"})
+        self.post({"start": 3, "stop": 4, "label": "A"})
+        status, data = self.post({"eraseNearest": 3})
+        self.assertEqual(status, 200)
+        self.assertEqual(data["ut_segments"], [[0, 2, H]])
+        self.assertEqual(load_user_truth(self.truth_path, 4).tolist(), [H, H, X, X])
+        with self.assertRaises(HTTPError) as raised:
+            self.post({"eraseNearest": 4})
         self.assertEqual(raised.exception.code, 400)
 
 

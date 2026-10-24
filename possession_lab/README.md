@@ -148,7 +148,8 @@ What is shown:
   playback within ±1.5 s.
 * UT editing: press **Ancla aquí** at the start of a passage, seek to its end, then press `H`, `A`,
   or `D` to write that span; without an anchor a label applies to the current frame. `X` erases
-  the span and **Borrar UT** clears everything. The same `H/A/D/X` keys work anywhere on the page
+  the span and **Borrar UT** erases the UT run nearest to the current frame. The same `H/A/D/X`
+  keys work anywhere on the page
   (except while typing in a text field) and every label press leaves an anchor at the end of the
   written span. Anchors are drawn on both timelines; drag one to move the label boundary. The UT is
   written to `outputs/user_truth.json` after every edit and reloaded on the next session.

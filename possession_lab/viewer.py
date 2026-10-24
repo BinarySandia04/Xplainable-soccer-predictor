@@ -301,6 +301,23 @@ def move_user_truth_boundary(
     return user_truth
 
 
+def erase_nearest_user_truth(user_truth: np.ndarray, frame: int) -> np.ndarray:
+    """Erase the UT run closest to ``frame``; leave the array untouched when there are no runs."""
+    user_truth = np.asarray(user_truth)
+    n = int(user_truth.size)
+    frame = int(frame)
+    if not (0 <= frame < n):
+        raise ValueError(f"frame {frame} outside 0..{n - 1}")
+    runs = pm.segments(user_truth, pm.valid_runs(user_truth))
+    if not runs:
+        return user_truth
+    start, stop, _ = min(
+        runs, key=lambda run: max(run[0] - frame, frame - run[1] + 1, 0)
+    )
+    user_truth[start:stop] = X
+    return user_truth
+
+
 def build_user_truth_data(pred: np.ndarray, user_truth: np.ndarray) -> dict[str, Any]:
     """Score the fixed prediction against the user truth.
 
@@ -781,9 +798,13 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
                 raise ValueError
             n_frames = int(self.pred.size)
             clear = bool(body.get("clear"))
-            boundary = target = start = stop = code = None
+            erase_nearest = boundary = target = start = stop = code = None
             if clear:
                 pass
+            elif "eraseNearest" in body:
+                erase_nearest = int(body["eraseNearest"])
+                if not (0 <= erase_nearest < n_frames):
+                    raise ValueError
             elif "boundary" in body:
                 boundary, target = int(body["boundary"]), int(body["to"])
                 if not (0 <= boundary <= n_frames and 0 <= target <= n_frames):
@@ -803,6 +824,8 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
                 try:
                     if clear:
                         self.user_truth[:] = X
+                    elif erase_nearest is not None:
+                        erase_nearest_user_truth(self.user_truth, erase_nearest)
                     elif boundary is not None:
                         move_user_truth_boundary(self.user_truth, boundary, target)
                     else:
@@ -819,7 +842,7 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
                 ).encode("utf-8")
                 self.__class__.payload = merged_payload
         except ValueError:
-            self._send_error(HTTPStatus.BAD_REQUEST, "invalid user-truth boundary")
+            self._send_error(HTTPStatus.BAD_REQUEST, "invalid user-truth edit")
             return
         except OSError:
             self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "could not save user truth")

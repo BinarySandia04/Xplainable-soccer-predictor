@@ -421,7 +421,8 @@ required. `imageio-ffmpeg` is only used by the offline audio extractor, not by t
 * **User truth (UT).** The browser can paint `H/A/D/X` on the current frame or an anchored range,
   from the buttons or globally from the keyboard. Each label press leaves an anchor at the end of
   the written span; run boundaries are drawn on both timelines and can be dragged to move a cut.
-  `POST /api/user-truth` updates the UT array (paint, boundary move, or clear), writes
+  `POST /api/user-truth` updates the UT array (paint, boundary move, erase nearest run, or
+  clear), writes
   `outputs/user_truth.json` atomically, and returns recomputed UT segments and official-scorer
   metrics over exactly the tagged frames. The UT is viewer-only: `features.py`, `model.py`, and
   `pipeline.py` never import or read it, and the fixed `predictions.csv` is never modified.
