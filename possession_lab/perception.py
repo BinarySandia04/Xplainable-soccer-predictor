@@ -35,6 +35,14 @@ BALL_CLASS = 32
 PITCH_MARGIN = 1.5
 # A ball farther than this from the pitch is a ball boy/advert/crowd false positive.
 BALL_MARGIN = 1.2
+# Physical gate for temporal ball association.  Match-data ball speeds are below roughly
+# 40 m/s (about 145 km/h), including shots; the extra metre covers homography/projection noise.
+# This is deliberately an upper bound: a false positive that is farther than this from the last
+# accepted point is not the same ball, no matter how confident the detector is.
+BALL_MAX_SPEED_MPS = 40.0
+BALL_GATE_TOLERANCE_M = 1.0
+BALL_MIN_CONFIDENCE = 0.18
+BALL_TRACK_MAX_GAP_S = 1.0
 
 # Cache layout.  The first dimension is a sampled frame, not necessarily every video frame.
 MAX_PLAYERS = 40
@@ -275,6 +283,119 @@ def _inside_pitch(points: np.ndarray, pitch: tuple[float, float], margin: float)
     )
 
 
+def ball_gate_metres(
+    dt_s: float,
+    *,
+    max_speed: float = BALL_MAX_SPEED_MPS,
+    tolerance: float = BALL_GATE_TOLERANCE_M,
+) -> float:
+    """Maximum plausible ball displacement after ``dt_s`` seconds."""
+    return max(0.0, float(max_speed) * max(0.0, float(dt_s)) + float(tolerance))
+
+
+def select_plausible_ball_detections(
+    points: np.ndarray,
+    confidence: np.ndarray,
+    present: np.ndarray,
+    frame_index: np.ndarray,
+    *,
+    fps: float = FPS,
+    max_speed: float = BALL_MAX_SPEED_MPS,
+    tolerance: float = BALL_GATE_TOLERANCE_M,
+    min_confidence: float = BALL_MIN_CONFIDENCE,
+    max_gap_s: float = BALL_TRACK_MAX_GAP_S,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Select the temporal YOLO-ball track that is physically reachable.
+
+    ``points`` is ``(samples, candidates, 2)`` in pitch metres.  A measurement farther from the
+    previous accepted ball than ``max_speed * dt + tolerance`` is rejected, even if YOLO is very
+    confident.  A new track needs two mutually reachable detections, so a single false positive
+    cannot seed or move the track.  The returned ``status`` is ``0`` for an accepted detection,
+    ``1`` for a low-confidence accepted detection, and ``2`` for no usable measurement.
+
+    This is an online physical prior only: it uses pitch geometry and time, never ground truth.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    confidence = np.asarray(confidence, dtype=np.float64)
+    present = np.asarray(present, dtype=bool)
+    frame_index = np.asarray(frame_index, dtype=np.float64)
+    if points.ndim != 3 or points.shape[-1] != 2:
+        raise ValueError(f"points must have shape (samples, candidates, 2), got {points.shape}")
+    if confidence.shape != points.shape[:2] or present.shape != points.shape[:2]:
+        raise ValueError("points, confidence, and present shapes disagree")
+    if frame_index.shape != (points.shape[0],):
+        raise ValueError("frame_index must have one entry per sample")
+
+    samples = points.shape[0]
+    ball = np.full((samples, 2), np.nan, dtype=np.float64)
+    ball_confidence = np.zeros(samples, dtype=np.float64)
+    status = np.full(samples, 2, dtype=np.int8)
+    selected = np.full(samples, -1, dtype=np.int16)
+    if samples == 0:
+        return ball, ball_confidence, status, selected
+
+    last: np.ndarray | None = None
+    last_frame = -1
+    pending: np.ndarray | None = None
+    pending_frame = -1
+
+    for sample in range(samples):
+        valid = present[sample] & np.isfinite(points[sample]).all(axis=1)
+        rows = np.flatnonzero(valid & (confidence[sample] >= float(min_confidence)))
+        if pending is not None and (frame_index[sample] - pending_frame) / fps > max_gap_s:
+            pending = None
+        if rows.size == 0:
+            continue
+
+        if last is None:
+            # A single detection is not enough to start a new track.  Confirm it with a second
+            # detection that is reachable at football speed.
+            if pending is None:
+                row = int(rows[np.argmax(confidence[sample, rows])])
+                pending = points[sample, row].copy()
+                pending_frame = int(round(frame_index[sample]))
+                continue
+            dt = max(1.0 / fps, (frame_index[sample] - pending_frame) / fps)
+            gate = ball_gate_metres(dt, max_speed=max_speed, tolerance=tolerance)
+            distances = np.linalg.norm(points[sample, rows] - pending, axis=1)
+            reachable = rows[distances <= gate]
+            if reachable.size == 0:
+                row = int(rows[np.argmax(confidence[sample, rows])])
+                pending = points[sample, row].copy()
+                pending_frame = int(round(frame_index[sample]))
+                continue
+            row = int(reachable[np.argmin(np.linalg.norm(points[sample, reachable] - pending, axis=1))])
+        else:
+            dt = (frame_index[sample] - last_frame) / fps
+            if dt > max_gap_s:
+                last = None
+                row = int(rows[np.argmax(confidence[sample, rows])])
+                pending = points[sample, row].copy()
+                pending_frame = int(round(frame_index[sample]))
+                continue
+            dt = max(1.0 / fps, dt)
+            gate = ball_gate_metres(dt, max_speed=max_speed, tolerance=tolerance)
+            distances = np.linalg.norm(points[sample, rows] - last, axis=1)
+            reachable = rows[distances <= gate]
+            if reachable.size == 0:
+                # Keep the previous point for a short reacquisition window, but do not emit a
+                # measurement for this frame.
+                continue
+            row = int(reachable[np.argmin(np.linalg.norm(points[sample, reachable] - last, axis=1))])
+
+        point = points[sample, row]
+        value = float(confidence[sample, row])
+        ball[sample] = point
+        ball_confidence[sample] = value
+        status[sample] = 0 if value >= 0.25 else 1
+        selected[sample] = row
+        last = point.copy()
+        last_frame = int(round(frame_index[sample]))
+        pending = None
+
+    return ball, ball_confidence, status, selected
+
+
 def _box_foot_points(boxes: np.ndarray) -> np.ndarray:
     boxes = np.asarray(boxes, dtype=np.float64)
     return np.stack(((boxes[:, 0] + boxes[:, 2]) / 2.0, boxes[:, 3]), axis=1)
@@ -454,11 +575,11 @@ class _WhiteBlobBallDetector:
 class VideoBallTracker:
     """Causal ball tracker in pitch space.
 
-    The tracker is seeded by a YOLO ball detection (or by an ATD observation only when explicitly
-    allowed) and then uses image evidence.  It does not consume ATD observations as measurements
-    while it is alive; this is what lets it bridge an ATD gap.  If it is lost and an ATD seed is
-    available, it may reacquire near that seed; the cache records the source so the fusion layer
-    can discount seeded samples.
+    The tracker is seeded by an ATD observation, or by two mutually reachable YOLO ball
+    detections, and then uses image evidence.  It does not consume ATD observations as
+    measurements while it is alive; this is what lets it bridge an ATD gap.  If it is lost and an
+    ATD seed is available, it may reacquire near that seed; the cache records the source so the
+    fusion layer can discount seeded samples.
     """
 
     def __init__(
@@ -466,7 +587,7 @@ class VideoBallTracker:
         *,
         max_gap_s: float = 3.5,
         gate_m: float = 9.0,
-        speed_cap: float = 38.0,
+        speed_cap: float = BALL_MAX_SPEED_MPS,
         search_radius: int = 68,
     ) -> None:
         self.max_gap_s = float(max_gap_s)
@@ -485,6 +606,8 @@ class VideoBallTracker:
         self.confidence = 0.0
         self.template: np.ndarray | None = None
         self.missing = 0
+        self.pending: dict[str, Any] | None = None
+        self.pending_frame = -1
 
     @staticmethod
     def _nearest_ball(
@@ -556,6 +679,8 @@ class VideoBallTracker:
         self.last_pitch = point.copy()
         self.last_pixel = pixel.copy()
         self.missing = 0
+        self.pending = None
+        self.pending_frame = -1
         confidence = float(candidate.get("confidence", 0.5))
         self.confidence = max(0.08, min(1.0, confidence))
         template = self._template_from_frame(frame, (float(pixel[0]), float(pixel[1])))
@@ -568,6 +693,22 @@ class VideoBallTracker:
             "source": int(source),
             "origin": str(candidate.get("origin", "yolo")),
         }
+
+    def _motion_gate(self, frame_index: int, reference_frame: int) -> float:
+        """Max reachable distance between two samples, with a projection tolerance."""
+        dt = max(1.0 / FPS, (int(frame_index) - int(reference_frame)) / FPS)
+        return min(self.gate_m, ball_gate_metres(dt, max_speed=self.speed_cap))
+
+    def _reachable(self, point: np.ndarray, frame_index: int) -> bool:
+        """Whether a point can be the same ball as the last accepted observation."""
+        if (
+            not self.alive
+            or self.last_frame < 0
+            or not np.isfinite(self.last_pitch).all()
+        ):
+            return True
+        distance = float(np.linalg.norm(np.asarray(point, dtype=np.float64) - self.last_pitch))
+        return distance <= self._motion_gate(frame_index, self.last_frame)
 
     def _best_visible(
         self,
@@ -587,6 +728,8 @@ class VideoBallTracker:
             if confidence < min_confidence:
                 continue
             distance = float(np.linalg.norm(point - target))
+            if distance > gate:
+                continue
             # Prefer a confident detection even if it is slightly farther, but never let a weak
             # detection jump across the gate.
             score = distance - 1.5 * min(confidence, 0.6)
@@ -634,22 +777,22 @@ class VideoBallTracker:
                 or self._off_pitch(self.last_pitch)
                 or float(np.linalg.norm(self.last_pitch - anchor)) > 5.0
             ):
-                near = self._best_visible(visible, anchor, 4.0, min_confidence=0.18)
-                if near is None:
+                near = self._best_visible(visible, anchor, 2.5, min_confidence=0.18)
+                if near is None or not self._reachable(np.asarray(near["pitch"]), frame_index):
                     pixel = pitch_to_pixel(homography, anchor[None, :], self.pitch)[0]
                     candidate = self._as_candidate(anchor, pixel, 0.82, "atd")
-                else:
-                    candidate = near
-                    candidate["origin"] = "yolo+atd"
-                return self._commit(candidate, frame, frame_index, source=3 if near is None else 0)
+                    return self._commit(candidate, frame, frame_index, source=3)
+                candidate = near
+                candidate["origin"] = "yolo+atd"
+                return self._commit(candidate, frame, frame_index, source=0)
 
-            near = self._best_visible(visible, anchor, 3.2, min_confidence=0.12)
-            if near is None:
+            near = self._best_visible(visible, anchor, 2.5, min_confidence=0.12)
+            if near is None or not self._reachable(np.asarray(near["pitch"]), frame_index):
                 pixel = pitch_to_pixel(homography, anchor[None, :], self.pitch)[0]
                 candidate = self._as_candidate(anchor, pixel, 0.78, "atd")
                 return self._commit(candidate, frame, frame_index, source=3)
             # Use the image measurement when it is close to the anchor; otherwise trust the anchor.
-            if float(np.linalg.norm(np.asarray(near["pitch"]) - anchor)) <= 4.0:
+            if float(np.linalg.norm(np.asarray(near["pitch"]) - anchor)) <= 2.5:
                 near["origin"] = "yolo+atd"
                 return self._commit(near, frame, frame_index, source=0)
             pixel = pitch_to_pixel(homography, anchor[None, :], self.pitch)[0]
@@ -669,7 +812,7 @@ class VideoBallTracker:
                     self.alive = False
                     self.confidence = 0.0
                 else:
-                    gate = max(4.0, min(16.0, 2.5 + 8.0 * gap))
+                    gate = self._motion_gate(frame_index, self.last_frame)
                     candidate = self._best_visible(visible, predicted, gate)
                     if candidate is None:
                         predicted_pixel = pitch_to_pixel(homography, predicted[None, :], self.pitch)[0]
@@ -685,10 +828,19 @@ class VideoBallTracker:
                             best_distance = gate
                             for blob in blobs:
                                 distance = float(np.linalg.norm(np.asarray(blob["pitch"]) - predicted))
+                                if distance > gate:
+                                    continue
                                 score = distance - 0.8 * float(blob.get("confidence", 0.0))
                                 if score < best_distance:
                                     best_blob, best_distance = blob, score
                             candidate = best_blob
+                    if candidate is not None and not self._reachable(
+                        np.asarray(candidate["pitch"]), frame_index
+                    ):
+                        # The prediction may be ahead of the last accepted point; the candidate
+                        # still has to be physically reachable from that point, not only from the
+                        # predicted position.
+                        candidate = None
                     if candidate is not None:
                         return self._commit(candidate, frame, frame_index, source=0)
                     point = predicted
@@ -705,14 +857,50 @@ class VideoBallTracker:
                         "origin": "prediction",
                     }
 
-        # No anchor and no useful prediction: reacquire from a confident YOLO ball.  A weak
-        # detection is not enough to start a new track, because the class has false positives in
-        # crowds and advertising boards.
+        # No anchor and no useful prediction: reacquire from a confident YOLO ball.  A new track
+        # needs two mutually reachable detections; a single false positive in the crowd or on an
+        # advertising board must not become the ball.
         visible.sort(key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
-        seed = next((item for item in visible if float(item.get("confidence", 0.0)) >= 0.22), None)
-        if seed is not None:
-            seed["origin"] = "yolo-reacquire"
-            return self._commit(seed, frame, frame_index, source=0)
+        if (
+            self.pending is not None
+            and (frame_index - self.pending_frame) / FPS > BALL_TRACK_MAX_GAP_S
+        ):
+            self.pending = None
+            self.pending_frame = -1
+        seed = next(
+            (item for item in visible if float(item.get("confidence", 0.0)) >= BALL_MIN_CONFIDENCE),
+            None,
+        )
+        if seed is None:
+            self.alive = False
+            self.confidence = 0.0
+            return {
+                "pixel": [float("nan"), float("nan")],
+                "pitch": [float("nan"), float("nan")],
+                "confidence": 0.0,
+                "source": 2,
+                "origin": "lost",
+            }
+        if self.pending is None:
+            self.pending = dict(seed)
+            self.pending_frame = int(frame_index)
+        else:
+            gate = self._motion_gate(frame_index, self.pending_frame)
+            pending_point = np.asarray(self.pending["pitch"], dtype=np.float64)
+            confirmed = self._best_visible(
+                visible,
+                pending_point,
+                gate,
+                min_confidence=BALL_MIN_CONFIDENCE,
+            )
+            if confirmed is None:
+                self.pending = dict(seed)
+                self.pending_frame = int(frame_index)
+            else:
+                self.pending = None
+                self.pending_frame = -1
+                confirmed["origin"] = "yolo-reacquire"
+                return self._commit(confirmed, frame, frame_index, source=0)
 
         self.alive = False
         self.confidence = 0.0
@@ -721,7 +909,7 @@ class VideoBallTracker:
             "pitch": [float("nan"), float("nan")],
             "confidence": 0.0,
             "source": 2,
-            "origin": "lost",
+            "origin": "pending-reacquire",
         }
 
 

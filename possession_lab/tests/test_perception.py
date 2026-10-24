@@ -17,6 +17,7 @@ from possession_lab.perception import (
     pixel_to_pitch,
     pitch_to_pixel,
     save_perception,
+    select_plausible_ball_detections,
 )
 
 
@@ -85,12 +86,21 @@ class VideoBallTrackerTest(unittest.TestCase):
             [self.detection],
             atd_anchor=None,
         )
+        # One detection is only a candidate; a second reachable observation confirms it.
+        self.assertEqual(seeded["source"], 2)
+        seeded = tracker.update(
+            self.frame,
+            1,
+            self.homography,
+            [self.detection],
+            atd_anchor=None,
+        )
         self.assertEqual(seeded["source"], 0)
         self.assertAlmostEqual(seeded["pitch"][0], 52.65)
 
         anchored = tracker.update(
             self.frame,
-            1,
+            2,
             self.homography,
             [],
             atd_anchor=np.array([52.65, 34.0]),
@@ -100,7 +110,7 @@ class VideoBallTrackerTest(unittest.TestCase):
 
         predicted = tracker.update(
             self.frame,
-            2,
+            3,
             self.homography,
             [],
             atd_anchor=None,
@@ -110,7 +120,7 @@ class VideoBallTrackerTest(unittest.TestCase):
 
         lost = tracker.update(
             self.frame,
-            102,
+            103,
             self.homography,
             [],
             atd_anchor=None,
@@ -120,12 +130,156 @@ class VideoBallTrackerTest(unittest.TestCase):
 
         reacquired = tracker.update(
             self.frame,
-            110,
+            111,
+            self.homography,
+            [self.detection],
+            atd_anchor=None,
+        )
+        self.assertEqual(reacquired["source"], 2)
+        reacquired = tracker.update(
+            self.frame,
+            112,
             self.homography,
             [self.detection],
             atd_anchor=None,
         )
         self.assertEqual(reacquired["source"], 0)
+
+    def test_far_jump_is_rejected_and_does_not_move_the_ball(self):
+        tracker = VideoBallTracker()
+        tracker.update(self.frame, 0, self.homography, [self.detection], atd_anchor=None)
+        tracker.update(self.frame, 1, self.homography, [self.detection], atd_anchor=None)
+        before = tracker.last_pitch.copy()
+        far = {
+            "pixel": [1700.0, 900.0],
+            "pitch": [90.0, 55.0],
+            "confidence": 0.99,
+            "origin": "yolo",
+        }
+        result = tracker.update(self.frame, 2, self.homography, [far], atd_anchor=None)
+        self.assertEqual(result["source"], 1)
+        self.assertLess(float(np.linalg.norm(np.asarray(result["pitch"]) - before)), 0.2)
+
+    def test_high_confidence_detection_just_outside_gate_is_rejected(self):
+        tracker = VideoBallTracker()
+        tracker.update(self.frame, 0, self.homography, [self.detection], atd_anchor=None)
+        tracker.update(self.frame, 1, self.homography, [self.detection], atd_anchor=None)
+        just_outside = {
+            "pixel": [1000.0, 540.0],
+            "pitch": [55.65, 34.0],
+            "confidence": 0.99,
+            "origin": "yolo",
+        }
+        result = tracker.update(
+            self.frame, 2, self.homography, [just_outside], atd_anchor=None
+        )
+        self.assertEqual(result["source"], 1)
+        self.assertAlmostEqual(result["pitch"][0], 52.65, places=3)
+
+    def test_prediction_cannot_bypass_the_last_accepted_gate(self):
+        tracker = VideoBallTracker()
+        start = {
+            "pixel": [700.0, 540.0],
+            "pitch": [50.0, 34.0],
+            "confidence": 0.8,
+            "origin": "yolo",
+        }
+        moving = {
+            "pixel": [720.0, 540.0],
+            "pitch": [51.0, 34.0],
+            "confidence": 0.8,
+            "origin": "yolo",
+        }
+        tracker.update(self.frame, 0, self.homography, [start], atd_anchor=None)
+        tracker.update(self.frame, 1, self.homography, [moving], atd_anchor=None)
+        # This point is close to the constant-velocity prediction but 3 m from the last accepted
+        # point; the prediction must not widen the physical gate.
+        ahead = {
+            "pixel": [780.0, 540.0],
+            "pitch": [54.0, 34.0],
+            "confidence": 0.99,
+            "origin": "yolo",
+        }
+        result = tracker.update(self.frame, 2, self.homography, [ahead], atd_anchor=None)
+        self.assertEqual(result["source"], 1)
+        self.assertLess(float(result["pitch"][0]), 52.0)
+
+    def test_single_false_positive_cannot_seed_a_track(self):
+        tracker = VideoBallTracker()
+        first = tracker.update(self.frame, 0, self.homography, [self.detection], atd_anchor=None)
+        self.assertEqual(first["source"], 2)
+        far = {
+            "pixel": [1700.0, 900.0],
+            "pitch": [90.0, 55.0],
+            "confidence": 0.99,
+            "origin": "yolo",
+        }
+        second = tracker.update(self.frame, 1, self.homography, [far], atd_anchor=None)
+        self.assertEqual(second["source"], 2)
+        self.assertFalse(tracker.alive)
+
+    def test_large_atd_anchor_jump_is_an_anchor_not_a_yolo_detection(self):
+        tracker = VideoBallTracker()
+        tracker.update(self.frame, 0, self.homography, [self.detection], atd_anchor=None)
+        tracker.update(self.frame, 1, self.homography, [self.detection], atd_anchor=None)
+        far = {
+            "pixel": [1700.0, 900.0],
+            "pitch": [90.0, 55.0],
+            "confidence": 0.99,
+            "origin": "yolo",
+        }
+        result = tracker.update(
+            self.frame,
+            2,
+            self.homography,
+            [far],
+            atd_anchor=np.array([90.0, 55.0]),
+        )
+        self.assertEqual(result["source"], 3)
+        np.testing.assert_allclose(result["pitch"], [90.0, 55.0], atol=1e-9)
+
+
+class PlausibleBallSelectionTest(unittest.TestCase):
+    def _inputs(self, points, frames=None):
+        points = np.asarray(points, dtype=np.float64)
+        count = points.shape[0]
+        confidence = np.full((count, 1), 0.8, dtype=np.float64)
+        present = np.ones((count, 1), dtype=bool)
+        if frames is None:
+            frames = np.arange(count) * 5
+        return points[:, None, :], confidence, present, np.asarray(frames, dtype=np.float64)
+
+    def test_far_detection_is_rejected_but_the_next_reachable_one_is_kept(self):
+        points = np.array([[10.0, 10.0], [10.2, 10.0], [70.0, 10.0], [10.4, 10.0]])
+        ball, confidence, status, selected = select_plausible_ball_detections(
+            *self._inputs(points, frames=[0, 5, 10, 15])
+        )
+        self.assertTrue(np.isnan(ball[0]).all())
+        np.testing.assert_allclose(ball[1], points[1], atol=1e-9)
+        self.assertTrue(np.isnan(ball[2]).all())
+        np.testing.assert_allclose(ball[3], points[3], atol=1e-9)
+        self.assertEqual(int(status[1]), 0)
+        self.assertEqual(int(status[2]), 2)
+        self.assertEqual(int(selected[2]), -1)
+        self.assertGreater(float(confidence[1]), 0.0)
+
+    def test_two_mutually_reachable_detections_are_required_to_start(self):
+        points = np.array([[70.0, 10.0], [10.0, 10.0], [70.0, 10.0]])
+        ball, _, _, _ = select_plausible_ball_detections(
+            *self._inputs(points, frames=[0, 5, 10])
+        )
+        self.assertTrue(np.isnan(ball).all())
+
+    def test_reacquisition_after_a_gap_needs_a_reachable_confirmation(self):
+        points = np.array(
+            [[10.0, 10.0], [10.2, 10.0], [20.0, 10.0], [20.2, 10.0]]
+        )
+        ball, _, _, _ = select_plausible_ball_detections(
+            *self._inputs(points, frames=[0, 5, 100, 105])
+        )
+        self.assertTrue(np.isfinite(ball[1]).all())
+        self.assertTrue(np.isnan(ball[2]).all())
+        np.testing.assert_allclose(ball[3], points[3], atol=1e-9)
 
 
 class PerceptionCacheTest(unittest.TestCase):

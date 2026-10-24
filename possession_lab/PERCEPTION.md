@@ -16,6 +16,7 @@ tactical MP4
   -> YOLO11x: people + sports ball (full frame, 1920)
   -> per-frame homography: foot points and ball centre to pitch metres
   -> player team labels: nearest ATD slot (jersey colour is deliberately not claimed)
+  -> physical temporal gate: reject ball detections unreachable at football speed
   -> own ball tracker: YOLO ball + white-blob fallback + motion prediction
   -> compact perception.npz cache
                               \
@@ -27,8 +28,19 @@ goals / stoppages -----------/
 
 The own tracker is **anchored to ATD** while ATD is present, so a false YOLO ball cannot pull it
 away from the validated observation.  In an ATD gap it predicts through the gap and accepts YOLO or
-white-blob measurements only inside a motion gate.  If it has neither an anchor nor a usable
-measurement it reports `lost`; it never invents a position silently.
+white-blob measurements only inside a time-aware motion gate.  If it has neither an anchor nor a
+usable measurement it reports `lost`; it never invents a position silently.
+
+The gate is physical, not a ground-truth lookup.  It uses a match-data upper bound of `40 m/s`
+(about `145 km/h`, a generous bound for shots); the gate allows `40 m/s * dt + 1 m` for
+homography/projection error.  A detection outside that radius is rejected even when YOLO is very
+confident, and a velocity prediction cannot widen the gate: the candidate must be reachable from
+the last accepted point, not only from the predicted position.  Starting or reacquiring a YOLO
+track needs two mutually reachable detections, so a single false positive on a crowd or advertising
+board cannot seed it.  The same association is applied to the independent `yolo_ball` ballot and
+to the viewer's YOLO layer; public ground truth is still used only for evaluation, never as an
+online gate.  A tracker update pinned to ATD is labelled source `3`; only YOLO/white-blob
+measurements are source `0`, so an anchor snap cannot be mistaken for a YOLO jump in diagnostics.
 
 ## Ball-layer source codes
 
@@ -39,9 +51,10 @@ measurement it reports `lost`; it never invents a position silently.
 | `2` | lost / no estimate |
 | `3` | ATD anchor |
 
-The viewer draws the own tracker in green, the raw YOLO ball as an orange square, and the fused
-consensus ball as a magenta diamond.  The raw ATD, diagnostic Kalman, and production combined
-layers remain available unchanged.
+The viewer draws the own tracker in green, the temporally gated YOLO ball as an orange square,
+and the fused consensus ball as a magenta diamond.  The raw ATD, diagnostic Kalman, and production
+combined layers remain available unchanged.  The YOLO layer shows only detections that passed the
+physical association; the cache still retains all raw candidates for diagnostics.
 
 ## The poll
 
@@ -56,7 +69,7 @@ sources are likelihood updates with effective weights:
 | `atd_shape` | diagnostic | 0.01 |
 | `video_players` | independent evidence | 0.10 |
 | `video_ball` | independent evidence, strongest in ATD gaps | 0.14 |
-| `yolo_ball` | independent raw detector evidence | 0.04 |
+| `yolo_ball` | independent detector evidence, physically associated in time | 0.04 |
 | `hmm_atd` | prior | 1.00 |
 | `tags` | diagnostic | 0.01 |
 | `audio` | diagnostic | 0.02 |
@@ -108,10 +121,23 @@ The **Poll multi-fuente** card shows, for the current frame:
   envelope, or event);
 * the agreement/disagreement between the fused label and the validated baseline.
 
-The new map and video layers show all detector outputs, not just the final label.  The raw YOLO
-ball layer is intentionally off by default; enable it to inspect false positives.  The YOLO player
-rings can be toggled independently.  The browser never receives the 199k-frame tracking table; it
-fetches small per-frame payloads.
+The new map and video layers show the detector and fusion layers, not just the final label.  The
+YOLO ball layer is off by default and now applies the same physical association as the ballot, so
+it cannot jump to an unreachable false positive.  The cache still stores every raw candidate for
+offline inspection, but raw candidates are never drawn as an accepted ball.  The YOLO player rings
+can be toggled independently.  The browser never receives the 199k-frame tracking table; it fetches
+small per-frame payloads.
+
+## Physical-gate check
+
+On the 7,500-frame public cache, the raw best YOLO candidate had 566 consecutive frame-to-frame
+displacements above `2.6 m` (the 25 fps gate), with a maximum of `84.9 m` in one frame.  After the
+physical association, 4,497 frames have an accepted YOLO observation and no consecutive accepted
+pair exceeds the gate; the maximum observed displacement is `1.86 m` per frame.  The own tracker's
+source-`0` measurements are also below the gate (4,700 observations, 4,340 consecutive pairs,
+maximum `2.55 m`, zero violations).  These numbers are diagnostics from the public window, not an
+online input.  The fused label is unchanged, which is the intended safety result: the gate fixes
+continuity without promoting a noisy detector over the validated HMM.
 
 ## Current public-window check (development result)
 
@@ -134,7 +160,9 @@ a later evaluation shows a repeatable gain, especially in spell F1 rather than f
 ## Known limitations
 
 * YOLO's COCO sports-ball class produces false positives in crowds and near advertising boards;
-  the tracker's pitch gate, motion gate, and ATD anchor suppress most, not all, of them.
+  the pitch gate, the `40 m/s + 1 m` physical gate, the two-detection reacquisition rule, and the
+  ATD anchor suppress most of them.  The gate is deliberately conservative: a real ball faster
+  than the bound would be dropped rather than allowed to teleport.
 * Player team labels come from the nearest ATD slot.  Jersey-colour classification is a possible
   future source but is not enabled, so no actor identity is claimed.
 * The public cache covers only frames `[11,185, 18,685)`.  Outside that window the viewer and

@@ -13,7 +13,8 @@ The validated ATD/HMM is no longer the only opinion.  Each independent source em
     The own video ball tracker.  It is a gap-filling source: while ATD is present it is anchored
     to ATD, and while ATD is missing it uses YOLO ball detections plus a white-blob fallback.
 ``yolo_ball``
-    The raw YOLO sports-ball detections, before temporal tracking.
+    YOLO sports-ball detections, associated in time under a physical speed gate.  Detections
+    unreachable from the previous accepted point are rejected instead of becoming a teleport.
 ``hmm_atd``
     The posterior of the existing validated ATD/HMM.  Keeping it as one voter means the new
     evidence has to earn a disagreement instead of replacing a strong baseline by fiat.
@@ -46,6 +47,7 @@ from .model import (
     merge_isolated_runs,
     viterbi,
 )
+from .perception import select_plausible_ball_detections
 
 SOURCE_LABELS = {
     "atd_ball": "ATD balón",
@@ -419,9 +421,26 @@ def _resample_perception(perception: Any | None, n_frames: int) -> dict[str, np.
     ball_confidence[~fresh] = 0.0
     ball_source[~fresh] = 2
     ball_source[ball_confidence <= 0.02] = 2
-    yolo_present = np.asarray(perception.yolo_ball_present[index], dtype=bool) & fresh[:, None]
-    yolo_confidence = np.asarray(perception.yolo_ball_confidence[index], dtype=np.float32) * decay[:, None]
-    yolo_present &= yolo_confidence > 0.01
+    # YOLO emits several candidates per frame and the class is noisy.  Associate them causally in
+    # pitch space before they can vote: a candidate unreachable from the last accepted point at
+    # football speed is rejected, and a new track needs two mutually reachable detections.
+    plausible_ball, plausible_confidence, _, _ = select_plausible_ball_detections(
+        perception.yolo_ball_pitch,
+        perception.yolo_ball_confidence,
+        perception.yolo_ball_present,
+        perception.frame_index,
+        fps=FPS,
+    )
+    candidate_count = int(np.asarray(perception.yolo_ball_pitch).shape[1])
+    yolo_ball = np.full((n_frames, candidate_count, 2), np.nan, dtype=np.float32)
+    yolo_confidence = np.zeros((n_frames, candidate_count), dtype=np.float32)
+    yolo_present = np.zeros((n_frames, candidate_count), dtype=bool)
+    mapped_ball = np.asarray(plausible_ball[index], dtype=np.float32)
+    mapped_confidence = np.asarray(plausible_confidence[index], dtype=np.float32) * decay
+    mapped_fresh = fresh & np.isfinite(mapped_ball).all(axis=1) & (mapped_confidence > 0.01)
+    yolo_ball[mapped_fresh, 0] = mapped_ball[mapped_fresh]
+    yolo_confidence[mapped_fresh, 0] = mapped_confidence[mapped_fresh]
+    yolo_present[mapped_fresh, 0] = True
     out = {
         "player_pitch": np.asarray(perception.players_pitch[index], dtype=np.float32),
         "player_team": np.asarray(perception.players_team[index], dtype=np.int8),
@@ -432,8 +451,8 @@ def _resample_perception(perception: Any | None, n_frames: int) -> dict[str, np.
         "ball_pixel": ball_pixel,
         "ball_confidence": ball_confidence.astype(np.float32),
         "ball_source": ball_source,
-        "yolo_ball": np.asarray(perception.yolo_ball_pitch[index], dtype=np.float32),
-        "yolo_ball_confidence": yolo_confidence.astype(np.float32),
+        "yolo_ball": yolo_ball,
+        "yolo_ball_confidence": yolo_confidence,
         "yolo_ball_present": yolo_present,
         "age": age,
     }
@@ -668,7 +687,8 @@ def _source_yolo_ball(
     present = np.asarray(video["yolo_ball_present"], dtype=bool)
     confidence = np.asarray(video["yolo_ball_confidence"], dtype=np.float64)
     points = np.asarray(video["yolo_ball"], dtype=np.float64)
-    # Best raw detector point per frame; no temporal association here on purpose.
+    # The resampler has already associated candidates under the physical speed gate, so choosing
+    # the best remaining candidate cannot teleport to a far false positive.
     safe = np.where(present & np.isfinite(points).all(axis=2), confidence, -np.inf)
     best = np.argmax(safe, axis=1)
     has = np.isfinite(safe[np.arange(n), best]) & (safe[np.arange(n), best] > 0)
@@ -689,8 +709,8 @@ def _source_yolo_ball(
         sigma=3.8,
         dead_r=7.5,
     )
-    # A raw YOLO ball is more valuable when ATD has lost it, but it should not win a fight with ATD
-    # while the provided ball is present.
+    # The YOLO ballot is more valuable when ATD has lost the ball, but it should not win a fight
+    # with ATD while the provided ball is present.
     weight = vote.weight * np.where(np.asarray(atd_present, dtype=bool), 0.35, 1.0)
     active = vote.active & (weight > 1e-5)
     probability = vote.probability.copy()

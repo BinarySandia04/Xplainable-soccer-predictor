@@ -42,7 +42,10 @@ python3.12 -m venv .venv
 The validated HMM remains the default, but the lab can add independent video evidence on top of
 it.  The optional path detects players and the sports ball with YOLO, projects foot points through
 the per-frame homography, tracks the ball in pitch space through ATD gaps, and combines the video
-ballots with the HMM, smart tags, whistle, and events.  It never reads the public ground truth.
+ballots with the HMM, smart tags, whistle, and events.  A temporal physical gate (`40 m/s` plus
+projection tolerance) prevents a confident but unreachable YOLO detection from becoming the ball;
+starting or reacquiring a YOLO track needs two mutually reachable detections.  It never reads the
+public ground truth.
 
 ```bash
 # One-time: CPU/GPU perception dependencies.  The base requirements still reproduce predictions.
@@ -148,8 +151,9 @@ What is shown:
   ring, dashed while predicting); **Combinado** is the production tracker, ATD observations plus
   damped extrapolation for holes of at most 1.2 s (white ring when observed, dashed amber when
   estimating); **Balón vídeo** is the independent YOLO/white-blob tracker (green, dashed while
-  predicting, teal when pinned to ATD); **YOLO balón** shows the raw sports-ball detections
-  (orange square); **Fusión** is the consensus ball from the multi-source poll (magenta diamond).
+  predicting, teal when pinned to ATD); **YOLO balón** shows sports-ball detections after the
+  physical temporal gate (orange square), so an unreachable false positive cannot make it jump;
+  **Fusión** is the consensus ball from the multi-source poll (magenta diamond).
   A red ring means the point is beyond the pitch. The last ~1 s of each enabled layer is drawn as
   a fading trail. The `Seguimiento` checkbox toggles the whole overlay; `Jugadores YOLO` draws the
   detected player feet as hollow team-coloured rings. The layer checkboxes select which estimates

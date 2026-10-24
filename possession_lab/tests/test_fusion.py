@@ -218,6 +218,30 @@ class PerceptionResampleTest(unittest.TestCase):
         self.assertEqual(video["ball_source"][9], 2)
         self.assertTrue(np.isnan(video["ball_pitch"][9]).any())
 
+    def test_resampled_yolo_ball_uses_the_physical_gate(self):
+        perception = _empty_perception(
+            samples=3,
+            n_frames=30,
+            fps=25,
+            step=5,
+            start=0,
+            stop=30,
+            model="test.pt",
+            device="cpu",
+            video_width=1920,
+            video_height=1080,
+        )
+        perception.frame_index[:] = [0, 5, 10]
+        for sample, point in enumerate(([10.0, 10.0], [10.2, 10.0], [80.0, 50.0])):
+            perception.yolo_ball_present[sample, 0] = True
+            perception.yolo_ball_pitch[sample, 0] = point
+            perception.yolo_ball_confidence[sample, 0] = 0.9
+        video = _resample_perception(perception, 30)
+        self.assertTrue(video["yolo_ball_present"][5, 0])
+        np.testing.assert_allclose(video["yolo_ball"][5, 0], [10.2, 10.0], atol=1e-6)
+        self.assertFalse(video["yolo_ball_present"][10, 0])
+        self.assertTrue(np.isnan(video["yolo_ball"][10, 0]).all())
+
 
 if __name__ == "__main__":
     unittest.main()

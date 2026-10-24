@@ -57,6 +57,7 @@ from .config import (
     asset_paths,
 )
 from .data import TagTable, load_public_gt, load_smart_tags, load_submission
+from .perception import select_plausible_ball_detections
 
 # The official scorer is the source of truth for possession segments/spells, just as it is for the
 # report.  Import it lazily-safe by putting the repository root on sys.path first.
@@ -487,6 +488,20 @@ class FrameStore:
         self.fusion = fusion
         self.trail_frames = max(1, int(trail_frames))
         self.n_frames = int(tracking.n_frames)
+        self._yolo_ball_pitch: np.ndarray | None = None
+        self._yolo_ball_confidence: np.ndarray | None = None
+        self._yolo_ball_selected: np.ndarray | None = None
+        if perception is not None and getattr(perception, "samples", 0) > 0:
+            plausible, confidence, _, selected = select_plausible_ball_detections(
+                perception.yolo_ball_pitch,
+                perception.yolo_ball_confidence,
+                perception.yolo_ball_present,
+                perception.frame_index,
+                fps=float(getattr(perception, "fps", FPS)),
+            )
+            self._yolo_ball_pitch = plausible
+            self._yolo_ball_confidence = confidence
+            self._yolo_ball_selected = selected
         if getattr(features, "start", 0) != 0:
             raise ValueError("FrameStore needs full-match features starting at frame 0")
 
@@ -604,7 +619,7 @@ class FrameStore:
 
     def _yolo_layer_payload(self, frame: int) -> dict[str, Any]:
         sample = self._perception_sample(frame)
-        if sample is None:
+        if sample is None or self._yolo_ball_pitch is None:
             return {
                 "source": 2,
                 "observed": False,
@@ -617,12 +632,19 @@ class FrameStore:
                 "out_of_play": False,
                 "age_frames": None,
             }
-        detections = [
-            item
-            for item in sample.get("yolo_ball", [])
-            if item.get("x") is not None and item.get("y") is not None
-        ]
-        if not detections:
+        index = self.perception.nearest_index(int(frame))
+        point = np.asarray(self._yolo_ball_pitch[index], dtype=np.float64)
+        confidence = (
+            float(self._yolo_ball_confidence[index])
+            if self._yolo_ball_confidence is not None
+            else 0.0
+        )
+        slot = int(self._yolo_ball_selected[index]) if self._yolo_ball_selected is not None else -1
+        if (
+            slot < 0
+            or not np.isfinite(point).all()
+            or confidence <= 0.01
+        ):
             return {
                 "source": 2,
                 "observed": False,
@@ -635,22 +657,20 @@ class FrameStore:
                 "out_of_play": False,
                 "age_frames": int(sample.get("age_frames", 0)),
             }
-        best = max(detections, key=lambda item: float(item.get("confidence") or 0.0))
-        confidence = float(best.get("confidence") or 0.0)
+        pixel = np.asarray(self.perception.yolo_ball_pixel[index, slot], dtype=np.float64)
         source = 0 if confidence >= 0.25 else 1
         return {
             "source": source,
             "observed": bool(source == 0),
-            "x": best.get("x"),
-            "y": best.get("y"),
-            "px": best.get("px"),
-            "py": best.get("py"),
+            "x": _finite(point[0]),
+            "y": _finite(point[1]),
+            "px": _finite(pixel[0]),
+            "py": _finite(pixel[1]),
             "confidence": confidence,
             "gap_s": abs(int(sample.get("age_frames", 0))) / FPS if source != 0 else 0.0,
             "out_of_play": bool(
-                best.get("x") is not None
-                and best.get("y") is not None
-                and self._outside_pitch(float(best["x"]), float(best["y"]))
+                np.isfinite(point).all()
+                and self._outside_pitch(float(point[0]), float(point[1]))
             ),
             "age_frames": int(sample.get("age_frames", 0)),
         }

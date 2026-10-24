@@ -324,6 +324,24 @@ class FrameStoreMultiSourceTest(unittest.TestCase):
 
         class FakePerception:
             samples = 3
+            fps = 25
+            frame_index = np.array([0, 1, 2], dtype=np.int32)
+            yolo_ball_pitch = np.full((3, 6, 2), np.nan, dtype=np.float32)
+            yolo_ball_pixel = np.full((3, 6, 2), np.nan, dtype=np.float32)
+            yolo_ball_confidence = np.zeros((3, 6), dtype=np.float32)
+            yolo_ball_present = np.zeros((3, 6), dtype=bool)
+            for _frame in range(3):
+                yolo_ball_pitch[_frame, 0] = [12.0 + _frame, 22.0 + _frame]
+                yolo_ball_pixel[_frame, 0] = [520.0 + _frame, 320.0 + _frame]
+                yolo_ball_confidence[_frame, 0] = 0.7
+                yolo_ball_present[_frame, 0] = True
+            # The third sample is a confident but physically unreachable false positive.
+            yolo_ball_pitch[2, 0] = [80.0, 50.0]
+            yolo_ball_pixel[2, 0] = [1700.0, 900.0]
+
+            @staticmethod
+            def nearest_index(frame):
+                return max(0, min(2, int(frame)))
 
             @staticmethod
             def nearest(frame):
@@ -412,6 +430,9 @@ class FrameStoreMultiSourceTest(unittest.TestCase):
         self.assertEqual(payload["layers"]["video"]["x"], 11.0)
         self.assertEqual(payload["layers"]["video"]["px"], 501.0)
         self.assertEqual(payload["layers"]["yolo"]["x"], 13.0)
+        payload_far = store.frame_payload(2)
+        self.assertEqual(payload_far["layers"]["yolo"]["source"], 2)
+        self.assertIsNone(payload_far["layers"]["yolo"]["x"])
         self.assertEqual(payload["layers"]["fusion"]["x"], 11.0)
         self.assertEqual(payload["layers"]["fusion"]["source"], 0)
         self.assertEqual(len(payload["video_players"]), 1)
