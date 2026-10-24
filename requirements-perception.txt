@@ -1,0 +1,19 @@
+# Optional perception/fusion environment for the video ball tracker and YOLO ballots.
+#
+#   python3.12 -m venv .venv
+#   .venv/bin/python -m pip install -r requirements-possession.txt
+#   # optional CUDA build first, if you have an NVIDIA GPU:
+#   # .venv/bin/python -m pip install torch==2.11.0 torchvision==0.26.0 \
+#   #   --index-url https://download.pytorch.org/whl/cu128
+#   .venv/bin/python -m pip install -r requirements-perception.txt
+#
+# The base lab stays CPU-only; the perception path is optional and is never required to reproduce
+# predictions.csv.  YOLO weights (for example yolo11x.pt) are downloaded separately and are
+# git-ignored.
+-r requirements-possession.txt
+
+torch==2.11.0
+torchvision==0.26.0
+ultralytics==8.4.188
+opencv-python==5.0.0
+scipy==1.18.1

@@ -289,6 +289,14 @@ def cmd_viewer(args: argparse.Namespace) -> int:
     metrics = Path(args.metrics) if args.metrics else output_dir / "metrics_public.json"
     user_truth = Path(args.user_truth) if args.user_truth else USER_TRUTH_PATH
     explanations = None if args.no_explanations else (Path(args.explanations) if args.explanations else output_dir / "explanations.json")
+    if args.perception:
+        perception_path = Path(args.perception)
+    else:
+        perception_path = output_dir / "perception.npz"
+        public_cache = output_dir / "perception_public.npz"
+        if not perception_path.is_file() and public_cache.is_file():
+            perception_path = public_cache
+    fusion_path = Path(args.fusion) if args.fusion else output_dir / "fusion.npz"
 
     try:
         return serve_viewer(
@@ -300,6 +308,8 @@ def cmd_viewer(args: argparse.Namespace) -> int:
             user_truth_path=user_truth,
             explanations_path=explanations,
             data_dir=args.data_dir,
+            perception_path=perception_path if perception_path.is_file() else None,
+            fusion_path=fusion_path if fusion_path.is_file() else None,
             port=args.port,
             open_browser=not args.no_open,
             start_frame=args.start_frame,
@@ -316,6 +326,141 @@ def cmd_viewer(args: argparse.Namespace) -> int:
         return 2
 
 
+def cmd_perceive(args: argparse.Namespace) -> int:
+    """Run YOLO player/ball perception and write a reusable video cache."""
+    from .config import OUTPUT_DIR, PUBLIC_START, PUBLIC_STOP, VIDEO_PATH
+    from .perception import perceive_video, save_perception
+    from .pipeline import load_lab
+
+    output_dir = Path(args.output_dir or OUTPUT_DIR)
+    lab = load_lab(args.data_dir, load_gt=False)
+    start = int(args.start if args.start is not None else PUBLIC_START)
+    stop = int(args.stop if args.stop is not None else PUBLIC_STOP)
+    path = Path(args.perception) if args.perception else output_dir / "perception.npz"
+    print(
+        f"perception: {start:,}..{stop:,} step {args.step}, model {args.model}, "
+        f"device {args.device or 'auto'}"
+    )
+    perception = perceive_video(
+        VIDEO_PATH,
+        lab.homography,
+        lab.tracking,
+        start=start,
+        stop=stop,
+        step=args.step,
+        model=args.model,
+        device=args.device,
+        imgsz=args.imgsz,
+        progress=True,
+    )
+    saved = save_perception(path, perception)
+    print(
+        f"perception: wrote {saved} ({perception.samples:,} samples; "
+        f"ball visible {float((perception.ball_source == 0).mean()):.1%}, "
+        f"predicted {float((perception.ball_source == 1).mean()):.1%})"
+    )
+    return 0
+
+
+def cmd_fusion(args: argparse.Namespace) -> int:
+    """Build the multi-source poll, write its prediction, and score both it and the baseline."""
+    from .config import OUTPUT_DIR
+    from .evaluate import full_match_stats, public_metrics, to_jsonable
+    from .features import extract_features
+    from .fusion import build_fusion, save_fusion
+    from .perception import load_perception
+    from .pipeline import (
+        load_lab,
+        prepare_event_products,
+        validate_codes,
+        write_submission,
+    )
+
+    output_dir = Path(args.output_dir or OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lab = load_lab(args.data_dir)
+    perception_path = Path(args.perception) if args.perception else output_dir / "perception.npz"
+    perception = None if args.no_perception else load_perception(perception_path)
+    if perception is None:
+        print(f"fusion: no perception cache at {perception_path}; using non-video ballots only")
+    else:
+        print(
+            f"fusion: perception {perception.samples:,} samples "
+            f"({perception.start:,}..{perception.stop:,}, step {perception.step})"
+        )
+    track, whistle, events = prepare_event_products(
+        lab.tracking, lab.tags, use_audio=not args.no_audio
+    )
+    features = extract_features(
+        lab.tracking, lab.tags, ball_track=track, whistle=whistle, events=events
+    )
+    result = build_fusion(
+        lab.tracking,
+        lab.tags,
+        perception=perception,
+        features=features,
+        events=events,
+        track=track,
+        whistle=whistle,
+        include_baseline=not args.skip_baseline,
+        combine_mode=args.combine_mode,
+        use_audio=not args.no_audio,
+    )
+    fusion_path = save_fusion(
+        Path(args.fusion) if args.fusion else output_dir / "fusion.npz", result
+    )
+    submission = write_submission(result.codes, output_dir / "fusion_predictions.csv")
+    metrics = public_metrics(result.codes, lab.gt, bootstrap_n=args.bootstrap_n)
+    baseline_metrics = (
+        public_metrics(result.baseline_codes, lab.gt, bootstrap_n=args.bootstrap_n)
+        if result.baseline_codes is not None
+        else None
+    )
+    source_summary = {
+        key: {
+            "label": source.label,
+            "active_fraction": float(source.active.mean()),
+            "mean_weight": float(source.weight.mean()),
+            "max_weight": float(source.weight.max()),
+        }
+        for key, source in result.sources.items()
+    }
+    report = {
+        "fusion": metrics,
+        "baseline": baseline_metrics,
+        "sources": source_summary,
+        "combine_mode": args.combine_mode,
+        "fusion_path": str(fusion_path),
+        "prediction_path": str(submission),
+        "full_match": full_match_stats(result.codes),
+        "validation": validate_codes(result.codes),
+        "meta": to_jsonable(result.meta),
+    }
+    _json(output_dir / "fusion_metrics_public.json", report)
+    _json(output_dir / "fusion_validation.json", report["validation"])
+    print(
+        "fusion: spellF1 {:.4f} | macroF1 {:.4f} | accuracy {:.4f} | D-F1 {:.4f} | segments {}".format(
+            metrics["spell_f1_mean"],
+            metrics["macro_f1"],
+            metrics["accuracy"],
+            metrics["per_class"]["D"]["f1"],
+            metrics["n_pred_segments"],
+        )
+    )
+    if baseline_metrics is not None:
+        print(
+            "baseline: spellF1 {:.4f} | macroF1 {:.4f} | accuracy {:.4f} | D-F1 {:.4f} | segments {}".format(
+                baseline_metrics["spell_f1_mean"],
+                baseline_metrics["macro_f1"],
+                baseline_metrics["accuracy"],
+                baseline_metrics["per_class"]["D"]["f1"],
+                baseline_metrics["n_pred_segments"],
+            )
+        )
+    print("fusion: wrote", fusion_path, "and", submission)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m possession_lab",
@@ -325,7 +470,17 @@ def build_parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         default="all",
-        choices=["all", "predict", "evaluate", "stress", "visualize", "viewer", "explain"],
+        choices=[
+            "all",
+            "predict",
+            "evaluate",
+            "stress",
+            "visualize",
+            "viewer",
+            "explain",
+            "perceive",
+            "fusion",
+        ],
     )
     parser.add_argument("--data-dir", default=None, help="gated data directory (default: data/)")
     parser.add_argument("--output-dir", default=None, help="output directory (default: possession_lab/outputs)")
@@ -333,6 +488,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-stress", action="store_true", help="skip the missing-ball suite")
     parser.add_argument("--no-figures", action="store_true", help="write data only, no report")
     parser.add_argument("--no-explain", action="store_true", help="skip building outputs/explanations.json")
+
+    perception = parser.add_argument_group("perception", "YOLO/video perception and multi-source fusion")
+    perception.add_argument("--perception", default=None, help="perception cache path (default: outputs/perception.npz)")
+    perception.add_argument("--fusion", default=None, help="fusion cache path (default: outputs/fusion.npz)")
+    perception.add_argument("--no-perception", action="store_true", help="ignore any perception cache")
+    perception.add_argument("--start", type=int, default=None, help="first video frame for perceive (default: public start)")
+    perception.add_argument("--stop", type=int, default=None, help="exclusive last video frame for perceive (default: public stop)")
+    perception.add_argument("--step", type=int, default=1, help="process every Nth video frame (default: 1)")
+    perception.add_argument("--model", default="yolo11x.pt", help="Ultralytics weights (default: yolo11x.pt)")
+    perception.add_argument("--device", default=None, help="YOLO device, e.g. 0 or cpu (default: auto)")
+    perception.add_argument("--imgsz", type=int, default=1920, help="YOLO inference size (default: 1920)")
+    perception.add_argument("--combine-mode", choices=["log", "linear"], default="log", help="ballot pool (default: log)")
+    perception.add_argument("--skip-baseline", action="store_true", help="do not compute the baseline comparison")
+    perception.add_argument("--no-audio", action="store_true", help="disable whistle/audio products")
 
     viewer = parser.add_argument_group("viewer", "local video reviewer options")
     viewer.add_argument("--port", type=int, default=8765, help="local HTTP port (default: 8765)")
@@ -373,6 +542,8 @@ def main(argv: list[str] | None = None) -> int:
         "visualize": cmd_visualize,
         "viewer": cmd_viewer,
         "explain": cmd_explain,
+        "perceive": cmd_perceive,
+        "fusion": cmd_fusion,
     }
     return commands[args.command](args)
 

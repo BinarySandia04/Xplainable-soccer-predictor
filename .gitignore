@@ -36,6 +36,14 @@ data/*
 *.gzip
 *.pl3container
 
+# -- model weights -----------------------------------------------------------------------------
+# YOLO checkpoints are downloaded or trained locally. They are large binaries and must never be
+# committed; the perception cache stores detections, not weights.
+*.pt
+*.pth
+*.onnx
+*.engine
+
 # -- internal documents ---------------------------------------------------------------------------
 # OVERVIEW.md -- the institutional description of the competition -- IS committed. It is the only
 # place that explains why the format changed from 2026, and a document like that circulating by
