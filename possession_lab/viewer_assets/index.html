@@ -30,6 +30,12 @@
               Tu navegador no puede reproducir este video.
             </video>
             <canvas id="overlay" class="video-overlay" aria-label="Balón y jugadores proyectados sobre el video"></canvas>
+            <div id="videoBuffer" class="video-buffer hidden" role="status" aria-live="polite">
+              <span class="video-buffer-pill">
+                <span class="spinner" aria-hidden="true"></span>
+                <span id="videoBufferText">Cargando video…</span>
+              </span>
+            </div>
             <div id="videoError" class="video-error hidden" role="alert"></div>
           </div>
           <div class="video-caption">
@@ -38,6 +44,7 @@
               <input id="overlayToggle" type="checkbox" checked>
               Seguimiento
             </label>
+            <span id="videoBuffered" class="mono">buffer —</span>
             <span id="videoDuration" class="mono">duración —</span>
           </div>
         </div>

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 import threading
 import webbrowser
@@ -1092,6 +1093,37 @@ def build_frame_store(
     return store, events, ball_gap_runs(track, min_frames=max(1, int(0.4 * FPS)))
 
 
+def _open_viewer_browser(url: str) -> None:
+    """Open the local viewer without leaking browser child-process stderr into the terminal.
+
+    On Linux, ``xdg-open`` hands the URL to an existing Chromium/Brave session.  That session can
+    keep the inherited stderr open and print zygote/broken-pipe noise after the server has
+    started, so the launcher's streams are detached.  Fall back to :mod:`webbrowser` only when
+    ``xdg-open`` is unavailable or cannot be started.
+    """
+    if sys.platform.startswith("linux"):
+        try:
+            subprocess.Popen(
+                ["xdg-open", url],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            return
+        except OSError:
+            pass
+    try:
+        webbrowser.open(url)
+    except Exception as exc:  # pragma: no cover - platform/browser failure path
+        print(
+            f"viewer: no se pudo abrir el navegador; abre {url} manualmente ({exc})",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def serve_viewer(
     predictions_path: str | Path,
     *,
@@ -1181,7 +1213,9 @@ def serve_viewer(
     )
     print("Ctrl-C to stop.", flush=True)
     if open_browser:
-        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        opener = threading.Timer(0.5, _open_viewer_browser, args=(url,))
+        opener.daemon = True
+        opener.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -267,6 +267,44 @@ video {
   outline: none;
 }
 
+.video-buffer {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  z-index: 3;
+  background: rgba(8, 13, 18, 0.42);
+}
+
+.video-buffer-pill {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.7rem 1.1rem;
+  color: var(--ink-soft);
+  font-size: 0.88rem;
+  background: rgba(10, 15, 20, 0.88);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  box-shadow: var(--shadow);
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.18);
+  border-top-color: var(--h);
+  border-radius: 50%;
+  animation: spin 900ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .video-overlay {
   position: absolute;
   inset: 0;
@@ -290,8 +328,10 @@ video {
 
 .video-caption {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   justify-content: space-between;
-  gap: 1rem;
+  gap: 0.35rem 1rem;
   padding: 0.55rem 0.8rem;
   color: var(--muted);
   font-size: 0.78rem;

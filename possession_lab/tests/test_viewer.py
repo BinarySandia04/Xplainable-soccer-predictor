@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -17,6 +20,7 @@ from possession_lab.config import A, D, H, X
 from possession_lab.data import TagEvent
 from possession_lab.viewer import (
     FrameStore,
+    _open_viewer_browser,
     build_user_truth_data,
     build_viewer_data,
     erase_nearest_user_truth,
@@ -563,6 +567,43 @@ class ViewerUserTruthServerTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as raised:
             self.post({"eraseNearest": 4})
         self.assertEqual(raised.exception.code, 400)
+
+
+class ViewerAssetTest(unittest.TestCase):
+    def test_every_js_element_id_exists_in_html(self):
+        assets = Path(__file__).resolve().parents[1] / "viewer_assets"
+        html = (assets / "index.html").read_text(encoding="utf-8")
+        js = (assets / "viewer.js").read_text(encoding="utf-8")
+        ids = set(re.findall(r'id="([^"]+)"', html))
+        referenced = set(re.findall(r'\$\("#([^"]+)"\)', js))
+        self.assertEqual(sorted(referenced - ids), [])
+
+
+class BrowserOpenTest(unittest.TestCase):
+    def test_linux_launcher_is_detached_and_quiet(self):
+        url = "http://127.0.0.1:8765/"
+        with mock.patch("possession_lab.viewer.sys.platform", "linux"), mock.patch(
+            "possession_lab.viewer.subprocess.Popen"
+        ) as popen:
+            _open_viewer_browser(url)
+        popen.assert_called_once()
+        args, kwargs = popen.call_args
+        self.assertEqual(args[0], ["xdg-open", url])
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+        self.assertTrue(kwargs["start_new_session"])
+        self.assertTrue(kwargs["close_fds"])
+
+    def test_falls_back_when_xdg_open_is_missing(self):
+        url = "http://127.0.0.1:8765/"
+        with mock.patch("possession_lab.viewer.sys.platform", "linux"), mock.patch(
+            "possession_lab.viewer.subprocess.Popen", side_effect=FileNotFoundError
+        ), mock.patch(
+            "possession_lab.viewer.webbrowser.open", return_value=True
+        ) as opener:
+            _open_viewer_browser(url)
+        opener.assert_called_once_with(url)
 
 
 if __name__ == "__main__":
