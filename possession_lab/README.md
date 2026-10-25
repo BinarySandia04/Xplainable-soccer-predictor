@@ -37,6 +37,39 @@ python3.12 -m venv .venv
 .venv/bin/python evaluation/validate_submission.py possession_lab/outputs/predictions.csv
 ```
 
+### Optional video perception and multi-source fusion
+
+The validated HMM remains the default, but the lab can add independent video evidence on top of
+it.  The optional path detects players and the sports ball with YOLO, projects foot points through
+the per-frame homography, tracks the ball in pitch space through ATD gaps, and combines the video
+ballots with the HMM, smart tags, whistle, and events.  A temporal physical gate (`40 m/s` plus
+projection tolerance) prevents a confident but unreachable YOLO detection from becoming the ball;
+starting or reacquiring a YOLO track needs two mutually reachable detections.  It never reads the
+public ground truth.
+
+```bash
+# One-time: CPU/GPU perception dependencies.  The base requirements still reproduce predictions.
+.venv/bin/python -m pip install -r requirements-perception.txt
+
+# Public 5-minute window (about 13-15 min on an RTX 5070 Ti at step 1).
+.venv/bin/python -m possession_lab perceive \
+  --start 11185 --stop 18685 --step 1 \
+  --perception possession_lab/outputs/perception_public.npz
+
+# Build and score the fused prediction separately from predictions.csv.
+.venv/bin/python -m possession_lab fusion \
+  --perception possession_lab/outputs/perception_public.npz
+
+# The viewer auto-loads perception.npz/perception_public.npz and fusion.npz.
+.venv/bin/python -m possession_lab viewer
+```
+
+The pipeline is deliberately **additive**: baseline `outputs/predictions.csv` is unchanged, while
+fusion writes `outputs/fusion_predictions.csv`, `outputs/fusion.npz`, and
+`outputs/fusion_metrics_public.json`.  Keep the fused file separate until public evaluation
+justifies promoting it.  The architecture, source weights, cache format, and current measurements
+are in [PERCEPTION.md](PERCEPTION.md).
+
 Inference requires these four files under `data/tactical/`:
 
 ```text
@@ -64,6 +97,10 @@ stress.csv               clean / random / long missing-ball stress rows
 full_stats.json          full-match spell structure
 timings.json             measured CPU timings and GPU note
 whistle.npz              cached per-frame whistle score/envelope/events
+perception.npz           optional YOLO player/ball cache for video fusion
+fusion.npz               optional multi-source fusion cache
+fusion_predictions.csv   fused file, kept separate from predictions.csv
+fusion_metrics_public.json  fused vs baseline public metrics
 report.html              self-contained report with eight figures
 01_data_overview.png ... 08_tag_context.png
 user_truth.json          optional viewer-only UT (written by the local reviewer)
@@ -96,6 +133,8 @@ The default URL is `http://127.0.0.1:8765/`; the page opens at the first public 
 | `--metrics PATH` | public metrics JSON (default `possession_lab/outputs/metrics_public.json`) |
 | `--user-truth PATH` | UT JSON (default `possession_lab/outputs/user_truth.json`) |
 | `--explanations PATH` | switch annotations JSON (default `outputs/explanations.json`) |
+| `--perception PATH` | YOLO perception cache (default `outputs/perception.npz`, else `perception_public.npz`) |
+| `--fusion PATH` | multi-source fusion cache (default `outputs/fusion.npz`) |
 | `--no-explanations` | start without the annotation layer |
 | `--start-frame N` | initial frame; URL `?frame=N` overrides it |
 | `--no-open` | do not launch a browser |
@@ -106,14 +145,19 @@ What is shown:
 * Video, current frame, timecode, predicted label, public GT (only inside frames
   `[11,185, 18,685)`; outside it the GT is shown as `X` / “sin evaluar”), and the UT.
 * **Tracking overlay.** Player slots and the ball are projected onto the video with the frame's
-  homography (1920×1080). The three ball layers can be toggled independently under **Capas de
-  balón**: **ATD bruto** draws only ATD observations (white solid ring); **Kalman** is a causal
+  homography (1920×1080). The ball layers can be toggled independently under **Capas de balón**:
+  **ATD bruto** draws only ATD observations (white solid ring); **Kalman** is a causal
   constant-velocity filter that rejects isolated jumps and predicts through holes up to 5 s (cyan
   ring, dashed while predicting); **Combinado** is the production tracker, ATD observations plus
   damped extrapolation for holes of at most 1.2 s (white ring when observed, dashed amber when
-  estimating). A red ring means the point is beyond the pitch. The last ~1 s of each enabled
-  layer is drawn as a fading trail. The `Seguimiento` checkbox toggles the whole overlay; the
-  layer checkboxes select which estimates are drawn.
+  estimating); **Balón vídeo** is the independent YOLO/white-blob tracker (green, dashed while
+  predicting, teal when pinned to ATD); **YOLO balón** shows sports-ball detections after the
+  physical temporal gate (orange square), so an unreachable false positive cannot make it jump;
+  **Fusión** is the consensus ball from the multi-source poll (magenta diamond).
+  A red ring means the point is beyond the pitch. The last ~1 s of each enabled layer is drawn as
+  a fading trail. The `Seguimiento` checkbox toggles the whole overlay; `Jugadores YOLO` draws the
+  detected player feet as hollow team-coloured rings. The layer checkboxes select which estimates
+  are drawn.
 * **Mapa cenital.** A separate pitch canvas under the video draws the same frame directly from
   ATD metres, with **no homography and no video dependency**: pitch lines, blue/red player slots,
   the enabled ball layers, and their ~1 s trails. It is the honest view of what the model sees
@@ -127,10 +171,15 @@ What is shown:
   computed from the same full-match feature arrays the model used, sliced per frame by the local
   server; the browser never receives the 199k-frame tracking table.
   The Kalman layer is **diagnostic only**: it does not feed `features.py`, the HMM, the event
-  detector, or the submission. A video-domain MOSSE/GrayDiff/NanoTrack fusion was evaluated on
-  paper but not implemented: this workspace has no tracker code or weights and no OpenCV/SciPy/
-  filterpy runtime, and the tactical video still needs frame-accurate alignment to make a pixel
-  tracker comparable with the ATD. The dataset-native Kalman layer is the implemented alternative.
+  detector, or the submission. The optional video path is separate: `perception.py` runs YOLO and
+  its own pitch-space ball tracker, and `fusion.py` exposes every source ballot and the poll
+  decision. It is documented in [PERCEPTION.md](PERCEPTION.md), and it remains opt-in because the
+  public-window check has not shown a repeatable metric gain.
+* **Poll multi-fuente.** When `fusion.npz` is loaded, the card below the dataset explorer shows the
+  fused label, the baseline label, the final H/A/D probability, and one row per source with its
+  role (prior / evidence / diagnostic / override), status, effective weight, and reason. Agreement
+  with the validated baseline is highlighted; a difference is shown as `⚠` rather than hidden.
+  The fused badge in the label card and the **Fusión** layer use the same per-frame decision.
 * **Event markers.** The full-match and detail timelines mark goals (green), confirmed stoppages
   (amber dashes), and ball-tracking gaps (grey). Hovering a timeline shows the frame, time, pred,
   GT, and UT.

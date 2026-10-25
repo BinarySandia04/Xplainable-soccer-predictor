@@ -30,6 +30,12 @@
               Tu navegador no puede reproducir este video.
             </video>
             <canvas id="overlay" class="video-overlay" aria-label="Balón y jugadores proyectados sobre el video"></canvas>
+            <div id="videoBuffer" class="video-buffer hidden" role="status" aria-live="polite">
+              <span class="video-buffer-pill">
+                <span class="spinner" aria-hidden="true"></span>
+                <span id="videoBufferText">Cargando video…</span>
+              </span>
+            </div>
             <div id="videoError" class="video-error hidden" role="alert"></div>
           </div>
           <div class="video-caption">
@@ -38,6 +44,11 @@
               <input id="overlayToggle" type="checkbox" checked>
               Seguimiento
             </label>
+            <label class="overlay-toggle" title="Dibuja los pies de los jugadores detectados por YOLO">
+              <input id="yoloPlayersToggle" type="checkbox" checked>
+              Jugadores YOLO
+            </label>
+            <span id="videoBuffered" class="mono">buffer —</span>
             <span id="videoDuration" class="mono">duración —</span>
           </div>
         </div>
@@ -54,6 +65,9 @@
               <span><i class="pitch-dot dot-atd"></i>ATD bruto</span>
               <span><i class="pitch-dot dot-kalman"></i>Kalman</span>
               <span><i class="pitch-dot dot-combined"></i>Combinado</span>
+              <span><i class="pitch-dot dot-video"></i>Balón vídeo</span>
+              <span><i class="pitch-dot dot-yolo"></i>YOLO</span>
+              <span><i class="pitch-dot dot-fusion"></i>Fusión</span>
             </div>
           </div>
           <div class="layer-bar" role="group" aria-label="Capas de balón visibles">
@@ -69,6 +83,18 @@
             <label class="layer-toggle" title="ATD observado + extrapolación causal de ≤ 1,2 s; es la capa del modelo">
               <input type="checkbox" data-layer="combined" checked>
               Combinado
+            </label>
+            <label class="layer-toggle" title="Tracker propio sobre el video: detecta el balón con YOLO y rellena huecos del ATD">
+              <input type="checkbox" data-layer="video" checked>
+              Balón vídeo
+            </label>
+            <label class="layer-toggle" title="Detecciones de YOLO sports-ball tras el filtro físico temporal: una detección inalcanzable a velocidad de balón se descarta">
+              <input type="checkbox" data-layer="yolo">
+              YOLO balón
+            </label>
+            <label class="layer-toggle" title="Balón de consenso del poll multi-fuente">
+              <input type="checkbox" data-layer="fusion" checked>
+              Fusión
             </label>
           </div>
           <div class="pitch-wrap">
@@ -134,6 +160,13 @@
                 <span id="gtName" class="label-name">—</span>
               </div>
             </div>
+            <div class="label-cell fusion-label-cell">
+              <span class="eyebrow" title="Consenso del poll multi-fuente">Fusión</span>
+              <div class="label-line">
+                <span id="fusionBadge" class="badge badge-X">—</span>
+                <span id="fusionName" class="label-name">—</span>
+              </div>
+            </div>
             <div class="label-cell ut-cell">
               <span class="eyebrow">UT (User truth)</span>
               <div class="label-line">
@@ -144,6 +177,7 @@
           </div>
 
           <div id="agreement" class="agreement na">GT pública no disponible en este frame</div>
+          <div id="fusionAgreement" class="agreement na">Fusión no cargada</div>
           <div id="utAgreement" class="agreement na">UT sin etiqueta en este frame</div>
 
           <dl class="facts">
@@ -170,6 +204,27 @@
             <div><dt>Evento</dt><dd id="eventState">—</dd></div>
           </dl>
           <p class="fine-print">Proyección del ATD sobre el video con la homografía del frame. El explorador muestra el tracker combinado del modelo: ATD observado y extrapolación causal de ≤ 1,2 s. El mapa añade las capas Kalman y ATD bruto para comparar, pero no cambia el modelo ni los eventos.</p>
+        </section>
+
+        <section id="fusionCard" class="card fusion-card" aria-label="Poll multi-fuente de posesión">
+          <div class="eyebrow">Poll multi-fuente · frame</div>
+          <div id="fusionStatus" class="muted small">Cargando consenso…</div>
+          <div class="fusion-head">
+            <div>
+              <span class="eyebrow">Decisión</span>
+              <div class="label-line">
+                <span id="fusedBadge" class="badge badge-X">—</span>
+                <span id="fusedName" class="label-name">—</span>
+              </div>
+            </div>
+            <div class="fusion-confidence" title="Confianza posterior de la secuencia HMM; las barras de resumen muestran la probabilidad fusionada del frame">
+              <span class="mono" id="fusionConfidence">—</span>
+              <span class="muted small">confianza HMM</span>
+            </div>
+          </div>
+          <div id="fusionSummary" class="muted small">Sin votos todavía.</div>
+          <div id="sourceList" class="source-list" aria-live="polite"></div>
+          <p class="fine-print">Cada fila es un voto independiente (probabilidad H/A/D y peso). El HMM ATD validado es el prior; el balón de vídeo y los jugadores YOLO pueden moverlo. Los eventos confirmados fuerzan <strong>D</strong>. Ninguna GT pública entra en el poll.</p>
         </section>
 
         <section id="explainCard" class="card explain-card" aria-label="Por qué el modelo cambió de estado">

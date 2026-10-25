@@ -22,21 +22,35 @@
     1: "Athletic Club",
   };
   const MONO = '"SFMono-Regular", "Cascadia Code", "Roboto Mono", monospace';
-  const BALL_LAYERS = ["raw", "kalman", "combined"];
+  const BALL_LAYERS = ["raw", "kalman", "yolo", "video", "combined", "fusion"];
   const LAYER_NAMES = {
     raw: "ATD bruto",
     kalman: "Kalman",
     combined: "Combinado",
+    video: "Balón vídeo",
+    yolo: "YOLO balón",
+    fusion: "Fusión",
   };
   const LAYER_SHORT_NAMES = {
     raw: "ATD",
     kalman: "Kalman",
     combined: "comb.",
+    video: "vídeo",
+    yolo: "YOLO",
+    fusion: "fusión",
+  };
+  const SOURCE_STATUS_NAMES = {
+    observed: "observado",
+    estimated: "estimado",
+    abstain: "sin datos",
+    event: "evento",
+    unknown: "?",
   };
   const ui = {
     video: $("#video"),
     overlay: $("#overlay"),
     overlayToggle: $("#overlayToggle"),
+    yoloPlayersToggle: $("#yoloPlayersToggle"),
     layerToggles: Array.from(document.querySelectorAll("[data-layer]")),
     pitchMap: $("#pitchMap"),
     pitchStatus: $("#pitchStatus"),
@@ -58,6 +72,15 @@
     utName: $("#utName"),
     agreement: $("#agreement"),
     utAgreement: $("#utAgreement"),
+    fusionAgreement: $("#fusionAgreement"),
+    fusionBadge: $("#fusionBadge"),
+    fusionName: $("#fusionName"),
+    fusedBadge: $("#fusedBadge"),
+    fusedName: $("#fusedName"),
+    fusionConfidence: $("#fusionConfidence"),
+    fusionSummary: $("#fusionSummary"),
+    fusionStatus: $("#fusionStatus"),
+    sourceList: $("#sourceList"),
     spellText: $("#spellText"),
     spellDuration: $("#spellDuration"),
     tagText: $("#tagText"),
@@ -130,7 +153,8 @@
     switchFilter: "all",
     switchFrames: [],
     overlayEnabled: true,
-    layers: { raw: true, kalman: true, combined: true },
+    layers: { raw: true, kalman: true, combined: true, video: true, yolo: false, fusion: true },
+    yoloPlayersEnabled: true,
     frameData: null,
     frameDataRequest: null,
     frameCache: new Map(),
@@ -264,6 +288,7 @@
   function sourceText(source) {
     if (source === 0) return "observado";
     if (source === 1) return "estimado";
+    if (source === 3) return "anclado ATD";
     return "perdido";
   }
 
@@ -282,7 +307,7 @@
   function layerSummary(frameData, compact = false, includeGap = true) {
     if (!frameData) return "cargando seguimiento…";
     const parts = [];
-    for (const layer of ["combined", "kalman", "raw"]) {
+    for (const layer of ["fusion", "combined", "video", "yolo", "kalman", "raw"]) {
       if (!state.layers[layer]) continue;
       const data = layerData(frameData, layer);
       const source = data ? Number(data.source) : 2;
@@ -300,6 +325,13 @@
   function layerColor(layer, source, alpha = 1) {
     if (layer === "raw") return `rgba(244, 248, 251, ${alpha})`;
     if (layer === "kalman") return `rgba(154, 208, 255, ${alpha})`;
+    if (layer === "video") {
+      if (source === 1) return `rgba(255, 200, 87, ${alpha})`;
+      if (source === 3) return `rgba(85, 209, 135, ${alpha})`;
+      return `rgba(46, 220, 150, ${alpha})`;
+    }
+    if (layer === "yolo") return `rgba(255, 180, 92, ${alpha})`;
+    if (layer === "fusion") return `rgba(232, 121, 249, ${alpha})`;
     return source === 1
       ? `rgba(255, 200, 87, ${alpha})`
       : `rgba(244, 248, 251, ${alpha})`;
@@ -394,6 +426,7 @@
     if (cached) {
       state.frameData = cached;
       updateExplorer();
+      updateFusionPanel();
       return;
     }
     if (state.frameData && state.frameData.frame === frame) {
@@ -416,6 +449,7 @@
         state.frameData = payload;
         state.frameDataError = false;
         updateExplorer();
+        updateFusionPanel();
         drawOverlay();
       })
       .catch((error) => {
@@ -511,18 +545,61 @@
       ctx.stroke();
       return;
     }
-    const radius = (layer === "kalman" ? 6.2 : 8.2) * scale;
+    if (layer === "yolo") {
+      const radius = 3.4 * scale;
+      ctx.beginPath();
+      ctx.rect(x - radius, y - radius, radius * 2, radius * 2);
+      ctx.lineWidth = 1.3;
+      ctx.strokeStyle = color;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(x, y, 1.1 * scale, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      return;
+    }
+    ctx.save();
+    if (layer === "fusion") {
+      // Diamond for the consensus/fused ball; it should read as a decision, not a detection.
+      const radius = 8.6 * scale;
+      ctx.beginPath();
+      ctx.moveTo(x, y - radius);
+      ctx.lineTo(x + radius, y);
+      ctx.lineTo(x, y + radius);
+      ctx.lineTo(x - radius, y);
+      ctx.closePath();
+      ctx.lineWidth = 2.2;
+      ctx.strokeStyle = color;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(x, y, 2.6 * scale, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.restore();
+      return;
+    }
+    const radius = (layer === "kalman" ? 6.2 : layer === "video" ? 7.2 : 8.2) * scale;
     ctx.beginPath();
     ctx.arc(x, y, radius, 0, Math.PI * 2);
-    ctx.lineWidth = layer === "combined" ? 2 : 1.7;
+    ctx.lineWidth = layer === "combined" || layer === "video" ? 2 : 1.7;
     if (source === 1) ctx.setLineDash([3, 2]);
     ctx.strokeStyle = color;
     ctx.stroke();
     ctx.setLineDash([]);
+    if (layer === "video" && source === 3) {
+      // ATD anchor: a small tick above the ring marks a video track that is currently pinned.
+      ctx.beginPath();
+      ctx.moveTo(x, y - radius - 2.5 * scale);
+      ctx.lineTo(x, y - radius + 2.5 * scale);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.3;
+      ctx.stroke();
+    }
     ctx.beginPath();
     ctx.arc(x, y, 2.2 * scale, 0, Math.PI * 2);
     ctx.fillStyle = color;
     ctx.fill();
+    ctx.restore();
   }
 
   function updatePitchStatus(frameData) {
@@ -560,6 +637,36 @@
       "aria-label",
       `Vista cenital frame ${frameData.frame}: ${frameData.players.length} slots, ${layerSummary(frameData)}.`,
     );
+  }
+
+  function drawYoloPlayerMarkers(ctx, players, xOf, yOf, coordinates, radius) {
+    if (!state.yoloPlayersEnabled || !Array.isArray(players) || players.length === 0) return;
+    ctx.save();
+    for (const player of players) {
+      const px = coordinates === "video" ? player.px : player.x;
+      const py = coordinates === "video" ? player.py : player.y;
+      if (px === null || px === undefined || py === null || py === undefined) continue;
+      if (!Number.isFinite(Number(px)) || !Number.isFinite(Number(py))) continue;
+      const x = xOf(Number(px));
+      const y = yOf(Number(py));
+      const color = player.team === 0 ? COLORS.H : player.team === 1 ? COLORS.A : "#c8d6e5";
+      ctx.beginPath();
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      ctx.lineWidth = 1.2;
+      ctx.strokeStyle = color;
+      ctx.globalAlpha = 0.58;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x, y - radius - 1.5);
+      ctx.lineTo(x, y - radius + 1.5);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(x, y, 1.1, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.78;
+      ctx.fill();
+    }
+    ctx.restore();
   }
 
   function drawPitchMap() {
@@ -663,6 +770,14 @@
       ctx.strokeStyle = "rgba(0, 0, 0, 0.72)";
       ctx.stroke();
     }
+    drawYoloPlayerMarkers(
+      ctx,
+      frameData && frameData.video_players,
+      xOf,
+      yOf,
+      "pitch",
+      playerRadius * 0.92,
+    );
 
     ctx.restore();
 
@@ -740,6 +855,14 @@
       ctx.strokeStyle = "rgba(0,0,0,0.7)";
       ctx.stroke();
     }
+    drawYoloPlayerMarkers(
+      ctx,
+      frameData.video_players,
+      xOf,
+      yOf,
+      "video",
+      4.4,
+    );
 
     for (const layer of visibleBallLayers()) {
       const layerInfo = layerData(frameData, layer);
@@ -917,6 +1040,138 @@
     return Boolean(state.data) && frame >= state.data.public[0] && frame < state.data.public[1];
   }
 
+  function probabilityBars(probability) {
+    const bars = document.createElement("div");
+    bars.className = "source-bars";
+    for (let index = 0; index < 3; index++) {
+      const value = Math.max(0, Math.min(1, Number(probability[index]) || 0));
+      const segment = document.createElement("i");
+      segment.className = `bar-${LABELS[index]}`;
+      segment.style.flex = `${value} 1 0`;
+      bars.appendChild(segment);
+    }
+    return bars;
+  }
+
+  function updateFusionPanel() {
+    const data = state.data;
+    if (!data) return;
+    const frameData =
+      state.frameData && state.frameData.frame === state.frame ? state.frameData : null;
+    const fusion = frameData && frameData.fusion ? frameData.fusion : null;
+
+    if (!fusion || !fusion.available) {
+      setBadge(ui.fusionBadge, "X");
+      ui.fusionName.textContent = data.fusion_available ? "Cargando…" : "Sin cache";
+      setBadge(ui.fusedBadge, "X");
+      ui.fusedName.textContent = data.fusion_available ? "Cargando…" : "Sin cache";
+      ui.fusionConfidence.textContent = "—";
+      ui.fusionAgreement.textContent = data.fusion_available
+        ? "Frame de fusión cargando"
+        : "Cache de fusión no cargado · ejecuta `fusion` y reinicia el viewer";
+      ui.fusionAgreement.className = "agreement na";
+      ui.fusionStatus.textContent = data.fusion_available
+        ? `frame ${formatFrame(state.frame)} · cargando poll…`
+        : "Fusión no disponible";
+      ui.fusionSummary.textContent = data.fusion_available
+        ? "Esperando los votos del frame."
+        : "No hay votos que mostrar.";
+      ui.sourceList.replaceChildren();
+      const empty = document.createElement("div");
+      empty.className = "fusion-empty";
+      empty.textContent = data.fusion_available
+        ? "Cargando fuentes…"
+        : "Ejecuta `python -m possession_lab fusion` para generar outputs/fusion.npz.";
+      ui.sourceList.appendChild(empty);
+      return;
+    }
+
+    const code = LABELS[fusion.code] || "X";
+    setBadge(ui.fusionBadge, code);
+    ui.fusionName.textContent = NAMES[code] || "—";
+    setBadge(ui.fusedBadge, code);
+    ui.fusedName.textContent = NAMES[code] || "—";
+    ui.fusionConfidence.textContent = `${(Number(fusion.confidence || 0) * 100).toFixed(0)}%`;
+    const baseline = fusion.baseline_label || null;
+    const mainPred = codeAt(data.labels, state.frame);
+    let agreementText;
+    let agreementClass;
+    if (!baseline) {
+      agreementText = "HMM base no disponible en este frame";
+      agreementClass = "agreement na";
+    } else if (baseline === code) {
+      agreementText = `✓ fusión coincide con el HMM base (${baseline})`;
+      agreementClass = "agreement ok";
+    } else {
+      agreementText = `⚠ fusión difiere del HMM base (${baseline} → ${code})`;
+      agreementClass = "agreement warn";
+    }
+    if (mainPred && mainPred !== code) {
+      agreementText += ` · predicción principal ${mainPred}`;
+    }
+    ui.fusionAgreement.textContent = agreementText;
+    ui.fusionAgreement.className = agreementClass;
+    const sourceCount = Array.isArray(fusion.sources) ? fusion.sources.length : 0;
+    ui.fusionStatus.textContent = `frame ${formatFrame(state.frame)} · ${sourceCount} fuentes · modo ${
+      fusion.combine_mode || "log"
+    }${baseline ? ` · HMM base ${baseline}` : ""}`;
+
+    const probability = fusion.fused_probability || [0, 0, 0];
+    const summary = [
+      `H ${(Number(probability[0]) * 100).toFixed(0)}%`,
+      `A ${(Number(probability[1]) * 100).toFixed(0)}%`,
+      `D ${(Number(probability[2]) * 100).toFixed(0)}%`,
+      fusion.event_dead ? "evento D" : "",
+    ].filter(Boolean).join(" · ");
+    ui.fusionSummary.replaceChildren(probabilityBars(probability));
+    const summaryText = document.createElement("span");
+    summaryText.textContent = summary;
+    ui.fusionSummary.appendChild(summaryText);
+
+    ui.sourceList.replaceChildren();
+    for (const source of fusion.sources || []) {
+      const row = document.createElement("div");
+      row.className = "source-row";
+      const statusName = source.status_name || "unknown";
+      if (statusName === "abstain") row.classList.add("abstain");
+      if (statusName === "estimated") row.classList.add("estimated");
+      if (statusName === "event") row.classList.add("event");
+
+      const head = document.createElement("div");
+      head.className = "source-row-head";
+      const name = document.createElement("span");
+      name.className = "source-name";
+      name.textContent = source.label || source.key || "fuente";
+      const status = document.createElement("span");
+      status.className = "source-status";
+      status.textContent = SOURCE_STATUS_NAMES[statusName] || statusName;
+      head.append(name, status);
+
+      const weight = document.createElement("span");
+      weight.className = "source-weight";
+      const numericWeight = Number(source.weight || 0);
+      if (source.role === "prior") weight.textContent = "prior";
+      else if (source.role === "override") weight.textContent = "override";
+      else if (source.role === "redundant") weight.textContent = `diagnóstico ${numericWeight.toFixed(2)}`;
+      else weight.textContent = numericWeight >= 0.001 ? `peso ${numericWeight.toFixed(2)}` : "peso 0";
+      weight.title = `Peso efectivo ${numericWeight.toFixed(4)}`;
+
+      row.append(head, weight, probabilityBars(source.probability || [0, 0, 0]));
+      const reason = document.createElement("span");
+      reason.className = "source-reason";
+      reason.textContent = source.reason || "";
+      reason.title = source.reason || "";
+      row.appendChild(reason);
+      ui.sourceList.appendChild(row);
+    }
+    if (!ui.sourceList.childElementCount) {
+      const empty = document.createElement("div");
+      empty.className = "fusion-empty";
+      empty.textContent = "El poll no tiene fuentes activas en este frame.";
+      ui.sourceList.appendChild(empty);
+    }
+  }
+
   function updateUI() {
     const data = state.data;
     if (!data || state.frame < 0) return;
@@ -996,6 +1251,7 @@
     if (document.activeElement !== ui.frameInput) {
       ui.frameInput.value = String(frame);
     }
+    updateFusionPanel();
   }
 
   function renderMetrics() {
@@ -2034,6 +2290,13 @@
       state.overlayEnabled = ui.overlayToggle.checked;
       drawOverlay();
     });
+    if (ui.yoloPlayersToggle) {
+      ui.yoloPlayersToggle.checked = state.yoloPlayersEnabled;
+      ui.yoloPlayersToggle.addEventListener("change", () => {
+        state.yoloPlayersEnabled = ui.yoloPlayersToggle.checked;
+        drawOverlay();
+      });
+    }
     for (const toggle of ui.layerToggles) {
       const layer = toggle.dataset.layer;
       if (!Object.prototype.hasOwnProperty.call(state.layers, layer)) continue;

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -17,6 +20,7 @@ from possession_lab.config import A, D, H, X
 from possession_lab.data import TagEvent
 from possession_lab.viewer import (
     FrameStore,
+    _open_viewer_browser,
     build_user_truth_data,
     build_viewer_data,
     erase_nearest_user_truth,
@@ -287,6 +291,159 @@ class FrameStoreLayersTest(unittest.TestCase):
             payload["trails"]["combined"]["pitch"],
             [[10.0, 20.0, 0], [11.0, 21.0, 1]],
         )
+
+
+class FrameStoreMultiSourceTest(unittest.TestCase):
+    def test_payload_carries_video_yolo_fusion_and_source_ballots(self):
+        tracking = SimpleNamespace(
+            n_frames=3,
+            ball=np.array([[10.0, 20.0], [11.0, 21.0], [12.0, 22.0]], dtype=np.float32),
+            ball_present=np.ones(3, dtype=bool),
+            players=np.zeros((3, 0, 2), dtype=np.float32),
+            speeds=np.zeros((3, 0), dtype=np.float32),
+            player_present=np.zeros((3, 0), dtype=bool),
+            teams=np.zeros(0, dtype=np.int8),
+            pitch=(105.3, 68.0),
+        )
+        homography = SimpleNamespace(
+            matrices=np.repeat(
+                np.array([[[1920.0, 0.0, 0.0], [0.0, 1080.0, 0.0], [0.0, 0.0, 1.0]]]),
+                3,
+                axis=0,
+            )
+        )
+        combined = SimpleNamespace(
+            source=np.zeros(3, dtype=np.int8),
+            estimate=np.array([[10.0, 20.0], [11.0, 21.0], [12.0, 22.0]], dtype=np.float32),
+            confidence=np.ones(3, dtype=np.float32),
+            gap_s=np.zeros(3, dtype=np.float32),
+            out_of_play=np.zeros(3, dtype=bool),
+        )
+        events = SimpleNamespace(goals=(), stoppages=())
+        features = SimpleNamespace(start=0)
+
+        class FakePerception:
+            samples = 3
+            fps = 25
+            frame_index = np.array([0, 1, 2], dtype=np.int32)
+            yolo_ball_pitch = np.full((3, 6, 2), np.nan, dtype=np.float32)
+            yolo_ball_pixel = np.full((3, 6, 2), np.nan, dtype=np.float32)
+            yolo_ball_confidence = np.zeros((3, 6), dtype=np.float32)
+            yolo_ball_present = np.zeros((3, 6), dtype=bool)
+            for _frame in range(3):
+                yolo_ball_pitch[_frame, 0] = [12.0 + _frame, 22.0 + _frame]
+                yolo_ball_pixel[_frame, 0] = [520.0 + _frame, 320.0 + _frame]
+                yolo_ball_confidence[_frame, 0] = 0.7
+                yolo_ball_present[_frame, 0] = True
+            # The third sample is a confident but physically unreachable false positive.
+            yolo_ball_pitch[2, 0] = [80.0, 50.0]
+            yolo_ball_pixel[2, 0] = [1700.0, 900.0]
+
+            @staticmethod
+            def nearest_index(frame):
+                return max(0, min(2, int(frame)))
+
+            @staticmethod
+            def nearest(frame):
+                frame = max(0, min(2, int(frame)))
+                return {
+                    "sample_frame": frame,
+                    "age_frames": 0,
+                    "ball": {
+                        "source": 0,
+                        "x": 10.0 + frame,
+                        "y": 20.0 + frame,
+                        "px": 500.0 + frame,
+                        "py": 300.0 + frame,
+                        "confidence": 0.8,
+                    },
+                    "yolo_ball": [
+                        {
+                            "x": 12.0 + frame,
+                            "y": 22.0 + frame,
+                            "px": 520.0 + frame,
+                            "py": 320.0 + frame,
+                            "confidence": 0.7,
+                        }
+                    ],
+                    "players": [
+                        {
+                            "x": 10.0 + frame,
+                            "y": 20.0 + frame,
+                            "px": 500.0 + frame,
+                            "py": 300.0 + frame,
+                            "team": 0,
+                            "team_confidence": 0.9,
+                            "confidence": 0.8,
+                            "track": 4,
+                            "box": [1.0, 2.0, 3.0, 4.0],
+                        }
+                    ],
+                }
+
+        class FakeFusion:
+            consensus_ball = np.array([[10.0, 20.0], [11.0, 21.0], [12.0, 22.0]], dtype=np.float32)
+            consensus_confidence = np.full(3, 0.8, dtype=np.float32)
+            meta = {"combine_mode": "log"}
+
+            @staticmethod
+            def sample(frame):
+                frame = int(frame)
+                return {
+                    "code": H,
+                    "label": "H",
+                    "baseline_code": A,
+                    "fused_probability": [0.7, 0.2, 0.1],
+                    "posterior": [0.7, 0.2, 0.1],
+                    "confidence": 0.8,
+                    "entropy": 0.6,
+                    "event_dead": False,
+                    "consensus_ball": {"x": 10.0 + frame, "y": 20.0 + frame, "confidence": 0.8},
+                    "sources": [
+                        {
+                            "key": "hmm_atd",
+                            "label": "HMM ATD",
+                            "role": "prior",
+                            "active": True,
+                            "status": 0,
+                            "status_name": "observed",
+                            "probability": [0.7, 0.2, 0.1],
+                            "weight": 1.0,
+                            "ball": {"x": 10.0 + frame, "y": 20.0 + frame},
+                            "reason": "posterior del HMM ATD validado",
+                        }
+                    ],
+                }
+
+        store = FrameStore(
+            tracking,
+            homography,
+            combined,
+            events,
+            features,
+            trail_frames=3,
+            perception=FakePerception(),
+            fusion=FakeFusion(),
+        )
+        payload = store.frame_payload(1)
+
+        self.assertEqual(payload["layers"]["video"]["x"], 11.0)
+        self.assertEqual(payload["layers"]["video"]["px"], 501.0)
+        self.assertEqual(payload["layers"]["yolo"]["x"], 13.0)
+        payload_far = store.frame_payload(2)
+        self.assertEqual(payload_far["layers"]["yolo"]["source"], 2)
+        self.assertIsNone(payload_far["layers"]["yolo"]["x"])
+        self.assertEqual(payload["layers"]["fusion"]["x"], 11.0)
+        self.assertEqual(payload["layers"]["fusion"]["source"], 0)
+        self.assertEqual(len(payload["video_players"]), 1)
+        self.assertEqual(payload["video_players"][0]["track"], 4)
+        self.assertEqual(len(payload["trails"]["video"]["pitch"]), 2)
+        self.assertEqual(len(payload["trails"]["fusion"]["pitch"]), 2)
+        self.assertEqual(payload["trails"]["yolo"]["pitch"], [])
+        self.assertTrue(payload["fusion"]["available"])
+        self.assertEqual(payload["fusion"]["label"], "H")
+        self.assertEqual(payload["fusion"]["baseline_label"], "A")
+        self.assertEqual(payload["fusion"]["sources"][0]["role"], "prior")
 
 
 class UserTruthTest(unittest.TestCase):
@@ -563,6 +720,51 @@ class ViewerUserTruthServerTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as raised:
             self.post({"eraseNearest": 4})
         self.assertEqual(raised.exception.code, 400)
+
+
+class ViewerAssetTest(unittest.TestCase):
+    def test_every_js_element_id_exists_in_html(self):
+        assets = Path(__file__).resolve().parents[1] / "viewer_assets"
+        html = (assets / "index.html").read_text(encoding="utf-8")
+        js = (assets / "viewer.js").read_text(encoding="utf-8")
+        ids = set(re.findall(r'id="([^"]+)"', html))
+        referenced = set(re.findall(r'\$\("#([^"]+)"\)', js))
+        self.assertEqual(sorted(referenced - ids), [])
+
+    def test_fusion_label_is_updated_in_both_summary_and_panel(self):
+        # The summary cell and the poll card intentionally have separate ids.  A missing update
+        # left the summary showing "—" while the card showed the fused label.
+        assets = Path(__file__).resolve().parents[1] / "viewer_assets"
+        js = (assets / "viewer.js").read_text(encoding="utf-8")
+        self.assertIn('setBadge(ui.fusionBadge, code)', js)
+        self.assertIn('setBadge(ui.fusedBadge, code)', js)
+
+
+class BrowserOpenTest(unittest.TestCase):
+    def test_linux_launcher_is_detached_and_quiet(self):
+        url = "http://127.0.0.1:8765/"
+        with mock.patch("possession_lab.viewer.sys.platform", "linux"), mock.patch(
+            "possession_lab.viewer.subprocess.Popen"
+        ) as popen:
+            _open_viewer_browser(url)
+        popen.assert_called_once()
+        args, kwargs = popen.call_args
+        self.assertEqual(args[0], ["xdg-open", url])
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+        self.assertTrue(kwargs["start_new_session"])
+        self.assertTrue(kwargs["close_fds"])
+
+    def test_falls_back_when_xdg_open_is_missing(self):
+        url = "http://127.0.0.1:8765/"
+        with mock.patch("possession_lab.viewer.sys.platform", "linux"), mock.patch(
+            "possession_lab.viewer.subprocess.Popen", side_effect=FileNotFoundError
+        ), mock.patch(
+            "possession_lab.viewer.webbrowser.open", return_value=True
+        ) as opener:
+            _open_viewer_browser(url)
+        opener.assert_called_once_with(url)
 
 
 if __name__ == "__main__":

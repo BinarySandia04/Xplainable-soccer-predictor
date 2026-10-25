@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 import threading
 import webbrowser
@@ -56,6 +57,7 @@ from .config import (
     asset_paths,
 )
 from .data import TagTable, load_public_gt, load_smart_tags, load_submission
+from .perception import select_plausible_ball_detections
 
 # The official scorer is the source of truth for possession segments/spells, just as it is for the
 # report.  Import it lazily-safe by putting the repository root on sys.path first.
@@ -125,6 +127,8 @@ def build_viewer_data(
     events: Any | None = None,
     ball_gaps: list[list[int]] | None = None,
     tracking_available: bool = False,
+    perception_available: bool = False,
+    fusion_available: bool = False,
 ) -> dict[str, Any]:
     """Build the compact payload consumed by the browser.
 
@@ -229,6 +233,8 @@ def build_viewer_data(
         "switches": switches,
         "explanations_available": bool(switches),
         "tracking_available": bool(tracking_available),
+        "perception_available": bool(perception_available),
+        "fusion_available": bool(fusion_available),
         "events": _event_payload(events),
         "ball_gaps": [[int(a), int(b)] for a, b in (ball_gaps or ())],
     }
@@ -351,6 +357,8 @@ def load_viewer_data(
     events: Any | None = None,
     ball_gaps: list[list[int]] | None = None,
     tracking_available: bool = False,
+    perception_available: bool = False,
+    fusion_available: bool = False,
 ) -> dict[str, Any]:
     """Read the generated CSV outputs and build the viewer payload."""
     pred = load_submission(predictions_path)
@@ -385,6 +393,8 @@ def load_viewer_data(
         events=events,
         ball_gaps=ball_gaps,
         tracking_available=tracking_available,
+        perception_available=perception_available,
+        fusion_available=fusion_available,
     )
     data.update(build_user_truth_data(pred, load_user_truth(user_truth_path, pred.size)))
     return data
@@ -465,6 +475,8 @@ class FrameStore:
         *,
         trail_frames: int = 25,
         kalman: Any | None = None,
+        perception: Any | None = None,
+        fusion: Any | None = None,
     ) -> None:
         self.tracking = tracking
         self.homography = homography
@@ -472,8 +484,24 @@ class FrameStore:
         self.kalman = kalman
         self.events = events
         self.features = features
+        self.perception = perception
+        self.fusion = fusion
         self.trail_frames = max(1, int(trail_frames))
         self.n_frames = int(tracking.n_frames)
+        self._yolo_ball_pitch: np.ndarray | None = None
+        self._yolo_ball_confidence: np.ndarray | None = None
+        self._yolo_ball_selected: np.ndarray | None = None
+        if perception is not None and getattr(perception, "samples", 0) > 0:
+            plausible, confidence, _, selected = select_plausible_ball_detections(
+                perception.yolo_ball_pitch,
+                perception.yolo_ball_confidence,
+                perception.yolo_ball_present,
+                perception.frame_index,
+                fps=float(getattr(perception, "fps", FPS)),
+            )
+            self._yolo_ball_pitch = plausible
+            self._yolo_ball_confidence = confidence
+            self._yolo_ball_selected = selected
         if getattr(features, "start", 0) != 0:
             raise ValueError("FrameStore needs full-match features starting at frame 0")
 
@@ -544,8 +572,147 @@ class FrameStore:
         length, width = self.tracking.pitch
         return x < -1.0 or x > length + 1.0 or y < -1.0 or y > width + 1.0
 
+    def _perception_sample(self, frame: int, max_age: int | None = None) -> dict[str, Any] | None:
+        if self.perception is None or getattr(self.perception, "samples", 0) == 0:
+            return None
+        sample = self.perception.nearest(int(frame))
+        age = abs(int(sample.get("age_frames", 0)))
+        limit = max(2, int(round(0.30 * FPS))) if max_age is None else int(max_age)
+        if age > limit:
+            return None
+        sample["age_frames"] = age
+        return sample
+
+    def _video_layer_payload(self, frame: int) -> dict[str, Any]:
+        sample = self._perception_sample(frame)
+        if sample is None:
+            return {
+                "source": 2,
+                "observed": False,
+                "x": None,
+                "y": None,
+                "px": None,
+                "py": None,
+                "confidence": 0.0,
+                "gap_s": None,
+                "out_of_play": False,
+                "age_frames": None,
+            }
+        ball = sample.get("ball", {})
+        source = int(ball.get("source", 2))
+        x = ball.get("x")
+        y = ball.get("y")
+        available = source != 2 and x is not None and y is not None
+        gap = (abs(int(sample.get("age_frames", 0))) / FPS) if available and source != 0 else (0.0 if available else None)
+        return {
+            "source": source,
+            "observed": bool(source == 0),
+            "x": x if available else None,
+            "y": y if available else None,
+            "px": ball.get("px") if available else None,
+            "py": ball.get("py") if available else None,
+            "confidence": _finite(ball.get("confidence")) if available else 0.0,
+            "gap_s": gap,
+            "out_of_play": bool(available and self._outside_pitch(float(x), float(y))),
+            "age_frames": int(sample.get("age_frames", 0)),
+        }
+
+    def _yolo_layer_payload(self, frame: int) -> dict[str, Any]:
+        sample = self._perception_sample(frame)
+        if sample is None or self._yolo_ball_pitch is None:
+            return {
+                "source": 2,
+                "observed": False,
+                "x": None,
+                "y": None,
+                "px": None,
+                "py": None,
+                "confidence": 0.0,
+                "gap_s": None,
+                "out_of_play": False,
+                "age_frames": None,
+            }
+        index = self.perception.nearest_index(int(frame))
+        point = np.asarray(self._yolo_ball_pitch[index], dtype=np.float64)
+        confidence = (
+            float(self._yolo_ball_confidence[index])
+            if self._yolo_ball_confidence is not None
+            else 0.0
+        )
+        slot = int(self._yolo_ball_selected[index]) if self._yolo_ball_selected is not None else -1
+        if (
+            slot < 0
+            or not np.isfinite(point).all()
+            or confidence <= 0.01
+        ):
+            return {
+                "source": 2,
+                "observed": False,
+                "x": None,
+                "y": None,
+                "px": None,
+                "py": None,
+                "confidence": 0.0,
+                "gap_s": None,
+                "out_of_play": False,
+                "age_frames": int(sample.get("age_frames", 0)),
+            }
+        pixel = np.asarray(self.perception.yolo_ball_pixel[index, slot], dtype=np.float64)
+        source = 0 if confidence >= 0.25 else 1
+        return {
+            "source": source,
+            "observed": bool(source == 0),
+            "x": _finite(point[0]),
+            "y": _finite(point[1]),
+            "px": _finite(pixel[0]),
+            "py": _finite(pixel[1]),
+            "confidence": confidence,
+            "gap_s": abs(int(sample.get("age_frames", 0))) / FPS if source != 0 else 0.0,
+            "out_of_play": bool(
+                np.isfinite(point).all()
+                and self._outside_pitch(float(point[0]), float(point[1]))
+            ),
+            "age_frames": int(sample.get("age_frames", 0)),
+        }
+
+    def _fusion_layer_payload(self, frame: int) -> dict[str, Any]:
+        if self.fusion is None:
+            return {
+                "source": 2,
+                "observed": False,
+                "x": None,
+                "y": None,
+                "px": None,
+                "py": None,
+                "confidence": 0.0,
+                "gap_s": None,
+                "out_of_play": False,
+            }
+        point = np.asarray(self.fusion.consensus_ball[frame], dtype=np.float64)
+        confidence = float(self.fusion.consensus_confidence[frame])
+        available = np.isfinite(point).all() and confidence > 0
+        x, y = (float(point[0]), float(point[1])) if available else (float("nan"), float("nan"))
+        pixel = _project(self.homography, frame, x, y, self.tracking.pitch) if available else None
+        return {
+            "source": 0 if available else 2,
+            "observed": bool(available),
+            "x": _finite(x) if available else None,
+            "y": _finite(y) if available else None,
+            "px": pixel[0] if pixel is not None else None,
+            "py": pixel[1] if pixel is not None else None,
+            "confidence": confidence if available else 0.0,
+            "gap_s": 0.0 if available else None,
+            "out_of_play": bool(available and self._outside_pitch(x, y)),
+        }
+
     def _layer_payload(self, frame: int, layer: str) -> dict[str, Any]:
         """Describe one ball layer at one frame without changing the model tracker."""
+        if layer == "video":
+            return self._video_layer_payload(frame)
+        if layer == "yolo":
+            return self._yolo_layer_payload(frame)
+        if layer == "fusion":
+            return self._fusion_layer_payload(frame)
         raw_present = bool(self.tracking.ball_present[frame])
         raw = self.tracking.ball[frame]
         if layer == "raw":
@@ -599,6 +766,38 @@ class FrameStore:
         The broadcast camera moves, so each historical pitch point must use the homography of its
         own frame on the video overlay, not the homography of the current frame.
         """
+        if layer == "video":
+            points: list[tuple[int, float, float, int]] = []
+            seen: set[int] = set()
+            start = max(0, frame - self.trail_frames + 1)
+            for k in range(start, frame + 1):
+                sample = self._perception_sample(k)
+                if sample is None:
+                    continue
+                sample_frame = int(sample.get("sample_frame", k))
+                if sample_frame in seen:
+                    continue
+                seen.add(sample_frame)
+                ball = sample.get("ball", {})
+                source = int(ball.get("source", 2))
+                if source == 2 or ball.get("x") is None or ball.get("y") is None:
+                    continue
+                points.append((k, float(ball["x"]), float(ball["y"]), source))
+            return points
+        if layer == "yolo":
+            return []
+        if layer == "fusion":
+            if self.fusion is None:
+                return []
+            points = []
+            start = max(0, frame - self.trail_frames + 1)
+            for k in range(start, frame + 1):
+                point = self.fusion.consensus_ball[k]
+                if not (np.isfinite(point[0]) and np.isfinite(point[1])):
+                    continue
+                points.append((k, float(point[0]), float(point[1]), 0))
+            return points
+
         if layer == "raw":
             points: list[tuple[int, float, float, int]] = []
             start = max(0, frame - self.trail_frames + 1)
@@ -653,13 +852,13 @@ class FrameStore:
 
         trails = {
             layer: self._trail_payload(frame, layer)
-            for layer in ("raw", "kalman", "combined")
+            for layer in ("raw", "kalman", "combined", "video", "yolo", "fusion")
         }
         trail = trails["combined"]["video"]
         trail_pitch = trails["combined"]["pitch"]
         layers = {
             layer: self._layer_payload(frame, layer)
-            for layer in ("raw", "kalman", "combined")
+            for layer in ("raw", "kalman", "combined", "video", "yolo", "fusion")
         }
 
         players: list[dict[str, Any]] = []
@@ -684,6 +883,39 @@ class FrameStore:
                     "speed": _finite(speeds[index]) if np.isfinite(speeds[index]) else None,
                 }
             )
+
+        video_players: list[dict[str, Any]] = []
+        sample = self._perception_sample(frame)
+        if sample is not None:
+            for player in sample.get("players", []):
+                if player.get("x") is None or player.get("y") is None:
+                    continue
+                video_players.append(
+                    {
+                        "x": player.get("x"),
+                        "y": player.get("y"),
+                        "px": player.get("px"),
+                        "py": player.get("py"),
+                        "team": int(player.get("team", -1)),
+                        "team_confidence": _finite(player.get("team_confidence")),
+                        "confidence": _finite(player.get("confidence")),
+                        "track": int(player.get("track", -1)),
+                        "box": player.get("box"),
+                    }
+                )
+
+        fusion_payload: dict[str, Any]
+        if self.fusion is None:
+            fusion_payload = {"available": False, "reason": "fusion cache not loaded"}
+        else:
+            fusion_payload = self.fusion.sample(frame)
+            fusion_payload["available"] = True
+            fusion_payload["baseline_label"] = (
+                CODE_TO_LABEL.get(int(fusion_payload["baseline_code"]), "X")
+                if fusion_payload.get("baseline_code") is not None
+                else None
+            )
+            fusion_payload["combine_mode"] = self.fusion.meta.get("combine_mode", "log")
 
         return {
             "available": True,
@@ -716,6 +948,10 @@ class FrameStore:
             "trail": trail,
             "trail_pitch": trail_pitch,
             "players": players,
+            "video_players": video_players,
+            "perception_available": bool(self.perception is not None),
+            "fusion_available": bool(self.fusion is not None),
+            "fusion": fusion_payload,
             "features": self._features_payload(frame),
             "active_events": self._active_events(frame),
         }
@@ -1055,6 +1291,8 @@ def build_frame_store(
     video_path: str | Path,
     *,
     data_dir: str | Path | None = None,
+    perception_path: str | Path | None = None,
+    fusion_path: str | Path | None = None,
 ) -> tuple[FrameStore, Any, list[list[int]]]:
     """Load the gated tracking once and prepare the per-frame explorer products.
 
@@ -1066,7 +1304,9 @@ def build_frame_store(
     from .balltrack import track_ball
     from .events import build_events
     from .features import extract_features
+    from .fusion import load_fusion
     from .kalman import kalman_ball_track
+    from .perception import load_perception
     from .pipeline import load_lab
 
     lab = load_lab(data_dir, load_gt=False)
@@ -1081,6 +1321,8 @@ def build_frame_store(
     events = build_events(
         lab.tracking, lab.tags, track=track, whistle=whistle, features=features
     )
+    perception = load_perception(perception_path) if perception_path else None
+    fusion = load_fusion(fusion_path) if fusion_path else None
     store = FrameStore(
         lab.tracking,
         lab.homography,
@@ -1088,8 +1330,41 @@ def build_frame_store(
         events,
         features,
         kalman=kalman,
+        perception=perception,
+        fusion=fusion,
     )
     return store, events, ball_gap_runs(track, min_frames=max(1, int(0.4 * FPS)))
+
+
+def _open_viewer_browser(url: str) -> None:
+    """Open the local viewer without leaking browser child-process stderr into the terminal.
+
+    On Linux, ``xdg-open`` hands the URL to an existing Chromium/Brave session.  That session can
+    keep the inherited stderr open and print zygote/broken-pipe noise after the server has
+    started, so the launcher's streams are detached.  Fall back to :mod:`webbrowser` only when
+    ``xdg-open`` is unavailable or cannot be started.
+    """
+    if sys.platform.startswith("linux"):
+        try:
+            subprocess.Popen(
+                ["xdg-open", url],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            return
+        except OSError:
+            pass
+    try:
+        webbrowser.open(url)
+    except Exception as exc:  # pragma: no cover - platform/browser failure path
+        print(
+            f"viewer: no se pudo abrir el navegador; abre {url} manualmente ({exc})",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def serve_viewer(
@@ -1102,6 +1377,8 @@ def serve_viewer(
     user_truth_path: str | Path | None = USER_TRUTH_PATH,
     explanations_path: str | Path | None = EXPLANATIONS_PATH,
     data_dir: str | Path | None = None,
+    perception_path: str | Path | None = None,
+    fusion_path: str | Path | None = None,
     host: str = "127.0.0.1",
     port: int = 8765,
     open_browser: bool = True,
@@ -1126,12 +1403,19 @@ def serve_viewer(
     events = None
     gaps: list[list[int]] = []
     try:
-        frame_store, events, gaps = build_frame_store(video, data_dir=data_dir)
+        frame_store, events, gaps = build_frame_store(
+            video,
+            data_dir=data_dir,
+            perception_path=perception_path,
+            fusion_path=fusion_path,
+        )
         print(
             f"tracking: {len(frame_store.tracking.ball):,} frames | "
             f"{len(getattr(events, 'goals', ()))} goles | "
             f"{len(getattr(events, 'stoppages', ()))} paradas | "
-            f"{len(gaps):,} huecos de balón",
+            f"{len(gaps):,} huecos de balón | "
+            f"percepción {'sí' if frame_store.perception is not None else 'no'} | "
+            f"fusión {'sí' if frame_store.fusion is not None else 'no'}",
             flush=True,
         )
     except Exception as exc:  # noqa: BLE001 - the overlay is an optional aid
@@ -1148,6 +1432,8 @@ def serve_viewer(
         events=events,
         ball_gaps=gaps,
         tracking_available=frame_store is not None,
+        perception_available=bool(frame_store is not None and frame_store.perception is not None),
+        fusion_available=bool(frame_store is not None and frame_store.fusion is not None),
     )
     pred = load_submission(predictions)
     user_truth = load_user_truth(user_truth_path, pred.size)
@@ -1181,7 +1467,9 @@ def serve_viewer(
     )
     print("Ctrl-C to stop.", flush=True)
     if open_browser:
-        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        opener = threading.Timer(0.5, _open_viewer_browser, args=(url,))
+        opener.daemon = True
+        opener.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
