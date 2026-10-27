@@ -5,7 +5,7 @@
 > * **Technical Proposal:** Full documentation in **[PROPOSAL.md](PROPOSAL.md)**.
 > * **Possession Lab:** Implementation details, CLI commands, and reviewer guide in **[possession_lab/README.md](possession_lab/README.md)**.
 > * **Performance:** **0.6519 spellF1** (vs 0.4242 best baseline) and **0.9466 macroF1** (vs 0.5812 best baseline).
-> * **Verification:** 162 passing tests (`pytest`), clean linter (`ruff check .`), and official format validation.
+> * **Verification:** 169 passing tests (`pytest`), clean linter (`ruff check .`), and official format validation.
 
 ---
 
