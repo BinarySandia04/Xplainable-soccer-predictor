@@ -1,0 +1,53 @@
+{
+  "weights": "ball_training/weights/yolo11x.pt",
+  "imgsz": 1920,
+  "images": 300,
+  "images_with_gt": 300,
+  "iou": 0.5,
+  "per_threshold": {
+    "0.05": {
+      "recall": 0.6167,
+      "precision": 0.2134,
+      "f1": 0.3171,
+      "tp": 185,
+      "fp": 682,
+      "fn": 115,
+      "frames_with_no_detection": 115,
+      "centre_px_median": 0.59,
+      "centre_px_p90": 0.92
+    },
+    "0.1": {
+      "recall": 0.5967,
+      "precision": 0.2873,
+      "f1": 0.3879,
+      "tp": 179,
+      "fp": 444,
+      "fn": 121,
+      "frames_with_no_detection": 121,
+      "centre_px_median": 0.58,
+      "centre_px_p90": 0.91
+    },
+    "0.2": {
+      "recall": 0.5467,
+      "precision": 0.3581,
+      "f1": 0.4327,
+      "tp": 164,
+      "fp": 294,
+      "fn": 136,
+      "frames_with_no_detection": 136,
+      "centre_px_median": 0.58,
+      "centre_px_p90": 0.9
+    },
+    "0.3": {
+      "recall": 0.4767,
+      "precision": 0.4157,
+      "f1": 0.4441,
+      "tp": 143,
+      "fp": 201,
+      "fn": 157,
+      "frames_with_no_detection": 157,
+      "centre_px_median": 0.61,
+      "centre_px_p90": 0.96
+    }
+  }
+}

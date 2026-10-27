@@ -44,6 +44,15 @@ data/*
 *.onnx
 *.engine
 
+# -- ball_training derived data (huge, regenerable or re-downloadable) ---------------------------
+# external raw datasets, the built YOLO dataset, labeled match frames, training runs, and
+# rendered videos.  See ball_training/README.md for exact sources and reproduction commands.
+ball_training/dataset/
+ball_training/external/
+ball_training/match/
+ball_training/runs/
+ball_training/visualizations/
+
 # -- internal documents ---------------------------------------------------------------------------
 # OVERVIEW.md -- the institutional description of the competition -- IS committed. It is the only
 # place that explains why the format changed from 2026, and a document like that circulating by

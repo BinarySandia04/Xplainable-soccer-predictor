@@ -358,8 +358,9 @@ def cmd_perceive(args: argparse.Namespace) -> int:
     stop = int(args.stop if args.stop is not None else PUBLIC_STOP)
     path = Path(args.perception) if args.perception else output_dir / "perception.npz"
     print(
-        f"perception: {start:,}..{stop:,} step {args.step}, model {args.model}, "
-        f"device {args.device or 'auto'}"
+        f"perception: {start:,}..{stop:,} step {args.step}, model {args.model}"
+        + (f" + ball:{args.ball_model}" if args.ball_model else "")
+        + f", device {args.device or 'auto'}"
     )
     perception = perceive_video(
         VIDEO_PATH,
@@ -369,6 +370,8 @@ def cmd_perceive(args: argparse.Namespace) -> int:
         stop=stop,
         step=args.step,
         model=args.model,
+        ball_model=args.ball_model,
+        ball_imgsz=args.ball_imgsz,
         device=args.device,
         imgsz=args.imgsz,
         progress=True,
@@ -517,6 +520,12 @@ def build_parser() -> argparse.ArgumentParser:
     perception.add_argument("--stop", type=int, default=None, help="exclusive last video frame for perceive (default: public stop)")
     perception.add_argument("--step", type=int, default=1, help="process every Nth video frame (default: 1)")
     perception.add_argument("--model", default="yolo11x.pt", help="Ultralytics weights (default: yolo11x.pt)")
+    perception.add_argument(
+        "--ball-model",
+        default=None,
+        help="dedicated ball weights (e.g. ball_training/weights/ball_yolo11s_best.pt); default: ball from --model",
+    )
+    perception.add_argument("--ball-imgsz", type=int, default=1280, help="inference size for --ball-model (default: 1280)")
     perception.add_argument("--device", default=None, help="YOLO device, e.g. 0 or cpu (default: auto)")
     perception.add_argument("--imgsz", type=int, default=1920, help="YOLO inference size (default: 1920)")
     perception.add_argument("--combine-mode", choices=["log", "linear"], default="log", help="ballot pool (default: log)")
