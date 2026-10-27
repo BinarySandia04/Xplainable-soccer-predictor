@@ -963,8 +963,14 @@ class VideoBallTracker:
                 candidate["origin"] = "yolo+atd"
                 return self._commit(candidate, frame, frame_index, source=0)
 
-            near = self._best_visible(visible, anchor, 2.5, min_confidence=0.12)
-            if near is None or not self._reachable(np.asarray(near["pitch"]), frame_index):
+            near = self._best_visible(visible, anchor, 2.5, min_confidence=0.06)
+            if near is not None and not self._reachable(np.asarray(near["pitch"]), frame_index):
+                near = None
+            if near is None:
+                # A confident image measurement corrects a sloppy ATD anchor: the anchor itself
+                # can lag the ball by metres (interpolated ATD), so let strong detections in.
+                near = self._best_visible(visible, anchor, 5.0, min_confidence=0.35)
+            if near is None:
                 pixel = pitch_to_pixel(homography, anchor[None, :], self.pitch)[0]
                 candidate = self._as_candidate(anchor, pixel, 0.78, "atd")
                 return self._commit(candidate, frame, frame_index, source=3)
@@ -1192,6 +1198,8 @@ def perceive_video(
     stop: int | None = None,
     step: int = 1,
     model: str = "yolo11x.pt",
+    ball_model: str | None = None,
+    ball_imgsz: int = 1280,
     device: str | int | None = None,
     imgsz: int = 1920,
     player_conf: float = 0.12,
@@ -1244,12 +1252,13 @@ def perceive_video(
         step=step,
         start=start,
         stop=stop,
-        model=model,
+        model=str(model) if not ball_model or str(ball_model) == str(model) else f"{model} + ball:{ball_model}",
         device=device,
         video_width=width,
         video_height=height,
     )
     yolo = YOLO(model)
+    ball_yolo = YOLO(ball_model) if ball_model and str(ball_model) != str(model) else None
     tracker = _GreedyTracker()
     ball_tracker = VideoBallTracker()
     sample = 0
@@ -1271,7 +1280,7 @@ def perceive_video(
                 break
             result = yolo.predict(
                 frame,
-                classes=[PERSON_CLASS, BALL_CLASS],
+                classes=[PERSON_CLASS] if ball_yolo is not None else [PERSON_CLASS, BALL_CLASS],
                 conf=min(player_conf, ball_conf),
                 iou=0.5,
                 imgsz=int(imgsz),
@@ -1280,6 +1289,22 @@ def perceive_video(
                 max_det=120,
             )[0]
             boxes, confidence, classes = _parse_boxes(result)
+            if ball_yolo is not None:
+                # dedicated ball detector; its class 0 is re-stamped as COCO's ball id
+                ball_result = ball_yolo.predict(
+                    frame,
+                    conf=ball_conf,
+                    iou=0.5,
+                    imgsz=int(ball_imgsz),
+                    device=device,
+                    verbose=False,
+                    max_det=4 * max_ball_detections,
+                )[0]
+                ball_boxes, ball_scores, _ = _parse_boxes(ball_result)
+                if ball_boxes.size:
+                    boxes = np.concatenate([boxes, ball_boxes])
+                    confidence = np.concatenate([confidence, ball_scores])
+                    classes = np.concatenate([classes, np.full(len(ball_boxes), BALL_CLASS, dtype=np.int16)])
             matrix = np.asarray(homography.matrices[current], dtype=np.float64)
             person_mask = (classes == PERSON_CLASS) & (confidence >= player_conf)
             person_boxes = boxes[person_mask]

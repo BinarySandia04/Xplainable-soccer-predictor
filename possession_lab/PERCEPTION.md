@@ -92,8 +92,11 @@ stay `X`, exactly like the baseline.
 .venv/bin/python -m pip install -r requirements-perception.txt
 
 # Public evaluation window at full frame rate.  About 13 minutes on an RTX 5070 Ti.
+# With the dedicated ball detector (`--ball-model`), the COCO weights below are used for
+# people only and the ball stream comes from the ball-only model; about 16 minutes.
 .venv/bin/python -m possession_lab perceive \
   --start 11185 --stop 18685 --step 1 \
+  --ball-model ball_training/weights/ball_yolo11s_best.pt \
   --perception possession_lab/outputs/perception_public.npz
 
 # Fusion with the public cache.  Writes fusion.npz, fusion_predictions.csv,

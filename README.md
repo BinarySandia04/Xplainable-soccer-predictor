@@ -4,6 +4,7 @@
 > 
 > * **Technical Proposal:** Full documentation in **[PROPOSAL.md](PROPOSAL.md)**.
 > * **Possession Lab:** Implementation details, CLI commands, and reviewer guide in **[possession_lab/README.md](possession_lab/README.md)**.
+> * **Ball Detector:** A dedicated YOLO11s trained on a merged four-source dataset — match-frame recall 0.55→0.70 and precision 0.36→0.72 over the COCO baseline — wired into perception with `--ball-model` (see **[ball_training/README.md](ball_training/README.md)**).
 > * **Performance:** **0.6519 spellF1** (vs 0.4242 best baseline) and **0.9466 macroF1** (vs 0.5812 best baseline).
 > * **Verification:** 169 passing tests (`pytest`), clean linter (`ruff check .`), and official format validation.
 
