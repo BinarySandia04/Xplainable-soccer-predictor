@@ -28,19 +28,18 @@ small HMM with the same transition prior as the baseline.  Confirmed goals/stopp
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Iterable
 import json
 import math
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 
-from .config import D, FPS, GRADED_HALVES, H, A, PITCH, PUBLIC_START, PUBLIC_STOP, X
+from .config import FPS, GRADED_HALVES, PITCH, A, D, H, X
 from .features import Features, extract_features
 from .model import (
     DEFAULT_PARAMS,
-    DecodeResult,
     ModelParams,
     decode,
     forward_backward,
@@ -314,7 +313,9 @@ def _geometry_source(
             dx = players[:, :, 0] - ball[:, None, 0]
             dy = players[:, :, 1] - ball[:, None, 1]
             distance = np.sqrt(dx * dx + dy * dy)
-            distance = np.where(mask, distance, np.inf)
+            # A non-finite coordinate is a missing player, not an infinitely far one: ``np.min``
+            # would let that one slot poison the whole team's distance for the frame.
+            distance = np.where(mask & np.isfinite(distance), distance, np.inf)
             with np.errstate(all="ignore"):
                 target[:] = np.min(distance, axis=1)
             target[~np.isfinite(target)] = np.nan
@@ -549,18 +550,27 @@ def _source_audio(features: Features, base_weight: float) -> SourceVote:
     )
 
 
+def _fit_length(mask: np.ndarray, n: int) -> np.ndarray:
+    """Return ``mask`` as a boolean array of exactly ``n`` frames, padding or truncating.
+
+    All three event masks have to be fitted the same way: a shorter ``goal``/``stop`` would make
+    ``kind`` shorter than the payload, and the per-frame explanation looks ``kind`` up by frame
+    number, so a window that runs past the cached events would raise instead of answering.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if mask.size >= n:
+        return mask[:n]
+    return np.pad(mask, (0, n - mask.size))
+
+
 def _source_events(features: Features, events: Any | None) -> SourceVote:
     n = features.stop - features.start
     goal = np.asarray(getattr(features, "goal_dead", np.zeros(n)), dtype=bool)
     stop = np.asarray(getattr(features, "stop_dead", np.zeros(n)), dtype=bool)
     if events is not None and getattr(events, "dead_mask", None) is not None:
-        dead = np.asarray(events.dead_mask, dtype=bool)
-        if dead.size >= n:
-            dead = dead[:n]
-        else:
-            dead = np.pad(dead, (0, n - dead.size))
-        goal = np.asarray(getattr(events, "goal_dead", goal), dtype=bool)[:n]
-        stop = np.asarray(getattr(events, "stop_dead", stop), dtype=bool)[:n]
+        dead = _fit_length(events.dead_mask, n)
+        goal = _fit_length(getattr(events, "goal_dead", goal), n)
+        stop = _fit_length(getattr(events, "stop_dead", stop), n)
     else:
         dead = goal | stop
     kind = np.where(goal, 1, np.where(stop, 2, 0)).astype(np.int8)
@@ -841,7 +851,7 @@ def build_fusion(
             events=events,
         )
     baseline_codes = np.asarray(baseline_codes, dtype=np.int8)
-    hmm_source, hmm_codes, hmm_confidence, hmm_posterior = _source_hmm(
+    hmm_source, _hmm_codes, hmm_confidence, hmm_posterior = _source_hmm(
         features, params, resolved_weights["hmm_atd"], baseline_codes=baseline_codes
     )
     sources["hmm_atd"] = hmm_source

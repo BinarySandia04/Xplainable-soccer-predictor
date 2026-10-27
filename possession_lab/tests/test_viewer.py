@@ -7,9 +7,11 @@ import re
 import subprocess
 import threading
 import unittest
+from http.client import HTTPConnection
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -18,8 +20,14 @@ import numpy as np
 
 from possession_lab.config import A, D, H, X
 from possession_lab.data import TagEvent
+from possession_lab.perception import (
+    BALL_CAND_ACCEPTED,
+    BALL_CAND_REJECTED_UNREACHABLE,
+)
 from possession_lab.viewer import (
     FrameStore,
+    MultiByteRange,
+    ViewerRequestHandler,
     _open_viewer_browser,
     build_user_truth_data,
     build_viewer_data,
@@ -322,22 +330,27 @@ class FrameStoreMultiSourceTest(unittest.TestCase):
         events = SimpleNamespace(goals=(), stoppages=())
         features = SimpleNamespace(start=0)
 
+        _yolo_ball_pitch = np.full((3, 6, 2), np.nan, dtype=np.float32)
+        _yolo_ball_pixel = np.full((3, 6, 2), np.nan, dtype=np.float32)
+        _yolo_ball_confidence = np.zeros((3, 6), dtype=np.float32)
+        _yolo_ball_present = np.zeros((3, 6), dtype=bool)
+        for _frame in range(3):
+            _yolo_ball_pitch[_frame, 0] = [12.0 + _frame, 22.0 + _frame]
+            _yolo_ball_pixel[_frame, 0] = [520.0 + _frame, 320.0 + _frame]
+            _yolo_ball_confidence[_frame, 0] = 0.7
+            _yolo_ball_present[_frame, 0] = True
+        # The third sample is a confident but physically unreachable false positive.
+        _yolo_ball_pitch[2, 0] = [80.0, 50.0]
+        _yolo_ball_pixel[2, 0] = [1700.0, 900.0]
+
         class FakePerception:
-            samples = 3
-            fps = 25
-            frame_index = np.array([0, 1, 2], dtype=np.int32)
-            yolo_ball_pitch = np.full((3, 6, 2), np.nan, dtype=np.float32)
-            yolo_ball_pixel = np.full((3, 6, 2), np.nan, dtype=np.float32)
-            yolo_ball_confidence = np.zeros((3, 6), dtype=np.float32)
-            yolo_ball_present = np.zeros((3, 6), dtype=bool)
-            for _frame in range(3):
-                yolo_ball_pitch[_frame, 0] = [12.0 + _frame, 22.0 + _frame]
-                yolo_ball_pixel[_frame, 0] = [520.0 + _frame, 320.0 + _frame]
-                yolo_ball_confidence[_frame, 0] = 0.7
-                yolo_ball_present[_frame, 0] = True
-            # The third sample is a confident but physically unreachable false positive.
-            yolo_ball_pitch[2, 0] = [80.0, 50.0]
-            yolo_ball_pixel[2, 0] = [1700.0, 900.0]
+            samples: ClassVar[int] = 3
+            fps: ClassVar[int] = 25
+            frame_index: ClassVar[np.ndarray] = np.array([0, 1, 2], dtype=np.int32)
+            yolo_ball_pitch: ClassVar[np.ndarray] = _yolo_ball_pitch
+            yolo_ball_pixel: ClassVar[np.ndarray] = _yolo_ball_pixel
+            yolo_ball_confidence: ClassVar[np.ndarray] = _yolo_ball_confidence
+            yolo_ball_present: ClassVar[np.ndarray] = _yolo_ball_present
 
             @staticmethod
             def nearest_index(frame):
@@ -382,9 +395,11 @@ class FrameStoreMultiSourceTest(unittest.TestCase):
                 }
 
         class FakeFusion:
-            consensus_ball = np.array([[10.0, 20.0], [11.0, 21.0], [12.0, 22.0]], dtype=np.float32)
-            consensus_confidence = np.full(3, 0.8, dtype=np.float32)
-            meta = {"combine_mode": "log"}
+            consensus_ball: ClassVar[np.ndarray] = np.array(
+                [[10.0, 20.0], [11.0, 21.0], [12.0, 22.0]], dtype=np.float32
+            )
+            consensus_confidence: ClassVar[np.ndarray] = np.full(3, 0.8, dtype=np.float32)
+            meta: ClassVar[dict[str, str]] = {"combine_mode": "log"}
 
             @staticmethod
             def sample(frame):
@@ -439,7 +454,15 @@ class FrameStoreMultiSourceTest(unittest.TestCase):
         self.assertEqual(payload["video_players"][0]["track"], 4)
         self.assertEqual(len(payload["trails"]["video"]["pitch"]), 2)
         self.assertEqual(len(payload["trails"]["fusion"]["pitch"]), 2)
-        self.assertEqual(payload["trails"]["yolo"]["pitch"], [])
+        # The yolo layer now draws a persistent trajectory (BotSORT-style) from its accepted track:
+        # frame 0 is the seeding frame (unaccepted), so the trail holds only the accepted point.
+        self.assertEqual(payload["trails"]["yolo"]["pitch"], [[13.0, 23.0, 0]])
+        self.assertEqual(payload["yolo_track"]["count"], 1)
+        # The candidate overlay surfaces every raw YOLO detection with its gate decision.
+        candidates = {round(c["x"], 1): c["decision"] for c in payload["yolo_candidates"]}
+        self.assertEqual(candidates[13.0], BALL_CAND_ACCEPTED)
+        candidates_far = {round(c["x"], 1): c["decision"] for c in payload_far["yolo_candidates"]}
+        self.assertEqual(candidates_far[80.0], BALL_CAND_REJECTED_UNREACHABLE)
         self.assertTrue(payload["fusion"]["available"])
         self.assertEqual(payload["fusion"]["label"], "H")
         self.assertEqual(payload["fusion"]["baseline_label"], "A")
@@ -513,9 +536,17 @@ class RangeTest(unittest.TestCase):
 
     def test_rejects_invalid_or_unsatisfiable_ranges(self):
         for header in ("not-a-range", "bytes=100-", "bytes=20-10", "bytes=0-1,3-4"):
-            with self.subTest(header=header):
-                with self.assertRaises(ValueError):
-                    parse_byte_range(header, 100)
+            with self.subTest(header=header), self.assertRaises(ValueError):
+                parse_byte_range(header, 100)
+
+    def test_a_well_formed_multi_range_is_its_own_error(self):
+        # 416 is only correct for a range the file cannot satisfy; a multi-part header is valid and
+        # the server must ignore it instead.
+        with self.assertRaises(MultiByteRange):
+            parse_byte_range("bytes=0-1,3-4", 100)
+        with self.assertRaises(ValueError) as raised:
+            parse_byte_range("bytes=0-1,garbage", 100)
+        self.assertNotIsInstance(raised.exception, MultiByteRange)
 
 
 class ViewerServerTest(unittest.TestCase):
@@ -573,6 +604,30 @@ class ViewerServerTest(unittest.TestCase):
             urlopen(request)
         self.assertEqual(raised.exception.code, 416)
 
+    def test_multi_range_probe_gets_the_whole_file_not_416(self):
+        request = Request(self.base + "/video", headers={"Range": "bytes=0-9,20-29"})
+        with urlopen(request) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers["Content-Length"], "100")
+            self.assertIsNone(response.headers["Content-Range"])
+            self.assertEqual(response.read(), bytes(range(100)))
+
+    def test_verbose_is_set_on_this_server_only(self):
+        noisy = make_server(
+            "127.0.0.1",
+            0,
+            payload=self.payload,
+            video_path=self.video,
+            assets_dir=Path(self.temp.name),
+            verbose=True,
+        )
+        try:
+            self.assertTrue(noisy.RequestHandlerClass.verbose)
+            self.assertFalse(ViewerRequestHandler.verbose)
+            self.assertFalse(self.server.RequestHandlerClass.verbose)
+        finally:
+            noisy.server_close()
+
     def test_unknown_path_is_not_served(self):
         with self.assertRaises(HTTPError) as raised:
             urlopen(self.base + "/static/../index.html")
@@ -628,6 +683,96 @@ class ViewerServerTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as raised:
             urlopen(request)
         self.assertEqual(raised.exception.code, 404)
+
+    def test_post_error_drains_the_body_and_keeps_the_connection_usable(self):
+        # urlopen closes the socket after every response, so it cannot see this: on a kept-alive
+        # connection an error answer that leaves the request body unread makes the *next* request
+        # parse from the middle of that body.
+        connection = HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        try:
+            connection.request(
+                "POST",
+                "/api/nowhere",
+                body=b'{"start": 0, "stop": 2, "label": "H"}',
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            self.assertEqual(response.status, 404)
+            response.read()
+            connection.request("GET", "/")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertIn(b"viewer", response.read())
+        finally:
+            connection.close()
+
+    def test_negative_frame_is_rejected(self):
+        server, thread = self._start_frame_server(lambda frame: {"available": True, "frame": int(frame)})
+        try:
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(base + "/api/frame?frame=-5")
+            self.assertEqual(raised.exception.code, 400)
+        finally:
+            self._stop(server, thread)
+
+    def test_frame_endpoint_reports_a_partial_cache_as_500(self):
+        # A perception/fusion .npz that covers less of the match than the labels makes the store
+        # index past the end.  That has to be an error response, not an exception in the handler.
+        def raise_out_of_range(frame):
+            raise IndexError(f"frame {frame} is not in the cached window")
+
+        server, thread = self._start_frame_server(raise_out_of_range)
+        try:
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(base + "/api/frame?frame=12851")
+            self.assertEqual(raised.exception.code, 500)
+            # The server is still alive afterwards.
+            with urlopen(base + "/api/viewer-data") as response:
+                self.assertEqual(response.status, 200)
+        finally:
+            self._stop(server, thread)
+
+    def test_empty_video_is_served_with_an_honest_content_length(self):
+        empty = Path(self.temp.name) / "empty.mp4"
+        empty.write_bytes(b"")
+        server = make_server(
+            "127.0.0.1",
+            0,
+            payload=self.payload,
+            video_path=empty,
+            assets_dir=Path(self.temp.name),
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            with urlopen(base + "/video") as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers["Content-Length"], "0")
+                self.assertEqual(response.read(), b"")
+        finally:
+            self._stop(server, thread)
+
+    def _start_frame_server(self, frame_payload):
+        server = make_server(
+            "127.0.0.1",
+            0,
+            payload=self.payload,
+            video_path=self.video,
+            assets_dir=Path(self.temp.name),
+            frame_store=SimpleNamespace(frame_payload=frame_payload),
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, thread
+
+    @staticmethod
+    def _stop(server, thread):
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 class ViewerUserTruthServerTest(unittest.TestCase):

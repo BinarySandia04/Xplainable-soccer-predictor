@@ -93,5 +93,17 @@ class FeatureExtractionTest(unittest.TestCase):
         self.assertTrue(f.out_of_play[5])
 
 
+class AerialFieldsTest(unittest.TestCase):
+    def test_extract_features_carries_launch_arrays(self):
+        f = extract_features(make_tracking(), TagTable.empty(make_tracking().n_frames))
+
+        n = len(f)
+        self.assertEqual(f.air.shape, (n,))
+        self.assertEqual(f.air.dtype, np.dtype(bool))
+        self.assertEqual(f.air_team.shape, (n,))
+        self.assertEqual(f.air_age.shape, (n,))
+        self.assertTrue((f.air_team == -1).all() or (f.air_team >= 0).any())
+
+
 if __name__ == "__main__":
     unittest.main()

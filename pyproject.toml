@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xplainable-soccer-predictor"
+version = "0.2.0"
+description = "Xplainable Soccer Predictor: Gap-aware hybrid HMM and multi-source fusion for football possession prediction"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Joan ICG" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "matplotlib>=3.7.0",
+    "scipy>=1.10.0",
+]
+
+[project.optional-dependencies]
+perception = [
+    "ultralytics>=8.0.0",
+    "opencv-python-headless>=4.8.0",
+    "torch>=2.0.0",
+]
+audio = [
+    "librosa>=0.10.0",
+    "imageio-ffmpeg>=0.4.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.1.0",
+]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["possession_lab/tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = [
+    ".git",
+    ".venv",
+    ".pytest_cache",
+    ".ruff_cache",
+    "evaluation",
+    "starter",
+    "data",
+    "reports",
+    "games.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "E501",    # line length handled contextually
+    "RUF046",  # int(round(x)) preserves python int against np.floating types
+    "RUF001",  # ambiguous unicode characters in documentation/html
+    "RUF022",  # manual logical grouping of __all__
+    "B905",    # zip strict=False
+]

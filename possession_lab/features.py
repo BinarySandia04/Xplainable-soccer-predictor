@@ -8,12 +8,13 @@ never pretends to know them.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
-import warnings
 
 import numpy as np
 
+from .aerial import launch_track
 from .balltrack import BallTrack, track_ball
 from .config import FPS, PITCH, STOP_LIVE_TAG_CODES
 from .data import TagTable, TrackingData
@@ -90,6 +91,11 @@ class Features:
     goal_dead: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
     stop_dead: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
     tag_live: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    # Causal aerial-duel support (aerial.launch_track): flight frames and the frozen launching
+    # team.  Zero-filled for older callers; only ``w_air`` reads them.
+    air: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    air_team: np.ndarray = field(default_factory=lambda: np.full(0, -1, dtype=np.int8))
+    air_age: np.ndarray = field(default_factory=lambda: np.full(0, 9999, dtype=np.int32))
 
     def __len__(self) -> int:
         return int(self.stop - self.start)
@@ -363,6 +369,9 @@ def extract_features(
             if away_mask.any():
                 d_away_last[k] = np.nanmin(dist_last[away_mask])
 
+    # Causal aerial attribution over the full sequence (199k cheap iterations, present-only).
+    aerial = launch_track(tracking)
+
     return Features(
         start=start,
         stop=stop,
@@ -404,6 +413,9 @@ def extract_features(
         goal_dead=goal_dead,
         stop_dead=stop_dead,
         tag_live=tag_live,
+        air=aerial.in_flight[start:stop],
+        air_team=aerial.team[start:stop],
+        air_age=aerial.age[start:stop],
     )
 
 

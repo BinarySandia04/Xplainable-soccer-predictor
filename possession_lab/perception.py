@@ -17,11 +17,12 @@ test or for the old HMM path does not require the perception environment.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Iterable
 import json
 import math
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -43,6 +44,17 @@ BALL_MAX_SPEED_MPS = 40.0
 BALL_GATE_TOLERANCE_M = 1.0
 BALL_MIN_CONFIDENCE = 0.18
 BALL_TRACK_MAX_GAP_S = 1.0
+
+# Per-candidate decision codes written by ``_run_ball_track`` (see ``annotate_ball_candidates``).
+# They make the gate transparent: every YOLO ball candidate is labelled with why it was kept or
+# dropped, which is the evidence the viewer overlays.  They are an online physical/geometric prior
+# only, never ground truth.
+BALL_CAND_REJECTED_LOW = 0  # below min_confidence and not reachable as a low-confidence recovery
+BALL_CAND_ACCEPTED = 1  # chosen for the high-confidence physical track
+BALL_CAND_RECOVERED = 2  # chosen by the second (low-confidence) association pass
+BALL_CAND_REJECTED_UNREACHABLE = 3  # outside the ``max_speed * dt + tolerance`` gate
+BALL_CAND_REJECTED_OCCLUDED = 4  # sits on a player position: likely a shirt patch, not the ball
+BALL_CAND_UNSELECTED = 5  # plausible and reachable, but another candidate won this frame
 
 # Cache layout.  The first dimension is a sampled frame, not necessarily every video frame.
 MAX_PLAYERS = 40
@@ -293,7 +305,39 @@ def ball_gate_metres(
     return max(0.0, float(max_speed) * max(0.0, float(dt_s)) + float(tolerance))
 
 
-def select_plausible_ball_detections(
+def _min_distance_to_players(
+    point: np.ndarray, players: np.ndarray | None
+) -> float:
+    """Smallest pitch distance from ``point`` to any finite player position (``inf`` if none)."""
+    if players is None:
+        return math.inf
+    players = np.asarray(players, dtype=np.float64)
+    if players.size == 0:
+        return math.inf
+    players = players.reshape(-1, 2)
+    players = players[np.isfinite(players).all(axis=1)]
+    if players.size == 0:
+        return math.inf
+    return float(np.min(np.linalg.norm(players - np.asarray(point, dtype=np.float64), axis=1)))
+
+
+@dataclass
+class BallTrackDecision:
+    """Rich result of the online ball-association pass.
+
+    ``select_plausible_ball_detections`` returns the first four arrays; ``annotate_ball_candidates``
+    returns ``decisions``; ``ball_track_ids`` is derived from ``status`` and ``frame_index``.
+    """
+
+    ball: np.ndarray  # (samples, 2) accepted pitch point, or NaN when nothing was usable
+    confidence: np.ndarray  # (samples,)
+    status: np.ndarray  # (samples,) 0 accepted, 1 low-confidence accepted, 2 none, 3 recovered
+    selected: np.ndarray  # (samples,) chosen candidate row, -1 when none
+    decisions: np.ndarray  # (samples, candidates) per-candidate BALL_CAND_* code
+    track_id: np.ndarray  # (samples,) ball track id, -1 when no track is live
+
+
+def _run_ball_track(
     points: np.ndarray,
     confidence: np.ndarray,
     present: np.ndarray,
@@ -304,16 +348,28 @@ def select_plausible_ball_detections(
     tolerance: float = BALL_GATE_TOLERANCE_M,
     min_confidence: float = BALL_MIN_CONFIDENCE,
     max_gap_s: float = BALL_TRACK_MAX_GAP_S,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Select the temporal YOLO-ball track that is physically reachable.
+    low_confidence_floor: float | None = None,
+    player_points: np.ndarray | None = None,
+    occlusion_radius_m: float = 0.0,
+) -> BallTrackDecision:
+    """Associate YOLO ball detections into one physically reachable track per sample.
 
-    ``points`` is ``(samples, candidates, 2)`` in pitch metres.  A measurement farther from the
-    previous accepted ball than ``max_speed * dt + tolerance`` is rejected, even if YOLO is very
-    confident.  A new track needs two mutually reachable detections, so a single false positive
-    cannot seed or move the track.  The returned ``status`` is ``0`` for an accepted detection,
-    ``1`` for a low-confidence accepted detection, and ``2`` for no usable measurement.
+    ``points`` is ``(samples, candidates, 2)`` in pitch metres.  Stage 1 keeps the strict, high-
+    confidence physical track: a measurement farther from the previous accepted ball than
+    ``max_speed * dt + tolerance`` is rejected even if YOLO is very confident, and a new track needs
+    two mutually reachable detections so a single false positive cannot seed or move it.
 
-    This is an online physical prior only: it uses pitch geometry and time, never ground truth.
+    Two optional, paper-inspired extensions are **off by default** so the strict track is unchanged:
+
+    * ``low_confidence_floor`` adds a ByteTrack/BotSORT second stage.  Only when stage 1 found
+      nothing usable *and* a track is already live, a candidate in ``[floor, min_confidence)`` that
+      is still physically reachable is accepted as a recovery (``status == 3``).  It can fill a
+      one-frame detector flicker but can never seed a track or outrank a confident detection.
+    * ``occlusion_radius_m`` adds a generic occlusion guard: a low-confidence recovery that sits within
+      this many metres of a player position (``player_points``) is treated as a shirt patch and
+      dropped.  It only rejects recoveries, so it never alters the strict stage-1 track.
+
+    This is an online physical and geometric prior only: pitch geometry and time, never ground truth.
     """
     points = np.asarray(points, dtype=np.float64)
     confidence = np.asarray(confidence, dtype=np.float64)
@@ -331,21 +387,58 @@ def select_plausible_ball_detections(
     ball_confidence = np.zeros(samples, dtype=np.float64)
     status = np.full(samples, 2, dtype=np.int8)
     selected = np.full(samples, -1, dtype=np.int16)
+    decisions = np.full(points.shape[:2], BALL_CAND_UNSELECTED, dtype=np.int8)
+    decisions[~present] = BALL_CAND_REJECTED_LOW
+    track_id = np.full(samples, -1, dtype=np.int16)
     if samples == 0:
-        return ball, ball_confidence, status, selected
+        return BallTrackDecision(ball, ball_confidence, status, selected, decisions, track_id)
 
     last: np.ndarray | None = None
     last_frame = -1
     pending: np.ndarray | None = None
     pending_frame = -1
+    current_track = -1
+    occlusion_on = float(occlusion_radius_m) > 0.0 and player_points is not None
+
+    def label(sample: int, chosen: int, recovered: bool, anchor: np.ndarray | None, gate: float) -> None:
+        rows = np.flatnonzero(present[sample])
+        for row in rows:
+            value = float(confidence[sample, row])
+            if row == chosen:
+                decisions[sample, row] = BALL_CAND_RECOVERED if recovered else BALL_CAND_ACCEPTED
+            elif (
+                occlusion_on
+                and low_confidence_floor is not None
+                and float(low_confidence_floor) <= value < float(min_confidence)
+                and _min_distance_to_players(points[sample, row], player_points[sample])
+                <= float(occlusion_radius_m)
+            ):
+                # A recovery candidate dropped specifically because it sits on a player patch.
+                decisions[sample, row] = BALL_CAND_REJECTED_OCCLUDED
+            elif value < float(min_confidence):
+                decisions[sample, row] = BALL_CAND_REJECTED_LOW
+            elif anchor is not None and np.linalg.norm(points[sample, row] - anchor) > gate:
+                decisions[sample, row] = BALL_CAND_REJECTED_UNREACHABLE
+            else:
+                decisions[sample, row] = BALL_CAND_UNSELECTED
 
     for sample in range(samples):
         valid = present[sample] & np.isfinite(points[sample]).all(axis=1)
         rows = np.flatnonzero(valid & (confidence[sample] >= float(min_confidence)))
         if pending is not None and (frame_index[sample] - pending_frame) / fps > max_gap_s:
             pending = None
-        if rows.size == 0:
+        # No confident detection and no live track: nothing can be accepted (a recovery needs a
+        # track to keep alive).  With a live track we fall through so the second stage can recover.
+        if rows.size == 0 and last is None:
+            label(sample, -1, False, None, ball_gate_metres(1.0 / fps, max_speed=max_speed, tolerance=tolerance))
             continue
+
+        chosen = -1
+        recovered = False
+        gate = ball_gate_metres(
+            max(1.0 / fps, (frame_index[sample] - (pending_frame if last is None else last_frame)) / fps),
+            max_speed=max_speed, tolerance=tolerance,
+        )
 
         if last is None:
             # A single detection is not enough to start a new track.  Confirm it with a second
@@ -354,46 +447,126 @@ def select_plausible_ball_detections(
                 row = int(rows[np.argmax(confidence[sample, rows])])
                 pending = points[sample, row].copy()
                 pending_frame = int(round(frame_index[sample]))
+                label(sample, -1, False, pending, gate)
                 continue
-            dt = max(1.0 / fps, (frame_index[sample] - pending_frame) / fps)
-            gate = ball_gate_metres(dt, max_speed=max_speed, tolerance=tolerance)
             distances = np.linalg.norm(points[sample, rows] - pending, axis=1)
             reachable = rows[distances <= gate]
             if reachable.size == 0:
                 row = int(rows[np.argmax(confidence[sample, rows])])
                 pending = points[sample, row].copy()
                 pending_frame = int(round(frame_index[sample]))
+                label(sample, -1, False, pending, gate)
                 continue
-            row = int(reachable[np.argmin(np.linalg.norm(points[sample, reachable] - pending, axis=1))])
+            chosen = int(reachable[np.argmin(np.linalg.norm(points[sample, reachable] - pending, axis=1))])
         else:
             dt = (frame_index[sample] - last_frame) / fps
             if dt > max_gap_s:
                 last = None
-                row = int(rows[np.argmax(confidence[sample, rows])])
-                pending = points[sample, row].copy()
-                pending_frame = int(round(frame_index[sample]))
+                current_track = -1
+                if rows.size:
+                    row = int(rows[np.argmax(confidence[sample, rows])])
+                    pending = points[sample, row].copy()
+                    pending_frame = int(round(frame_index[sample]))
+                label(sample, -1, False, pending, gate)
                 continue
             dt = max(1.0 / fps, dt)
             gate = ball_gate_metres(dt, max_speed=max_speed, tolerance=tolerance)
             distances = np.linalg.norm(points[sample, rows] - last, axis=1)
             reachable = rows[distances <= gate]
-            if reachable.size == 0:
+            if reachable.size > 0:
+                chosen = int(reachable[np.argmin(np.linalg.norm(points[sample, reachable] - last, axis=1))])
+            elif low_confidence_floor is not None:
+                # Second stage: a confident detection is missing this frame, so let a reachable low-
+                # confidence candidate keep the live track alive (never seeds, never occluded).
+                low_rows = np.flatnonzero(
+                    valid
+                    & (confidence[sample] >= float(low_confidence_floor))
+                    & (confidence[sample] < float(min_confidence))
+                )
+                if occlusion_on and low_rows.size:
+                    keep = [
+                        row
+                        for row in low_rows
+                        if _min_distance_to_players(points[sample, row], player_points[sample])
+                        > float(occlusion_radius_m)
+                    ]
+                    low_rows = np.asarray(keep, dtype=np.intp)
+                if low_rows.size:
+                    low_dist = np.linalg.norm(points[sample, low_rows] - last, axis=1)
+                    low_reach = low_rows[low_dist <= gate]
+                    if low_reach.size:
+                        chosen = int(low_reach[np.argmin(np.linalg.norm(points[sample, low_reach] - last, axis=1))])
+                        recovered = True
+            if chosen < 0:
                 # Keep the previous point for a short reacquisition window, but do not emit a
                 # measurement for this frame.
+                label(sample, -1, False, last, gate)
                 continue
-            row = int(reachable[np.argmin(np.linalg.norm(points[sample, reachable] - last, axis=1))])
 
-        point = points[sample, row]
-        value = float(confidence[sample, row])
+        point = points[sample, chosen]
+        value = float(confidence[sample, chosen])
         ball[sample] = point
         ball_confidence[sample] = value
-        status[sample] = 0 if value >= 0.25 else 1
-        selected[sample] = row
+        status[sample] = 3 if recovered else (0 if value >= 0.25 else 1)
+        selected[sample] = chosen
+        if current_track < 0:
+            current_track = int(np.max(track_id)) + 1 if np.any(track_id >= 0) else 0
+        track_id[sample] = current_track
         last = point.copy()
         last_frame = int(round(frame_index[sample]))
         pending = None
+        label(sample, chosen, recovered, point, gate)
 
-    return ball, ball_confidence, status, selected
+    return BallTrackDecision(ball, ball_confidence, status, selected, decisions, track_id)
+
+
+def select_plausible_ball_detections(
+    points: np.ndarray,
+    confidence: np.ndarray,
+    present: np.ndarray,
+    frame_index: np.ndarray,
+    *,
+    fps: float = FPS,
+    max_speed: float = BALL_MAX_SPEED_MPS,
+    tolerance: float = BALL_GATE_TOLERANCE_M,
+    min_confidence: float = BALL_MIN_CONFIDENCE,
+    max_gap_s: float = BALL_TRACK_MAX_GAP_S,
+    low_confidence_floor: float | None = None,
+    player_points: np.ndarray | None = None,
+    occlusion_radius_m: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Select the temporal YOLO-ball track that is physically reachable.
+
+    Returns ``(ball, confidence, status, selected)``.  ``status`` is ``0`` for an accepted
+    detection, ``1`` for a low-confidence accepted detection, ``2`` for no usable measurement and
+    ``3`` for a second-stage recovery.  The optional ``low_confidence_floor`` / ``occlusion_radius_m``
+    extensions are off by default, which reproduces the strict physical track exactly.  See
+    :func:`_run_ball_track` for the full method.
+    """
+    result = _run_ball_track(
+        points,
+        confidence,
+        present,
+        frame_index,
+        fps=fps,
+        max_speed=max_speed,
+        tolerance=tolerance,
+        min_confidence=min_confidence,
+        max_gap_s=max_gap_s,
+        low_confidence_floor=low_confidence_floor,
+        player_points=player_points,
+        occlusion_radius_m=occlusion_radius_m,
+    )
+    return result.ball, result.confidence, result.status, result.selected
+
+
+def annotate_ball_candidates(*args: Any, **kwargs: Any) -> np.ndarray:
+    """Return the ``(samples, candidates)`` per-candidate ``BALL_CAND_*`` decision grid.
+
+    Takes the same arguments as :func:`select_plausible_ball_detections`.  It never changes the
+    accepted track; it only reports why each candidate was kept or dropped.
+    """
+    return _run_ball_track(*args, **kwargs).decisions
 
 
 def _box_foot_points(boxes: np.ndarray) -> np.ndarray:
@@ -517,10 +690,10 @@ class _WhiteBlobBallDetector:
         mask = ((value >= threshold) & (saturation <= 105)).astype(np.uint8) * 255
         kernel = np.ones((2, 2), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+        count, _, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
         results: list[dict[str, Any]] = []
         for label in range(1, count):
-            x, y, w, h, area = [int(v) for v in stats[label]]
+            _x, _y, w, h, area = [int(v) for v in stats[label]]
             if not (self.min_area <= area <= self.max_area):
                 continue
             if w < 1 or h < 1 or w > 28 or h > 28:
@@ -604,6 +777,9 @@ class VideoBallTracker:
         self.last_pixel = np.full(2, np.nan, dtype=np.float64)
         self.velocity = np.zeros(2, dtype=np.float64)
         self.confidence = 0.0
+        # Confidence of the last genuinely observed ball; predicted frames decay from this, not from
+        # their own already-decayed value.
+        self.anchor_confidence = 0.0
         self.template: np.ndarray | None = None
         self.missing = 0
         self.pending: dict[str, Any] | None = None
@@ -683,6 +859,7 @@ class VideoBallTracker:
         self.pending_frame = -1
         confidence = float(candidate.get("confidence", 0.5))
         self.confidence = max(0.08, min(1.0, confidence))
+        self.anchor_confidence = self.confidence
         template = self._template_from_frame(frame, (float(pixel[0]), float(pixel[1])))
         if template is not None and (self.template is None or self.confidence >= 0.20):
             self.template = template
@@ -791,13 +968,11 @@ class VideoBallTracker:
                 pixel = pitch_to_pixel(homography, anchor[None, :], self.pitch)[0]
                 candidate = self._as_candidate(anchor, pixel, 0.78, "atd")
                 return self._commit(candidate, frame, frame_index, source=3)
-            # Use the image measurement when it is close to the anchor; otherwise trust the anchor.
-            if float(np.linalg.norm(np.asarray(near["pitch"]) - anchor)) <= 2.5:
-                near["origin"] = "yolo+atd"
-                return self._commit(near, frame, frame_index, source=0)
-            pixel = pitch_to_pixel(homography, anchor[None, :], self.pitch)[0]
-            candidate = self._as_candidate(anchor, pixel, 0.78, "atd")
-            return self._commit(candidate, frame, frame_index, source=3)
+            # ``_best_visible`` already restricted the candidate to the 2.5 m around the anchor, so
+            # this is the "image measurement agrees with the ATD" case and the anchor does not need
+            # to override it again.
+            near["origin"] = "yolo+atd"
+            return self._commit(near, frame, frame_index, source=0)
 
         # From here on the ATD ball is unavailable: this is the actual gap-filling path.
         if self.alive and self.last_frame >= 0 and np.isfinite(self.last_pitch).all():
@@ -846,7 +1021,11 @@ class VideoBallTracker:
                     point = predicted
                     pixel = pitch_to_pixel(homography, point[None, :], self.pitch)[0]
                     self.missing += 1
-                    self.confidence = max(0.03, self.confidence * math.exp(-gap / 1.2))
+                    # Decay from the confidence at the last *observed* ball, by the age of that
+                    # observation.  Multiplying the previous predicted confidence instead compounds
+                    # the factor every frame while ``gap`` also grows, so the exponent goes
+                    # quadratic and the tracker gives up long before ``max_gap_s``.
+                    self.confidence = max(0.03, self.anchor_confidence * math.exp(-gap / 1.2))
                     return {
                         "pixel": [float(pixel[0]), float(pixel[1])]
                         if np.isfinite(pixel).all()
@@ -974,13 +1153,9 @@ def _team_match(
         return np.full(detections.shape[0], -1, dtype=np.int8), np.zeros(detections.shape[0], dtype=np.float32)
     projected = pitch_to_pixel(homography, atd_players, pitch)
     costs = np.linalg.norm(detections[:, None, :] - projected[None, :, :], axis=2)
-    try:
-        from scipy.optimize import linear_sum_assignment
+    from scipy.optimize import linear_sum_assignment
 
-        rows, cols = linear_sum_assignment(costs)
-    except Exception:  # pragma: no cover - scipy is an optional perception dependency
-        rows = np.arange(min(costs.shape))
-        cols = np.argmin(costs, axis=1)[rows]
+    rows, cols = linear_sum_assignment(costs)
     teams = np.full(detections.shape[0], -1, dtype=np.int8)
     confidence = np.zeros(detections.shape[0], dtype=np.float32)
     for row, col in zip(rows, cols):

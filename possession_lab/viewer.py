@@ -29,20 +29,17 @@ import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 
 from .config import (
-    A,
     CODE_TO_LABEL,
-    D,
     EXPLANATIONS_PATH,
     FPS,
     GAME,
     GRADED_HALVES,
-    H,
     LABEL_TO_CODE,
     N_FRAMES,
     PITCH,
@@ -53,11 +50,23 @@ from .config import (
     SOURCE,
     USER_TRUTH_PATH,
     WHISTLE_CACHE,
+    A,
+    D,
+    H,
     X,
     asset_paths,
 )
 from .data import TagTable, load_public_gt, load_smart_tags, load_submission
-from .perception import select_plausible_ball_detections
+from .perception import _run_ball_track
+
+# Viewer-only ball association.  The yolo layer recomputes the ball track when the viewer loads, so
+# these extensions are visual evidence only: they never touch fusion.npz, predictions.csv or any
+# metric, because fusion recomputes the strict track on its own.  ``low_confidence_floor`` enables a
+# ByteTrack/BotSORT second stage that keeps the ball track alive across a one-frame detector flicker;
+# ``occlusion_radius_m`` is the guard that drops a low-confidence candidate sitting on a
+# player as a likely shirt patch.  Kept here (not in config) to make the offline/online split obvious.
+YOLO_VIEW_FLOOR = 0.05
+YOLO_VIEW_OCCLUSION_M = 0.5
 
 # The official scorer is the source of truth for possession segments/spells, just as it is for the
 # report.  Import it lazily-safe by putting the repository root on sys.path first.
@@ -65,8 +74,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from evaluation import possession_metrics as pm  # noqa: E402
 
-
 RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+RANGE_ITEM_RE = re.compile(r"^(\d*)-(\d*)$")
+# Largest JSON body the user-truth endpoint accepts.
+MAX_POST_BYTES = 100_000
 MIME_TYPES = {
     "index.html": "text/html; charset=utf-8",
     "viewer.js": "text/javascript; charset=utf-8",
@@ -491,17 +502,37 @@ class FrameStore:
         self._yolo_ball_pitch: np.ndarray | None = None
         self._yolo_ball_confidence: np.ndarray | None = None
         self._yolo_ball_selected: np.ndarray | None = None
+        self._yolo_ball_status: np.ndarray | None = None
+        self._yolo_ball_decisions: np.ndarray | None = None
+        self._yolo_ball_track_id: np.ndarray | None = None
+        self._yolo_track_count = 0
         if perception is not None and getattr(perception, "samples", 0) > 0:
-            plausible, confidence, _, selected = select_plausible_ball_detections(
+            present = getattr(perception, "players_present", None)
+            pitch_players = getattr(perception, "players_pitch", None)
+            player_points = None
+            if present is not None and pitch_players is not None:
+                player_points = np.where(
+                    np.asarray(present, dtype=bool)[..., None],
+                    np.asarray(pitch_players, dtype=np.float64),
+                    np.nan,
+                )
+            track = _run_ball_track(
                 perception.yolo_ball_pitch,
                 perception.yolo_ball_confidence,
                 perception.yolo_ball_present,
                 perception.frame_index,
                 fps=float(getattr(perception, "fps", FPS)),
+                low_confidence_floor=YOLO_VIEW_FLOOR,
+                player_points=player_points,
+                occlusion_radius_m=YOLO_VIEW_OCCLUSION_M,
             )
-            self._yolo_ball_pitch = plausible
-            self._yolo_ball_confidence = confidence
-            self._yolo_ball_selected = selected
+            self._yolo_ball_pitch = track.ball
+            self._yolo_ball_confidence = track.confidence
+            self._yolo_ball_status = track.status
+            self._yolo_ball_selected = track.selected
+            self._yolo_ball_decisions = track.decisions
+            self._yolo_ball_track_id = track.track_id
+            self._yolo_track_count = int(np.unique(track.track_id[track.track_id >= 0]).size)
         if getattr(features, "start", 0) != 0:
             raise ValueError("FrameStore needs full-match features starting at frame 0")
 
@@ -630,6 +661,8 @@ class FrameStore:
                 "confidence": 0.0,
                 "gap_s": None,
                 "out_of_play": False,
+                "recovered": False,
+                "track": -1,
                 "age_frames": None,
             }
         index = self.perception.nearest_index(int(frame))
@@ -655,13 +688,19 @@ class FrameStore:
                 "confidence": 0.0,
                 "gap_s": None,
                 "out_of_play": False,
+                "recovered": False,
+                "track": -1,
                 "age_frames": int(sample.get("age_frames", 0)),
             }
+        status = int(self._yolo_ball_status[index]) if self._yolo_ball_status is not None else 0
+        track = int(self._yolo_ball_track_id[index]) if self._yolo_ball_track_id is not None else -1
         pixel = np.asarray(self.perception.yolo_ball_pixel[index, slot], dtype=np.float64)
         source = 0 if confidence >= 0.25 else 1
         return {
             "source": source,
             "observed": bool(source == 0),
+            "recovered": bool(status == 3),
+            "track": track,
             "x": _finite(point[0]),
             "y": _finite(point[1]),
             "px": _finite(pixel[0]),
@@ -674,6 +713,39 @@ class FrameStore:
             ),
             "age_frames": int(sample.get("age_frames", 0)),
         }
+
+    def _yolo_candidates_payload(self, frame: int) -> list[dict[str, Any]]:
+        """Every raw YOLO ball candidate for the frame, labelled with its gate decision.
+
+        ``decision`` mirrors the ``BALL_CAND_*`` codes in :mod:`possession_lab.perception`:
+        0 rejected-low, 1 accepted, 2 recovered (2nd stage), 3 rejected-unreachable,
+        4 rejected-occluded-by-player, 5 unselected-but-plausible.  It is online physical/geometric
+        evidence only and does not affect fusion or the submitted predictions.
+        """
+        sample = self._perception_sample(frame)
+        if sample is None or self.perception is None or self._yolo_ball_decisions is None:
+            return []
+        index = self.perception.nearest_index(int(frame))
+        decisions = self._yolo_ball_decisions[index]
+        candidates: list[dict[str, Any]] = []
+        for slot in range(int(self.perception.yolo_ball_present.shape[1])):
+            if not bool(self.perception.yolo_ball_present[index, slot]):
+                continue
+            point = np.asarray(self.perception.yolo_ball_pitch[index, slot], dtype=np.float64)
+            if not np.isfinite(point).all():
+                continue
+            pixel = np.asarray(self.perception.yolo_ball_pixel[index, slot], dtype=np.float64)
+            candidates.append(
+                {
+                    "x": _finite(point[0]),
+                    "y": _finite(point[1]),
+                    "px": _finite(pixel[0]),
+                    "py": _finite(pixel[1]),
+                    "confidence": round(float(self.perception.yolo_ball_confidence[index, slot]), 3),
+                    "decision": int(decisions[slot]),
+                }
+            )
+        return candidates
 
     def _fusion_layer_payload(self, frame: int) -> dict[str, Any]:
         if self.fusion is None:
@@ -785,7 +857,28 @@ class FrameStore:
                 points.append((k, float(ball["x"]), float(ball["y"]), source))
             return points
         if layer == "yolo":
-            return []
+            if self._yolo_ball_pitch is None or self.perception is None:
+                return []
+            yolo_points: list[tuple[int, float, float, int]] = []
+            yolo_seen: set[int] = set()
+            start = max(0, frame - self.trail_frames + 1)
+            for k in range(start, frame + 1):
+                idx = self.perception.nearest_index(int(k))
+                if idx in yolo_seen:
+                    continue
+                yolo_seen.add(idx)
+                slot = int(self._yolo_ball_selected[idx]) if self._yolo_ball_selected is not None else -1
+                point = np.asarray(self._yolo_ball_pitch[idx], dtype=np.float64)
+                confidence = (
+                    float(self._yolo_ball_confidence[idx])
+                    if self._yolo_ball_confidence is not None
+                    else 0.0
+                )
+                if slot < 0 or not np.isfinite(point).all() or confidence <= 0.01:
+                    yolo_points = []  # a real gap breaks the trajectory, never bridges it
+                    continue
+                yolo_points.append((k, float(point[0]), float(point[1]), 0 if confidence >= 0.25 else 1))
+            return yolo_points
         if layer == "fusion":
             if self.fusion is None:
                 return []
@@ -949,6 +1042,13 @@ class FrameStore:
             "trail_pitch": trail_pitch,
             "players": players,
             "video_players": video_players,
+            "yolo_candidates": self._yolo_candidates_payload(frame),
+            "yolo_track": {
+                "count": int(self._yolo_track_count),
+                "floor": YOLO_VIEW_FLOOR,
+                "occlusion_m": YOLO_VIEW_OCCLUSION_M,
+                "id": int(layers["yolo"].get("track", -1)) if layers.get("yolo") else -1,
+            },
             "perception_available": bool(self.perception is not None),
             "fusion_available": bool(self.fusion is not None),
             "fusion": fusion_payload,
@@ -957,15 +1057,32 @@ class FrameStore:
         }
 
 
+class MultiByteRange(ValueError):
+    """A syntactically valid multi-part ``Range`` header, such as ``bytes=0-1,3-4``.
+
+    Serving ``multipart/byteranges`` is optional, and RFC 9110 wants a server that will not serve it
+    to ignore the header and return the whole representation with 200.  Answering 416 instead breaks
+    the clients that probe with two ranges, because 416 tells them the file cannot be ranged at all.
+    """
+
+
 def parse_byte_range(header: str, size: int) -> tuple[int, int] | None:
     """Parse a single-range ``Range`` header.
 
     Returns ``None`` when there is no range, or ``(start, end)`` with inclusive bounds.  Raises
-    ``ValueError`` for malformed, multi-range, or unsatisfiable requests.
+    :class:`MultiByteRange` for a well-formed multi-range header and ``ValueError`` for a malformed
+    or unsatisfiable one.
     """
     if not header:
         return None
-    match = RANGE_RE.fullmatch(header.strip())
+    candidate = header.strip()
+    if candidate.startswith("bytes=") and "," in candidate:
+        # The unit prefixes the whole list, so the individual items carry no ``bytes=`` of their own.
+        items = [item.strip() for item in candidate[len("bytes=") :].split(",")]
+        if items and all(RANGE_ITEM_RE.fullmatch(item) and item != "-" for item in items):
+            raise MultiByteRange("multiple ranges")
+        raise ValueError("unsupported range")
+    match = RANGE_RE.fullmatch(candidate)
     if not match:
         raise ValueError("unsupported range")
     first, last = match.groups()
@@ -995,41 +1112,88 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
     """Small whitelist-only HTTP handler with MP4 byte-range support."""
 
     protocol_version = "HTTP/1.1"
-    payload: bytes = b"{}"
-    video_path: Path | None = None
-    assets: dict[str, tuple[bytes, str]] = {}
-    pred: np.ndarray | None = None
-    user_truth: np.ndarray | None = None
-    user_truth_path: Path | None = None
-    frame_store: FrameStore | None = None
-    ut_lock = threading.Lock()
-    verbose = False
+    payload: ClassVar[bytes] = b"{}"
+    video_path: ClassVar[Path | None] = None
+    assets: ClassVar[dict[str, tuple[bytes, str]]] = {}
+    pred: ClassVar[np.ndarray | None] = None
+    user_truth: ClassVar[np.ndarray | None] = None
+    user_truth_path: ClassVar[Path | None] = None
+    frame_store: ClassVar[FrameStore | None] = None
+    ut_lock: ClassVar[threading.Lock] = threading.Lock()
+    verbose: ClassVar[bool] = False
+
+    _body_read: int = 0
+
+    def handle_one_request(self) -> None:
+        # Counted per request: ``Content-Length`` is the total the client declared, so draining has
+        # to subtract whatever this handler already consumed.
+        self._body_read = 0
+        super().handle_one_request()
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if self.verbose:
             super().log_message(fmt, *args)
 
-    def do_GET(self) -> None:  # noqa: N802 - stdlib naming
+    def do_GET(self) -> None:
         self._dispatch(send_body=True)
 
-    def do_HEAD(self) -> None:  # noqa: N802 - stdlib naming
+    def do_HEAD(self) -> None:
         self._dispatch(send_body=False)
 
-    def do_POST(self) -> None:  # noqa: N802 - stdlib naming
+    def _read_body(self, length: int) -> bytes:
+        data = self.rfile.read(length)
+        self._body_read += len(data)
+        return data
+
+    def _drain_request_body(self) -> None:
+        """Read and discard a declared request body that will not be used.
+
+        A keep-alive connection parses the next request straight out of ``rfile``, so answering an
+        error while body bytes are still queued makes that next request start in the middle of this
+        one's body.  Two cases cannot be drained and close the socket instead: a chunked body, whose
+        length is not known up front, and more bytes than the endpoint would ever accept.
+        """
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            self.close_connection = True
+            return
+        try:
+            declared = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            self.close_connection = True
+            return
+        remaining = declared - self._body_read
+        if remaining <= 0:
+            return
+        if remaining > MAX_POST_BYTES:
+            self.close_connection = True
+            return
+        while remaining > 0:
+            chunk = self.rfile.read(min(65_536, remaining))
+            if not chunk:
+                self.close_connection = True
+                return
+            remaining -= len(chunk)
+
+    def _reject(self, status: HTTPStatus, message: str) -> None:
+        """Send an error response and leave the connection safe for the next request."""
+        self._drain_request_body()
+        self._send_error(status, message)
+
+    def do_POST(self) -> None:
         if urlsplit(self.path).path != "/api/user-truth":
-            self._send_error(HTTPStatus.NOT_FOUND, "not found")
+            self._reject(HTTPStatus.NOT_FOUND, "not found")
             return
         if self.pred is None or self.user_truth is None or self.user_truth_path is None:
-            self._send_error(HTTPStatus.NOT_FOUND, "user truth not configured")
+            self._reject(HTTPStatus.NOT_FOUND, "user truth not configured")
             return
         if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
-            self._send_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "expected application/json")
+            self._reject(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "expected application/json")
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > 100_000:
+            if length <= 0 or length > MAX_POST_BYTES:
                 raise ValueError
-            body = json.loads(self.rfile.read(length))
+            body = json.loads(self._read_body(length))
             if not isinstance(body, dict):
                 raise ValueError
             n_frames = int(self.pred.size)
@@ -1051,7 +1215,7 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
                 if not (0 <= start < stop <= n_frames):
                     raise ValueError
         except (ValueError, TypeError, KeyError, json.JSONDecodeError):
-            self._send_error(HTTPStatus.BAD_REQUEST, "invalid user-truth edit")
+            self._reject(HTTPStatus.BAD_REQUEST, "invalid user-truth edit")
             return
 
         try:
@@ -1142,8 +1306,25 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             self._send_error(HTTPStatus.BAD_REQUEST, "invalid frame", send_body=send_body)
             return
-        payload = store.frame_payload(frame)
-        body = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        if frame < 0:
+            self._send_error(HTTPStatus.BAD_REQUEST, "frame must not be negative", send_body=send_body)
+            return
+        try:
+            payload = store.frame_payload(frame)
+            body = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            # A cache that does not cover the whole match (a public-window perception or fusion
+            # .npz next to full-length labels) raises here.  Report it as a 500 the page can show:
+            # letting the exception escape kills the handler thread and the browser only sees a
+            # dropped connection.
+            if self.verbose:
+                print(f"frame {frame} failed: {type(exc).__name__}: {exc}", flush=True)
+            self._send_error(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "frame unavailable: stale or partial perception/fusion cache",
+                send_body=send_body,
+            )
+            return
         self._send_bytes(
             body.encode("utf-8"),
             "application/json; charset=utf-8",
@@ -1190,11 +1371,28 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
             print(f"video request: range={range_header!r} size={size:,}", flush=True)
         try:
             parsed = parse_byte_range(range_header, size)
+        except MultiByteRange:
+            # We do not produce multipart/byteranges bodies.  RFC 9110 says the right answer is then
+            # to ignore the header and send the whole file, not 416: 416 tells the client the file
+            # cannot be ranged at all, and the two-range probe never comes back.
+            parsed = None
         except ValueError:
             self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Range", f"bytes */{size}")
             self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if size == 0:
+            # Nothing to serve.  The previous code turned a no-range request into a 0..0 slice, so
+            # it advertised ``Content-Length: 1`` and then wrote no body, leaving a keep-alive
+            # client waiting for an octet that never arrives.  A ranged request on an empty file is
+            # already answered with 416 ``bytes */0`` by the parser above.
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", "0")
+            self.send_header("Accept-Ranges", "bytes")
             self.end_headers()
             return
 
@@ -1215,7 +1413,7 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
 
-        if not send_body or size == 0:
+        if not send_body:
             return
         try:
             with Path(path).open("rb") as handle:
@@ -1265,6 +1463,7 @@ def make_server(
     user_truth: np.ndarray | None = None,
     user_truth_path: str | Path | None = None,
     frame_store: FrameStore | None = None,
+    verbose: bool = False,
 ) -> ViewerHTTPServer:
     """Create the local reviewer server.  ``port=0`` chooses an ephemeral port."""
     assets = _load_assets(Path(assets_dir))
@@ -1272,6 +1471,9 @@ def make_server(
         "payload": payload,
         "video_path": Path(video_path),
         "assets": assets,
+        # Set on the generated subclass, not on ViewerRequestHandler: a second server (a test, or a
+        # second run in the same process) would otherwise inherit the first one's verbosity.
+        "verbose": bool(verbose),
     }
     if pred is not None and user_truth is not None and user_truth_path is not None:
         attributes.update(
@@ -1418,7 +1620,7 @@ def serve_viewer(
             f"fusión {'sí' if frame_store.fusion is not None else 'no'}",
             flush=True,
         )
-    except Exception as exc:  # noqa: BLE001 - the overlay is an optional aid
+    except Exception as exc:
         print(f"tracking: no disponible ({exc})", flush=True)
 
     data = load_viewer_data(
@@ -1449,8 +1651,8 @@ def serve_viewer(
         user_truth=user_truth,
         user_truth_path=user_truth_path,
         frame_store=frame_store,
+        verbose=verbose,
     )
-    ViewerRequestHandler.verbose = verbose
     url = f"http://{host}:{server.server_address[1]}/"
     print(f"viewer: {url}", flush=True)
     print(

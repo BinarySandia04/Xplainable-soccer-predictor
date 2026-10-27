@@ -116,6 +116,10 @@ MODEL_PARAMS = {
     "flight_R": 0.0,
     "flight_speed": 10.0,
     "flight_p": 0.55,
+    # Aerial-duel launch attribution (aerial.launch_track).  Ships at zero weight: the public
+    # window contains no z coverage and the validated run must not move.  A positive weight
+    # supports the frozen launching team on causal flight frames instead of trusting proximity.
+    "w_air": 0.0,
     "w_tag": 0.0,
     "w_sp": 0.0,
     # Last-touch support.  A visible ball within ``lt_R`` of the player who last touched it is

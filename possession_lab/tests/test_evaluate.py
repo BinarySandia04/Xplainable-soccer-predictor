@@ -6,7 +6,7 @@ import unittest
 
 import numpy as np
 
-from possession_lab.config import A, D, H, N_FRAMES, PUBLIC_START, PUBLIC_STOP, X
+from possession_lab.config import N_FRAMES, PUBLIC_START, PUBLIC_STOP, A, D, H, X
 from possession_lab.evaluate import (
     evaluate_codes,
     full_match_stats,

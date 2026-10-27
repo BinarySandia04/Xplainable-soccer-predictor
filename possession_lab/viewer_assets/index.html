@@ -48,6 +48,10 @@
               <input id="yoloPlayersToggle" type="checkbox" checked>
               Jugadores YOLO
             </label>
+            <label class="overlay-toggle" title="Superpone todas las detecciones YOLO del balón con su decisión: ✓ aceptada, ámbar = recuperada (2.ª etapa ByteTrack), ✗ roja = inalcanzable a velocidad de balón, ⊘ morada = ocluida sobre un jugador, · = baja confianza">
+              <input id="yoloCandidatesToggle" type="checkbox" checked>
+              Candidatos balón
+            </label>
             <span id="videoBuffered" class="mono">buffer —</span>
             <span id="videoDuration" class="mono">duración —</span>
           </div>
@@ -88,8 +92,8 @@
               <input type="checkbox" data-layer="video" checked>
               Balón vídeo
             </label>
-            <label class="layer-toggle" title="Detecciones de YOLO sports-ball tras el filtro físico temporal: una detección inalcanzable a velocidad de balón se descarta">
-              <input type="checkbox" data-layer="yolo">
+            <label class="layer-toggle" title="Detecciones YOLO sports-ball tras la puerta física temporal + 2.ª etapa ByteTrack (recupera el balón en un parpadeo del detector) + guarda de oclusión de Kamble (rechaza el candidato sentado sobre un jugador). Traza la trayectoria continua del balón.">
+              <input type="checkbox" data-layer="yolo" checked>
               YOLO balón
             </label>
             <label class="layer-toggle" title="Balón de consenso del poll multi-fuente">

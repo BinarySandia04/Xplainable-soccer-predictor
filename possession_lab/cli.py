@@ -74,7 +74,7 @@ def _explain_and_write(args: argparse.Namespace, lab, pred) -> None:
 
     try:
         payload = _build_explanations(lab, pred)
-    except Exception as exc:  # noqa: BLE001 - best-effort side artifact
+    except Exception as exc:
         print(f"explanations: omitido ({exc})")
         return
     path = Path(args.output_dir) / EXPLANATIONS_PATH.name
@@ -83,12 +83,10 @@ def _explain_and_write(args: argparse.Namespace, lab, pred) -> None:
 
 
 def cmd_all(args: argparse.Namespace) -> int:
-    from .config import PUBLIC_START, PUBLIC_STOP
-    from .evaluate import evaluate_stress, full_match_stats, public_metrics, to_jsonable
+    from .evaluate import evaluate_stress, full_match_stats, public_metrics
     from .pipeline import (
         load_lab,
         predict_full,
-        public_prediction,
         validate_codes,
         validate_submission_file,
     )
@@ -170,7 +168,12 @@ def cmd_all(args: argparse.Namespace) -> int:
 
 
 def cmd_predict(args: argparse.Namespace) -> int:
-    from .pipeline import load_lab, predict_full, write_submission, validate_submission_file
+    from .pipeline import (
+        load_lab,
+        predict_full,
+        validate_submission_file,
+        write_submission,
+    )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -200,12 +203,27 @@ def cmd_explain(args: argparse.Namespace) -> int:
     return 0
 
 
+def _require_inputs(output_dir: Path, names: tuple[str, ...]) -> bool:
+    """Return False (and say why) when an output file a later stage needs is not there yet."""
+    missing = [name for name in names if not (output_dir / name).is_file()]
+    if missing:
+        print(
+            f"error: {output_dir} has no {', '.join(missing)};"
+            " run `python -m possession_lab predict` (or `all`) first.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def cmd_evaluate(args: argparse.Namespace) -> int:
+    from .config import PUBLIC_GT_PATH
     from .data import load_public_gt, load_submission
     from .evaluate import public_metrics
-    from .config import PUBLIC_GT_PATH
 
     output_dir = Path(args.output_dir)
+    if not _require_inputs(output_dir, ("predictions.csv",)):
+        return 1
     pred = load_submission(output_dir / "predictions.csv")
     metrics = public_metrics(pred, load_public_gt(PUBLIC_GT_PATH), bootstrap_n=args.bootstrap_n)
     _json(output_dir / "metrics_public.json", metrics)
@@ -245,6 +263,8 @@ def cmd_visualize(args: argparse.Namespace) -> int:
     from .visualize import generate_all
 
     output_dir = Path(args.output_dir)
+    if not _require_inputs(output_dir, ("predictions.csv", "metrics_public.json")):
+        return 1
     lab = load_lab(args.data_dir)
     pred = load_submission(output_dir / "predictions.csv")
     metrics = json.loads((output_dir / "metrics_public.json").read_text(encoding="utf-8"))

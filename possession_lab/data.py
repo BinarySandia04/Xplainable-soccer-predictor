@@ -12,6 +12,7 @@ import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -30,6 +31,7 @@ class TrackingData:
     teams: np.ndarray  # (P,) 0 home, 1 away, -1 unknown
     pitch: tuple[float, float]
     n_frames: int
+    ball_height: np.ndarray | None = None  # (N,) metres above ground, NaN when absent
 
     @property
     def n_players(self) -> int:
@@ -74,7 +76,7 @@ class TagTable:
     n_frames: int
 
     @classmethod
-    def empty(cls, n_frames: int) -> "TagTable":
+    def empty(cls, n_frames: int) -> TagTable:
         return cls(
             events=(),
             code_names=(),
@@ -167,6 +169,7 @@ def load_tracking(
 
     ball = np.full((n_frames, 2), np.nan, dtype=np.float32)
     ball_present = np.zeros(n_frames, dtype=bool)
+    ball_height = np.full((n_frames,), np.nan, dtype=np.float32)
     players = np.full((n_frames, n_players, 2), np.nan, dtype=np.float32)
     speeds = np.full((n_frames, n_players), np.nan, dtype=np.float32)
     player_present = np.zeros((n_frames, n_players), dtype=bool)
@@ -191,6 +194,8 @@ def load_tracking(
                     ball[frame, 0] = float(values[0]) * length
                     ball[frame, 1] = float(values[1]) * width
                     ball_present[frame] = True
+                    if len(values) >= 3 and not values[2].upper().startswith("N"):
+                        ball_height[frame] = float(values[2])
 
             player_tokens = parts[1].split(";") if parts[1] else []
             if len(player_tokens) > n_players:
@@ -213,6 +218,7 @@ def load_tracking(
     return TrackingData(
         ball=ball,
         ball_present=ball_present,
+        ball_height=ball_height,
         players=players,
         speeds=speeds,
         player_present=player_present,

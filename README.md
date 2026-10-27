@@ -1,3 +1,14 @@
+# Xplainable Soccer Predictor — More than a Hack 2027
+
+> **Our Proposal:** A gap-aware hybrid Hidden Markov Model with causal ball trajectory filtering, acoustic referee whistle detection, domain event rules, deep video perception with physical continuity gating, multi-source consensus fusion, and an interactive explainability studio.
+> 
+> * **Technical Proposal:** Full documentation in **[PROPOSAL.md](PROPOSAL.md)**.
+> * **Possession Lab:** Implementation details, CLI commands, and reviewer guide in **[possession_lab/README.md](possession_lab/README.md)**.
+> * **Performance:** **0.6519 spellF1** (vs 0.4242 best baseline) and **0.9466 macroF1** (vs 0.5812 best baseline).
+> * **Verification:** 162 passing tests (`pytest`), clean linter (`ruff check .`), and official format validation.
+
+---
+
 # More than a Hack 2027 — Phase 1: Ball Possession
 
 **Organised by [Metrica Sports](https://metrica-sports.com), [FC Barcelona](https://www.fcbarcelona.com)

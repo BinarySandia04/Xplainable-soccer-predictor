@@ -10,7 +10,6 @@ import numpy as np
 
 from possession_lab.data import load_homography, load_smart_tags, load_tracking
 
-
 ATD_XML = """<?xml version="1.0"?>
 <root>
   <Teams>
@@ -66,6 +65,36 @@ class DataLoadingTest(unittest.TestCase):
         self.assertAlmostEqual(float(tracking.speeds[0, 0]), 1.0)
         np.testing.assert_allclose(tracking.players[1, 1], [70.0, 40.0])
         np.testing.assert_array_equal(tracking.teams, [0, 1])
+
+    def test_ball_height_is_parsed_in_metres_and_defaults_to_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "atd.txt"
+            meta = Path(tmp) / "atd.xml"
+            raw.write_text(
+                "1:NaN,NaN,NaN;NaN,NaN,NaN:0.5,0.5,2.5\n"
+                "2:NaN,NaN,NaN;NaN,NaN,NaN:0.5,0.5,NaN\n",
+                encoding="utf-8",
+            )
+            meta.write_text(ATD_XML, encoding="utf-8")
+            tracking = load_tracking(raw, meta, pitch=(100.0, 50.0))
+
+        self.assertAlmostEqual(float(tracking.ball_height[0]), 2.5)
+        self.assertFalse(np.isfinite(tracking.ball_height[1]))
+
+    def test_tracking_data_without_height_stays_constructible(self):
+        from possession_lab.data import TrackingData
+
+        tracking = TrackingData(
+            ball=np.full((3, 2), np.nan, np.float32),
+            ball_present=np.zeros(3, bool),
+            players=np.full((3, 1, 2), np.nan, np.float32),
+            speeds=np.full((3, 1), np.nan, np.float32),
+            player_present=np.zeros((3, 1), bool),
+            teams=np.array([0], dtype=np.int8),
+            pitch=(105.3, 68.0),
+            n_frames=3,
+        )
+        self.assertIsNone(tracking.ball_height)
 
     def test_smart_tags_are_half_open_and_team_vote_is_signed(self):
         with tempfile.TemporaryDirectory() as tmp:

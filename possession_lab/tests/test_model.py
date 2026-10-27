@@ -210,5 +210,190 @@ class StopSignalParametersTest(unittest.TestCase):
         self.assertGreater(np.abs(gated[0] - np.log(1.0 / 3.0)).max(), 1e-3)
 
 
+class OptionalEmissionSignalsTest(unittest.TestCase):
+    """Branches the shipped configuration carries at weight zero.
+
+    Every parameter here is ``0.0`` / ``False`` in ``MODEL_PARAMS``, so the validated run never
+    executes these blocks and nothing in the suite covered them.  They are retuning knobs, so they
+    have to keep working when someone turns one on.
+    """
+
+    def test_w_tag_moves_mass_with_the_smart_tag_vote(self):
+        f = make_feature_namespace()
+        f.tag_vote[:] = 0
+        neutral = emission_log_probs(f, ModelParams())
+        f.tag_vote[0] = 1
+        home = emission_log_probs(f, ModelParams(w_tag=0.5))
+        self.assertGreater(home[0, 0], neutral[0, 0])
+        np.testing.assert_allclose(home[1], neutral[1], atol=1e-12)
+        f.tag_vote[0] = -1
+        away = emission_log_probs(f, ModelParams(w_tag=0.5))
+        self.assertGreater(away[0, 1], neutral[0, 1])
+        np.testing.assert_allclose(away[0, 0], neutral[0, 0], atol=1e-12)
+
+    def test_w_sp_supports_the_dead_ball_state_on_set_pieces(self):
+        f = make_feature_namespace()
+        base = emission_log_probs(f, ModelParams())
+        f.tag_setpiece = np.zeros(7, dtype=np.int8)
+        f.tag_setpiece[0] = 1
+        boosted = emission_log_probs(f, ModelParams(w_sp=0.8))
+        self.assertGreater(boosted[0, 2], base[0, 2])
+        np.testing.assert_allclose(boosted[1], base[1], atol=1e-12)
+
+    def test_w_gap_supports_the_dead_ball_state_on_long_holes(self):
+        f = make_feature_namespace()
+        f.gap[0] = 400
+        base = emission_log_probs(f, ModelParams())
+        boosted = emission_log_probs(f, ModelParams(w_gap=0.5))
+        self.assertGreater(boosted[0, 2], base[0, 2])
+
+    def test_whistle_supports_d_only_where_no_one_controls_the_ball(self):
+        f = make_feature_namespace()
+        f.near_distance[:] = 6.0
+        f.team_speed[:] = 0.0
+        f.whistle_env = np.ones(7, dtype=np.float64)
+        base = emission_log_probs(f, ModelParams())
+        boosted = emission_log_probs(f, ModelParams(w_whistle=1.0))
+        self.assertGreater(boosted[0, 2], base[0, 2])
+
+        f.near_distance[0] = 1.0
+        controlled = emission_log_probs(f, ModelParams(w_whistle=1.0))
+        unweighted = emission_log_probs(f, ModelParams())
+        np.testing.assert_allclose(controlled[0, 2], unweighted[0, 2], atol=1e-12)
+        self.assertGreater(controlled[1, 2], unweighted[1, 2])
+
+    def test_w_est_out_ignores_a_stale_low_confidence_estimate(self):
+        f = make_feature_namespace()
+        f.est_out = np.ones(7, dtype=bool)
+        f.est_confidence = np.ones(7, dtype=np.float64)
+        base = emission_log_probs(f, ModelParams())
+        confident = emission_log_probs(f, ModelParams(w_est_out=0.5))
+        self.assertGreater(confident[0, 2], base[0, 2])
+
+        f.est_confidence[:] = 0.0
+        stale = emission_log_probs(f, ModelParams(w_est_out=0.5))
+        np.testing.assert_allclose(stale[0], base[0], atol=1e-12)
+
+    def test_est_blend_pulls_a_missing_frame_towards_the_reconstructed_ball(self):
+        f = make_feature_namespace()
+        f.est_confidence = np.zeros(7, dtype=np.float64)
+        f.est_confidence[2] = 1.0
+        f.est_d_home = np.full(7, 0.5)
+        f.est_d_away = np.full(7, 12.0)
+        f.est_out = np.zeros(7, dtype=bool)
+        base = emission_log_probs(f, ModelParams())
+        np.testing.assert_allclose(base[2], np.log(1.0 / 3.0), atol=1e-12)
+        blended = emission_log_probs(f, ModelParams(est_blend=0.5))
+        self.assertGreater(blended[2, 0], blended[2, 1])
+        np.testing.assert_allclose(blended[3], base[3], atol=1e-12)
+
+    def test_persist_mode_leaves_every_missing_frame_uniform(self):
+        f = make_feature_namespace()
+        params = ModelParams(gap_thresh=0, miss_mode="persist")
+        logp = emission_log_probs(f, params)
+        np.testing.assert_allclose(logp[~np.asarray(f.present)], np.log(1.0 / 3.0), atol=1e-12)
+
+    def test_hybrid_prox_uses_geometry_but_ignores_the_tag_vote(self):
+        f = make_feature_namespace()
+        f.gap[4] = 500
+        f.tag_vote[4] = 1.0
+        prox = emission_log_probs(f, ModelParams(gap_thresh=2, miss_mode="prox"))
+        hybrid_prox = emission_log_probs(f, ModelParams(gap_thresh=2, miss_mode="hybrid_prox"))
+        hybrid = emission_log_probs(f, ModelParams(gap_thresh=2, miss_mode="hybrid"))
+        np.testing.assert_allclose(hybrid_prox[4], prox[4], atol=1e-12)
+        self.assertGreater(hybrid[4, 0], hybrid_prox[4, 0])
+        # Both hybrid modes keep a short hole uniform; only the long one reads team shape.
+        np.testing.assert_allclose(hybrid[3], np.log(1.0 / 3.0), atol=1e-12)
+        self.assertGreater(hybrid_prox[4, 0], np.log(1.0 / 3.0))
+
+
+class FlightGuardTest(unittest.TestCase):
+    """A ball in flight must not vote for the team it is currently nearer to."""
+
+    def make_flight(self):
+        f = make_feature_namespace()
+        f.ball_speed[:] = 14.0
+        f.d_home[:] = 4.0
+        f.d_away[:] = 8.0
+        f.near_distance[:] = 4.0
+        f.last_touch[:] = 1
+        f.last_touch_age[:] = 0
+        return f
+
+    def test_without_the_guard_distance_votes_for_home(self):
+        logp = emission_log_probs(self.make_flight(), ModelParams())
+        self.assertGreater(logp[0, 0], logp[0, 1])
+
+    def test_flight_keeps_the_mass_with_the_passing_team(self):
+        logp = emission_log_probs(self.make_flight(), ModelParams(flight_R=3.0))
+        self.assertGreater(logp[0, 1], logp[0, 0])
+
+    def test_flight_without_a_known_touch_falls_back_to_the_prior(self):
+        f = self.make_flight()
+        f.last_touch[:] = -1
+        logp = emission_log_probs(f, ModelParams(flight_R=3.0))
+        self.assertAlmostEqual(logp[0, 0], logp[0, 1], places=9)
+
+
+class AerialLaunchEmissionTest(unittest.TestCase):
+    """``w_air`` supports the launch team on causal aerial frames.  Ships at zero weight:
+    the validated submission must not move, and the validated run contains no z coverage."""
+
+    def make_air(self, namespace: SimpleNamespace) -> SimpleNamespace:
+        namespace.air = np.array([True, False, False, False, False, True, True])
+        namespace.air_team = np.array([1, -1, -1, -1, -1, 0, 1], dtype=np.int8)
+        namespace.air_age = np.array([3, 9999, 9999, 9999, 9999, 0, 1], dtype=np.int32)
+        return namespace
+
+    def test_default_params_ship_w_air_at_zero(self):
+        from possession_lab.config import MODEL_PARAMS
+
+        self.assertEqual(ModelParams().w_air, 0.0)
+        self.assertEqual(DEFAULT_PARAMS.w_air, 0.0)
+        self.assertEqual(MODEL_PARAMS.get("w_air", 0.0), 0.0)
+
+    def test_w_air_zero_leaves_emissions_bitwise_identical(self):
+        plain = make_feature_namespace()
+        with_air = self.make_air(make_feature_namespace())
+
+        base = emission_log_probs(plain, DEFAULT_PARAMS)
+        candidate = emission_log_probs(with_air, DEFAULT_PARAMS)
+        self.assertTrue(np.array_equal(base, candidate))
+
+    def test_w_air_adds_only_to_the_launch_team_on_flight_frames(self):
+        from dataclasses import replace
+
+        f = self.make_air(make_feature_namespace())
+        base = emission_log_probs(make_feature_namespace(), DEFAULT_PARAMS)
+        boosted = emission_log_probs(f, replace(DEFAULT_PARAMS, w_air=0.8))
+
+        self.assertAlmostEqual(float(boosted[0, 1] - base[0,1]), 0.8, places=9)
+        self.assertEqual(boosted[0, 0], base[0, 0])
+        self.assertEqual(boosted[0, 2], base[0, 2])
+        # frame 5: flight with launch team home
+        self.assertAlmostEqual(float(boosted[5, 0] - base[5, 0]), 0.8, places=9)
+        # non-flight frames are untouched
+        np.testing.assert_array_equal(boosted[1:5], base[1:5])
+        # frame 6 is out of play: a hard D override, the launch bonus must not apply
+        self.assertEqual(boosted[6, 1], base[6, 1])
+
+    def test_missing_air_fields_are_tolerated(self):
+        from dataclasses import replace
+
+        plain = make_feature_namespace()
+        base = emission_log_probs(plain, DEFAULT_PARAMS)
+        boosted = emission_log_probs(plain, replace(DEFAULT_PARAMS, w_air=0.8))
+        np.testing.assert_array_equal(boosted, base)
+
+    def test_unknown_launch_team_gets_no_bonus(self):
+        from dataclasses import replace
+
+        f = self.make_air(make_feature_namespace())
+        f.air_team[:] = -1
+        base = emission_log_probs(make_feature_namespace(), DEFAULT_PARAMS)
+        boosted = emission_log_probs(f, replace(DEFAULT_PARAMS, w_air=0.8))
+        np.testing.assert_array_equal(boosted, base)
+
+
 if __name__ == "__main__":
     unittest.main()

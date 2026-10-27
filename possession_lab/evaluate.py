@@ -13,15 +13,15 @@ from typing import Any
 import numpy as np
 
 from .config import (
-    A,
-    D,
     GRADED_HALVES,
-    H,
     N_FRAMES,
     PUBLIC_GT_PATH,
     PUBLIC_START,
     PUBLIC_STOP,
     ROOT,
+    A,
+    D,
+    H,
     X,
 )
 from .data import TagTable, TrackingData, load_public_gt
@@ -31,7 +31,7 @@ from .model import DEFAULT_PARAMS, ModelParams, decode
 # The official scorer is a namespace module in evaluation/, not an installed package.
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from evaluation import possession_metrics as pm  # noqa: E402
+from evaluation import possession_metrics as pm
 
 
 def evaluate_codes(gt: np.ndarray, pred: np.ndarray, bootstrap_n: int = 0) -> dict[str, Any]:

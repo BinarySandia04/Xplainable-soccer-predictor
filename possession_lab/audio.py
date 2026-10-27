@@ -40,7 +40,6 @@ from .config import (
     MERGE_GAP_S,
     MIN_EVENT_S,
     N_FRAMES,
-    OUTPUT_DIR,
     W_LOCAL_RATIO,
     W_MIN,
     WHISTLE_CACHE,

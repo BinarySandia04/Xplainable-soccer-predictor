@@ -12,7 +12,6 @@ import pandas as pd
 from .config import (
     CODE_TO_LABEL,
     CONTEXT,
-    D,
     GRADED_HALVES,
     N_FRAMES,
     PITCH,
@@ -20,12 +19,27 @@ from .config import (
     PUBLIC_START,
     PUBLIC_STOP,
     VIDEO_PATH,
+    D,
     X,
     asset_paths,
 )
-from .data import Homography, TagTable, TrackingData, load_homography, load_public_gt, load_smart_tags, load_tracking
+from .data import (
+    Homography,
+    TagTable,
+    TrackingData,
+    load_homography,
+    load_public_gt,
+    load_smart_tags,
+    load_tracking,
+)
 from .evaluate import features_for_window
-from .model import DEFAULT_PARAMS, DecodeResult, ModelParams, decode, merge_isolated_runs
+from .model import (
+    DEFAULT_PARAMS,
+    DecodeResult,
+    ModelParams,
+    decode,
+    merge_isolated_runs,
+)
 
 
 @dataclass(frozen=True)

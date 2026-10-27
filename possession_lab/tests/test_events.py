@@ -12,6 +12,9 @@ from possession_lab.config import D, H
 from possession_lab.data import TagEvent, TagTable, TrackingData
 from possession_lab.events import (
     EventData,
+    StopEvent,
+    _merge_stop_events,
+    _run_end_containing,
     apply_event_overrides,
     detect_goals,
     detect_stoppages,
@@ -181,6 +184,71 @@ class StoppageTest(unittest.TestCase):
         local_out = apply_event_overrides(local, events, start=10, stop=30)
         np.testing.assert_array_equal(local_out[10:], D)
         np.testing.assert_array_equal(local_out[:10], H)
+
+
+class RunEndContainingTest(unittest.TestCase):
+    """The low-motion run that contains the trigger, not merely one that starts earlier."""
+
+    def test_returns_the_end_of_the_containing_run(self):
+        mask = np.zeros(100, dtype=bool)
+        mask[40:60] = True
+        self.assertEqual(_run_end_containing(mask, 45, lookback=10, n=100), 60)
+        self.assertEqual(_run_end_containing(mask, 40, lookback=10, n=100), 60)
+        self.assertEqual(_run_end_containing(mask, 59, lookback=10, n=100), 60)
+
+    def test_a_run_that_only_starts_earlier_is_not_the_stoppage(self):
+        # The old fallback took the first run beginning before `start`, so this returned the end of
+        # the unrelated 10..20 run and misplaced the dead-ball interval by 35 frames.
+        mask = np.zeros(100, dtype=bool)
+        mask[10:20] = True
+        mask[40:60] = True
+        self.assertEqual(_run_end_containing(mask, 45, lookback=60, n=100), 60)
+
+    def test_no_containing_run_returns_none(self):
+        mask = np.zeros(100, dtype=bool)
+        mask[10:20] = True
+        self.assertIsNone(_run_end_containing(mask, 45, lookback=10, n=100))
+
+    def test_result_is_clamped_to_n(self):
+        mask = np.zeros(100, dtype=bool)
+        mask[40:100] = True
+        self.assertEqual(_run_end_containing(mask, 45, lookback=10, n=55), 55)
+
+
+class MergeStopEventsTest(unittest.TestCase):
+    """Merging must not treat frame 0 or a 0.0 peak as a missing value."""
+
+    def test_overlapping_intervals_are_joined(self):
+        first = StopEvent(start=100, end=200, trigger="out", confidence=0.6)
+        second = StopEvent(start=210, end=300, trigger="low_motion", confidence=0.8)
+        merged = _merge_stop_events([first, second])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual((merged[0].start, merged[0].end), (100, 300))
+        self.assertEqual(merged[0].trigger, "low_motion")
+        self.assertEqual(merged[0].confidence, 0.8)
+
+    def test_distant_intervals_stay_separate(self):
+        first = StopEvent(start=100, end=200, trigger="out", confidence=0.6)
+        second = StopEvent(start=1000, end=1100, trigger="low_motion", confidence=0.8)
+        self.assertEqual(len(_merge_stop_events([first, second])), 2)
+
+    def test_frame_zero_is_a_real_whistle_frame(self):
+        first = StopEvent(
+            start=0, end=100, trigger="out", confidence=0.6, whistle_frame=0, whistle_peak=0.0
+        )
+        second = StopEvent(
+            start=50, end=200, trigger="low_motion", confidence=0.4, whistle_frame=7, whistle_peak=1.5
+        )
+        merged = _merge_stop_events([first, second])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].whistle_frame, 0)
+        self.assertEqual(merged[0].whistle_peak, 0.0)
+
+    def test_unset_fields_take_the_first_value_that_is_set(self):
+        first = StopEvent(start=0, end=100, trigger="out", confidence=0.6, low_start=None)
+        second = StopEvent(start=50, end=200, trigger="low_motion", confidence=0.4, low_start=40)
+        merged = _merge_stop_events([first, second])
+        self.assertEqual(merged[0].low_start, 40)
 
 
 if __name__ == "__main__":
