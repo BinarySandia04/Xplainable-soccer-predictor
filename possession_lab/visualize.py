@@ -15,34 +15,32 @@ The figures are not decoration.  Each one answers a question that matters for a 
 from __future__ import annotations
 
 import html
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
-from matplotlib.patches import Circle, Rectangle
 import numpy as np
 import pandas as pd
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Circle, Rectangle
 
 from .config import (
-    A,
     CODE_TO_LABEL,
-    CONTEXT,
-    D,
     FPS,
     GRADED_HALVES,
-    H,
     PUBLIC_START,
     PUBLIC_STOP,
-    X,
+    A,
+    D,
+    H,
 )
 from .data import Homography, TagTable, TrackingData
-from .evaluate import full_match_stats
 from .features import Features
-from .model import DEFAULT_PARAMS, DecodeResult, decode
+from .model import DEFAULT_PARAMS
 from .pipeline import decode_public
 
 LABEL_COLORS = {"H": "#d62728", "A": "#1f77b4", "D": "#6b6b6b", "X": "#e8e8e8"}

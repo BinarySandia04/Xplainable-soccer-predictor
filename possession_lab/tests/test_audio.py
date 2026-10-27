@@ -10,7 +10,12 @@ import unittest
 
 import numpy as np
 
-from possession_lab.audio import band_score, detect_events, envelope, score_per_video_frame
+from possession_lab.audio import (
+    band_score,
+    detect_events,
+    envelope,
+    score_per_video_frame,
+)
 from possession_lab.config import AUDIO_SR, FPS
 
 

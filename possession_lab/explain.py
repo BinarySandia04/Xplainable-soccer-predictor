@@ -28,7 +28,7 @@ from typing import Any
 
 import numpy as np
 
-from .config import A, CODE_TO_LABEL, CONTEXT, D, FPS, GRADED_HALVES, H, X
+from .config import CODE_TO_LABEL, CONTEXT, FPS, GRADED_HALVES, A, D, H, X
 from .data import TagTable, TrackingData
 from .features import Features, extract_features
 from .model import DEFAULT_PARAMS, ModelParams, emission_log_probs
@@ -60,9 +60,13 @@ def find_switches(pred: np.ndarray, halves: tuple[tuple[int, int], ...] = GRADED
         previous = int(pred[start])
         for frame in range(start + 1, stop):
             current = int(pred[frame])
-            if current != previous and current != X and previous != X:
-                if not switches or frame - switches[-1][0] >= SWITCH_DEDUPE_FRAMES:
-                    switches.append((frame, previous, current))
+            if (
+                current != previous
+                and current != X
+                and previous != X
+                and (not switches or frame - switches[-1][0] >= SWITCH_DEDUPE_FRAMES)
+            ):
+                switches.append((frame, previous, current))
             previous = current
     return switches
 

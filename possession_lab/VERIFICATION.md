@@ -7,7 +7,7 @@ Unless noted, commands run from the repository root.
 
 ```text
 $ .venv/bin/python -m pytest -q possession_lab/tests
-81 passed, 4 subtests passed in 5.32s
+162 passed, 4 subtests passed in 10.57s
 
 $ .venv/bin/python -m compileall -q possession_lab
 $ node --check possession_lab/viewer_assets/viewer.js
@@ -22,7 +22,9 @@ structure, CSV writing, preflight validation, the explanation layer, and the loc
 raw/Kalman/combined layer payloads and trails, UT scoring/editing/persistence and boundary moves,
 byte ranges, HTTP 206/416/HEAD, API, and route whitelist). `test_kalman.py` adds five tests for
 the constant-velocity fit, short-hole prediction, long-hole refusal, outlier rejection, missing
-observations, and gap age.
+observations, and gap age. `test_aerial.py` adds seven tests for the causal flight detector and
+launch-team freeze (speed impulse, height trigger, hold, landing, rekick re-anchor, and
+past-only decisions).
 
 ## Regenerated outputs
 
@@ -89,6 +91,40 @@ long    HMM gap-aware      0.3840    0.6387    0.5602     8
 
 Random and long each remove about 40.7% of the public window. The gap-aware HMM beats both
 baselines on every mask; the long holes are the hardest case.
+
+## Aerial duel attribution (`w_air`)
+
+The ATD ball is a 2-D ground projection, so during a flight the nearest tracked slot is the player
+*under* the ball, not the toucher. `possession_lab/aerial.py:launch_track` marks flight frames
+causally (speed ≥ 8 m/s with a ≥ 4 m/s one-step gain, or optional ball z ≥ 1.8 m; the hold ends
+below 2.5 m/s near the ground, a rekick re-anchors, cap 3 s) and freezes the nearest team at the
+launch. `Features.air/air_team/air_age` feed one additive log-emission knob, `w_air`, that
+supports the launch team on `air ∧ present ∧ ¬out_of_play ∧ ¬dead ∧ team ≥ 0` frames. It ships at
+**0.0**, and `w_air = 0` skips the block entirely, so the validated submission cannot move:
+regenerated `predictions.csv` stayed `75b1968adad6795169aca4813d4ef38e` and
+`fusion_predictions.csv` stayed `648cd7885e556a4677cfebf34185f13d`.
+
+Measured on the public window (7,500 frames, `evaluation/gt/BAR-ATH_possession_gt_public.csv`):
+
+```text
+air frames                      257 (3.43%), launch team known on all 257
+agreement vs GT (GT ∈ {H,A})    launch team 79.8%  vs  proximity 81.0%  (n = 248)
+per-frame swing                 recovers 14 of 47 proximity-wrong frames,
+                                breaks 17 of 201 proximity-right frames → net −3
+decode, w_air ∈ {0.4,0.8,1.5}   spellF1 0.6286 | macroF1 0.9242  (baseline 0.6519 / 0.9466)
+single decode change            one 300-frame run [17,047–17,346] flips A→H while GT says A
+threshold sweep                 10 m/s launch or Δv 6 m/s: 105 air frames, 0 recovered / 0 broken
+z-only detector                 0 air frames in the window (the public segment has no z coverage)
+whole match                     11,787 dynamic flight frames (5.91%); z-confirmed flight 3,170
+                                frames, of which 900 (28.4%) have proximity voting another team
+                                than the frozen toucher
+```
+
+The failure mode the knob targets is real — on the z-confirmed flights outside the graded window
+proximity votes against the toucher 28.4% of the time — but inside the only graded window the
+dynamic detector's launch attribution does not beat proximity, and the Viterbi amplifies the 17
+broken frames into one spell flip that costs spellF1. The mechanism is fully tested and stays
+shipped at zero weight, ready for any future window that carries ball z.
 
 ## Events
 

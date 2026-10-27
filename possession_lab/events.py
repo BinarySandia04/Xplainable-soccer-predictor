@@ -15,7 +15,7 @@ else (possession, ordinary out-of-play) remains the HMM's job.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -126,6 +126,62 @@ def _runs(mask: np.ndarray, min_len: int = 1) -> list[tuple[int, int]]:
         for start, stop in zip(edges[::2], edges[1::2])
         if int(stop) - int(start) >= min_len
     ]
+
+
+def _run_end_containing(mask: np.ndarray, start: int, lookback: int, n: int) -> int | None:
+    """End (exclusive) of the True-run of ``mask`` that *contains* ``start``, else ``None``.
+
+    The scan begins ``lookback`` frames earlier so a run that started before the trigger is still
+    found.  Requiring containment matters: a run that merely begins before ``start`` is not the
+    stoppage's low-motion interval, and treating it as one misplaced the dead-ball end and let a
+    hard ``D`` override bleed into live frames.
+    """
+    offset = max(0, int(start) - int(lookback))
+    for run_start, run_stop in _runs(np.asarray(mask, dtype=bool)[offset:], min_len=1):
+        if offset + run_start <= start < offset + run_stop:
+            return min(int(n), offset + run_stop)
+    return None
+
+
+def _merge_stop_events(candidates: list[StopEvent]) -> list[StopEvent]:
+    """Join overlapping or adjacent stoppage intervals into one per stoppage.
+
+    ``candidates`` must be sorted by ``(start, end)``.  Intervals that touch within a second are
+    joined so a throw-in is not split into a dozen one-second pieces: the earliest start and the
+    latest end win, the stronger trigger survives, and every optional field keeps the first value
+    that is actually set.  ``is not None`` is used rather than truthiness because frame ``0`` and
+    peak ``0.0`` are legitimate values, not missing ones.
+    """
+    merged: list[StopEvent] = []
+    for event in candidates:
+        if merged and event.start <= merged[-1].end + FPS:
+            previous = merged[-1]
+            merged[-1] = replace(
+                previous,
+                start=min(previous.start, event.start),
+                end=max(previous.end, event.end),
+                trigger=previous.trigger
+                if previous.confidence >= event.confidence
+                else event.trigger,
+                confidence=max(previous.confidence, event.confidence),
+                whistle_frame=(
+                    previous.whistle_frame
+                    if previous.whistle_frame is not None
+                    else event.whistle_frame
+                ),
+                whistle_peak=(
+                    previous.whistle_peak
+                    if previous.whistle_peak is not None
+                    else event.whistle_peak
+                ),
+                low_start=(
+                    previous.low_start if previous.low_start is not None else event.low_start
+                ),
+                low_stop=previous.low_stop if previous.low_stop is not None else event.low_stop,
+            )
+        else:
+            merged.append(event)
+    return merged
 
 
 def _missing_runs(track: BallTrack) -> list[tuple[int, int]]:
@@ -469,8 +525,8 @@ def detect_stoppages(
         restart_floor = kwargs.pop("restart_floor", None)
         low_stop = kwargs.get("low_stop")
         if low_stop is None:
-            run = next(((a, b) for a, b in _runs(low[max(0, start - FPS) :], min_len=1) if start - FPS + a <= start), None)
-            low_stop = start + (run[1] - run[0]) if run else min(n, start + 5 * FPS)
+            end_of_run = _run_end_containing(low, start, FPS, n)
+            low_stop = end_of_run if end_of_run is not None else min(n, start + 5 * FPS)
         end = min(n, int(low_stop) + int(round(search_s * FPS)))
         control = _control_resume(start, end + 50, present, near_distance, gap)
         if control is not None:
@@ -570,22 +626,7 @@ def detect_stoppages(
     # Merge overlapping/adjacent intervals.  Prefer the stronger trigger and remember the earliest
     # start; this keeps a throw-in from being split into a dozen one-second pieces.
     candidates.sort(key=lambda event: (event.start, event.end))
-    merged: list[StopEvent] = []
-    for event in candidates:
-        if merged and event.start <= merged[-1].end + FPS:
-            previous = merged[-1]
-            merged[-1] = StopEvent(
-                start=min(previous.start, event.start),
-                end=max(previous.end, event.end),
-                trigger=previous.trigger if previous.confidence >= event.confidence else event.trigger,
-                confidence=max(previous.confidence, event.confidence),
-                whistle_frame=previous.whistle_frame or event.whistle_frame,
-                whistle_peak=previous.whistle_peak if previous.whistle_peak is not None else event.whistle_peak,
-                low_start=previous.low_start if previous.low_start is not None else event.low_start,
-                low_stop=previous.low_stop if previous.low_stop is not None else event.low_stop,
-            )
-        else:
-            merged.append(event)
+    merged = _merge_stop_events(candidates)
 
     # A kick-off tag is an explicit restart.  Without this trim, a long out-of-play/retrieval gap
     # that began before the kick-off can leak a hard D override into the first live frames (the
@@ -597,18 +638,11 @@ def detect_stoppages(
     ]
     trimmed: list[StopEvent] = []
     for event in merged:
-        restart = next((k for k in kickoffs if event.start <= k < event.end), None)
+        # The earliest kick-off inside the interval, not whichever one the tag file happens to list
+        # first: trimming to a later one would keep the hard D override over live frames.
+        restart = min((k for k in kickoffs if event.start <= k < event.end), default=None)
         if restart is not None and restart > event.start:
-            event = StopEvent(
-                start=event.start,
-                end=int(restart),
-                trigger=event.trigger,
-                confidence=event.confidence,
-                whistle_frame=event.whistle_frame,
-                whistle_peak=event.whistle_peak,
-                low_start=event.low_start,
-                low_stop=event.low_stop,
-            )
+            event = replace(event, end=int(restart))
         if event.end > event.start:
             trimmed.append(event)
     return tuple(trimmed)

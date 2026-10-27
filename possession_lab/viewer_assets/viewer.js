@@ -51,6 +51,7 @@
     overlay: $("#overlay"),
     overlayToggle: $("#overlayToggle"),
     yoloPlayersToggle: $("#yoloPlayersToggle"),
+    yoloCandidatesToggle: $("#yoloCandidatesToggle"),
     layerToggles: Array.from(document.querySelectorAll("[data-layer]")),
     pitchMap: $("#pitchMap"),
     pitchStatus: $("#pitchStatus"),
@@ -153,8 +154,9 @@
     switchFilter: "all",
     switchFrames: [],
     overlayEnabled: true,
-    layers: { raw: true, kalman: true, combined: true, video: true, yolo: false, fusion: true },
+    layers: { raw: true, kalman: true, combined: true, video: true, yolo: true, fusion: true },
     yoloPlayersEnabled: true,
+    yoloCandidatesEnabled: true,
     frameData: null,
     frameDataRequest: null,
     frameCache: new Map(),
@@ -547,15 +549,24 @@
     }
     if (layer === "yolo") {
       const radius = 3.4 * scale;
+      const recovered = Boolean(data.recovered);
+      ctx.save();
+      if (recovered) {
+        ctx.strokeStyle = "rgba(255, 200, 87, 0.95)";
+        ctx.fillStyle = "rgba(255, 200, 87, 0.95)";
+        ctx.setLineDash([2.5, 2]);
+      }
       ctx.beginPath();
       ctx.rect(x - radius, y - radius, radius * 2, radius * 2);
-      ctx.lineWidth = 1.3;
-      ctx.strokeStyle = color;
+      ctx.lineWidth = recovered ? 1.6 : 1.3;
+      ctx.strokeStyle = recovered ? "rgba(255, 200, 87, 0.95)" : color;
       ctx.stroke();
+      ctx.setLineDash([]);
       ctx.beginPath();
       ctx.arc(x, y, 1.1 * scale, 0, Math.PI * 2);
-      ctx.fillStyle = color;
+      ctx.fillStyle = recovered ? "rgba(255, 200, 87, 0.95)" : color;
       ctx.fill();
+      ctx.restore();
       return;
     }
     ctx.save();
@@ -669,6 +680,66 @@
     ctx.restore();
   }
 
+  // Decision codes mirror BALL_CAND_* in possession_lab/perception.py.  The accepted winner is drawn
+  // by drawLayerBall, so this overlay only draws the *other* candidates to make the physical gate
+  // visible: what YOLO saw, and why the tracker kept or discarded each one.
+  const YOLO_CAND = {
+    low: 0,
+    accepted: 1,
+    recovered: 2,
+    unreachable: 3,
+    occluded: 4,
+    unselected: 5,
+  };
+
+  function drawBallCandidates(ctx, frameData, xOf, yOf, coordinates, scale = 1) {
+    if (!state.layers.yolo || !state.yoloCandidatesEnabled) return;
+    const candidates = frameData && frameData.yolo_candidates;
+    if (!Array.isArray(candidates) || candidates.length === 0) return;
+    ctx.save();
+    ctx.lineWidth = 1.2;
+    for (const c of candidates) {
+      const cx = coordinates === "video" ? c.px : c.x;
+      const cy = coordinates === "video" ? c.py : c.y;
+      if (cx === null || cx === undefined || cy === null || cy === undefined) continue;
+      if (!Number.isFinite(Number(cx)) || !Number.isFinite(Number(cy))) continue;
+      const x = xOf(Number(cx));
+      const y = yOf(Number(cy));
+      const r = 3.2 * scale;
+      if (c.decision === YOLO_CAND.accepted || c.decision === YOLO_CAND.recovered) continue;
+      if (c.decision === YOLO_CAND.unreachable) {
+        ctx.strokeStyle = "rgba(255, 107, 95, 0.9)";
+        ctx.beginPath();
+        ctx.moveTo(x - r, y - r);
+        ctx.lineTo(x + r, y + r);
+        ctx.moveTo(x + r, y - r);
+        ctx.lineTo(x - r, y + r);
+        ctx.stroke();
+      } else if (c.decision === YOLO_CAND.occluded) {
+        // A low-confidence detection sitting on a player: kept out as a likely shirt patch.
+        ctx.strokeStyle = "rgba(198, 120, 255, 0.95)";
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x - r * 0.7, y + r * 0.7);
+        ctx.lineTo(x + r * 0.7, y - r * 0.7);
+        ctx.stroke();
+      } else if (c.decision === YOLO_CAND.unselected) {
+        ctx.strokeStyle = "rgba(120, 200, 230, 0.5)";
+        ctx.beginPath();
+        ctx.arc(x, y, r * 0.85, 0, Math.PI * 2);
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = "rgba(150, 160, 170, 0.55)";
+        ctx.beginPath();
+        ctx.arc(x, y, 1.3 * scale, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
   function drawPitchMap() {
     const data = state.data;
     const frameData =
@@ -753,6 +824,7 @@
     ctx.clip();
 
     drawLayerTrails(ctx, frameData, xOf, yOf, "pitch");
+    drawBallCandidates(ctx, frameData, xOf, yOf, "pitch", 1);
 
     const playerRadius = clamp(width * 0.0042, 3.5, 6);
     for (const player of (frameData && frameData.players) || []) {
@@ -838,6 +910,7 @@
     const yOf = (py) => py * scaleY;
 
     drawLayerTrails(ctx, frameData, xOf, yOf, "video");
+    drawBallCandidates(ctx, frameData, xOf, yOf, "video", 1);
 
     for (const player of frameData.players || []) {
       if (player.px === null || player.px === undefined || player.py === null || player.py === undefined) {
@@ -2294,6 +2367,13 @@
       ui.yoloPlayersToggle.checked = state.yoloPlayersEnabled;
       ui.yoloPlayersToggle.addEventListener("change", () => {
         state.yoloPlayersEnabled = ui.yoloPlayersToggle.checked;
+        drawOverlay();
+      });
+    }
+    if (ui.yoloCandidatesToggle) {
+      ui.yoloCandidatesToggle.checked = state.yoloCandidatesEnabled;
+      ui.yoloCandidatesToggle.addEventListener("change", () => {
+        state.yoloCandidatesEnabled = ui.yoloCandidatesToggle.checked;
         drawOverlay();
       });
     }

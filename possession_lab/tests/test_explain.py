@@ -9,7 +9,11 @@ from types import SimpleNamespace
 import numpy as np
 
 from possession_lab.config import A, D, H, X
-from possession_lab.explain import build_explanations, build_switch_records, find_switches
+from possession_lab.explain import (
+    build_explanations,
+    build_switch_records,
+    find_switches,
+)
 from possession_lab.model import ModelParams, emission_log_probs
 
 
@@ -124,7 +128,10 @@ class SwitchReasonsTest(unittest.TestCase):
         records = self.records(features)
         parked = next(r for r in records[0]["reasons"] if r["kind"] == "parked")
         for value in parked["evidence"].values():
-            self.assertTrue(value is None or value == value, f"NaN in {parked['evidence']}")
+            self.assertTrue(
+                value is None or not (isinstance(value, (float, np.floating)) and np.isnan(value)),
+                f"NaN in {parked['evidence']}",
+            )
         json.loads(json.dumps(build_explanations(  # strict round-trip: no NaN/Infinity tokens
             np.array([H] * 110 + [D] * 70, dtype=np.int8), features, 0, None, halves=((0, 180),)
         )))

@@ -3,19 +3,26 @@
 from __future__ import annotations
 
 import json
+import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import unittest
 
 import numpy as np
 
 from possession_lab.perception import (
+    BALL_CAND_ACCEPTED,
+    BALL_CAND_RECOVERED,
+    BALL_CAND_REJECTED_LOW,
+    BALL_CAND_REJECTED_OCCLUDED,
+    BALL_CAND_REJECTED_UNREACHABLE,
     VideoBallTracker,
-    _GreedyTracker,
     _empty_perception,
+    _GreedyTracker,
+    _run_ball_track,
+    annotate_ball_candidates,
     load_perception,
-    pixel_to_pitch,
     pitch_to_pixel,
+    pixel_to_pitch,
     save_perception,
     select_plausible_ball_detections,
 )
@@ -280,6 +287,108 @@ class PlausibleBallSelectionTest(unittest.TestCase):
         self.assertTrue(np.isfinite(ball[1]).all())
         self.assertTrue(np.isnan(ball[2]).all())
         np.testing.assert_allclose(ball[3], points[3], atol=1e-9)
+
+
+class BallAssociationExtensionsTest(unittest.TestCase):
+    """Second-stage (ByteTrack/BotSORT) recovery, occlusion guard, decisions and track ids."""
+
+    def _build(self, per_sample, frames):
+        samples = len(per_sample)
+        cols = max(len(row) for row in per_sample)
+        points = np.full((samples, cols, 2), np.nan, dtype=np.float64)
+        confidence = np.zeros((samples, cols), dtype=np.float64)
+        present = np.zeros((samples, cols), dtype=bool)
+        for i, row in enumerate(per_sample):
+            for j, (x, y, c) in enumerate(row):
+                points[i, j] = [x, y]
+                confidence[i, j] = c
+                present[i, j] = True
+        return points, confidence, present, np.asarray(frames, dtype=np.float64)
+
+    def test_second_stage_recovers_a_flicker_only_when_enabled(self):
+        args = self._build(
+            [[(10.0, 10.0, 0.8)], [(10.2, 10.0, 0.8)], [(10.4, 10.0, 0.10)]],
+            [0, 5, 10],
+        )
+        ball, _, status, _ = select_plausible_ball_detections(*args)
+        self.assertTrue(np.isnan(ball[2]).all())
+        self.assertEqual(int(status[2]), 2)
+
+        ball, _, status, selected = select_plausible_ball_detections(*args, low_confidence_floor=0.05)
+        self.assertEqual(int(status[2]), 3)
+        np.testing.assert_allclose(ball[2], [10.4, 10.0], atol=1e-9)
+        self.assertEqual(int(selected[2]), 0)
+
+    def test_second_stage_never_seeds_a_track_on_its_own(self):
+        args = self._build([[(10.0, 10.0, 0.10)], [(10.2, 10.0, 0.10)]], [0, 5])
+        ball, _, status, _ = select_plausible_ball_detections(*args, low_confidence_floor=0.05)
+        self.assertTrue(np.isnan(ball).all())
+        self.assertTrue((status == 2).all())
+
+    def test_occlusion_guard_drops_a_low_confidence_ball_on_a_player(self):
+        args = self._build(
+            [[(10.0, 10.0, 0.8)], [(10.2, 10.0, 0.8)], [(10.4, 10.0, 0.10)]],
+            [0, 5, 10],
+        )
+        players = np.full((3, 1, 2), np.nan, dtype=np.float64)
+        players[2, 0] = [10.4, 10.0]  # a player standing exactly on the recovery candidate
+
+        _, _, status_oc, _ = select_plausible_ball_detections(
+            *args, low_confidence_floor=0.05, player_points=players, occlusion_radius_m=0.5
+        )
+        self.assertEqual(int(status_oc[2]), 2)  # recovery rejected as a shirt patch
+        decisions = annotate_ball_candidates(
+            *args, low_confidence_floor=0.05, player_points=players, occlusion_radius_m=0.5
+        )
+        self.assertEqual(int(decisions[2, 0]), BALL_CAND_REJECTED_OCCLUDED)
+
+    def test_occlusion_guard_never_touches_a_confident_stage_one_detection(self):
+        args = self._build(
+            [[(10.0, 10.0, 0.8)], [(10.2, 10.0, 0.8)]],
+            [0, 5],
+        )
+        players = np.full((2, 1, 2), np.nan, dtype=np.float64)
+        players[1, 0] = [10.2, 10.0]
+        _, _, status, _ = select_plausible_ball_detections(
+            *args, player_points=players, occlusion_radius_m=0.5
+        )
+        self.assertEqual(int(status[1]), 0)  # stage 1 is unchanged by the guard
+
+    def test_annotate_labels_accepted_unreachable_and_low(self):
+        args = self._build(
+            [[(10.0, 10.0, 0.8)], [(10.2, 10.0, 0.8)], [(10.4, 10.0, 0.8), (60.0, 10.0, 0.8), (10.3, 10.0, 0.1)]],
+            [0, 5, 10],
+        )
+        decisions = annotate_ball_candidates(*args)
+        self.assertEqual(int(decisions[2, 0]), BALL_CAND_ACCEPTED)
+        self.assertEqual(int(decisions[2, 1]), BALL_CAND_REJECTED_UNREACHABLE)
+        self.assertEqual(int(decisions[2, 2]), BALL_CAND_REJECTED_LOW)
+
+    def test_annotate_marks_a_recovery_as_recovered(self):
+        args = self._build(
+            [[(10.0, 10.0, 0.8)], [(10.2, 10.0, 0.8)], [(10.4, 10.0, 0.10)]],
+            [0, 5, 10],
+        )
+        decisions = annotate_ball_candidates(*args, low_confidence_floor=0.05)
+        self.assertEqual(int(decisions[2, 0]), BALL_CAND_RECOVERED)
+
+    def test_track_id_splits_across_a_physical_gap(self):
+        args = self._build(
+            [
+                [(10.0, 10.0, 0.8)],
+                [(10.2, 10.0, 0.8)],
+                [(10.4, 10.0, 0.8)],
+                [(30.0, 30.0, 0.8)],
+                [(30.2, 30.0, 0.8)],
+            ],
+            [0, 5, 10, 400, 405],
+        )
+        result = _run_ball_track(*args)
+        self.assertEqual(int(result.track_id[0]), -1)  # seeding frame is not an accepted detection
+        self.assertEqual(int(result.track_id[1]), 0)
+        self.assertEqual(int(result.track_id[2]), 0)
+        self.assertEqual(int(result.track_id[3]), -1)  # new seed after the gap
+        self.assertEqual(int(result.track_id[4]), 1)
 
 
 class PerceptionCacheTest(unittest.TestCase):

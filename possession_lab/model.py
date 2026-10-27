@@ -49,6 +49,7 @@ class ModelParams:
     flight_R: float = 0.0
     flight_speed: float = 10.0
     flight_p: float = 0.55
+    w_air: float = 0.0
     w_tag: float = 0.0
     w_sp: float = 0.0
     w_lt: float = 0.0
@@ -70,7 +71,7 @@ class ModelParams:
     loose_stop_gate: bool = False
 
     @classmethod
-    def from_mapping(cls, values: dict[str, Any] | None = None) -> "ModelParams":
+    def from_mapping(cls, values: dict[str, Any] | None = None) -> ModelParams:
         if values is None:
             return cls(**MODEL_PARAMS)
         merged = dict(MODEL_PARAMS)
@@ -308,6 +309,26 @@ def emission_log_probs(features: Any, params: ModelParams = DEFAULT_PARAMS) -> n
             q /= q.sum(axis=1, keepdims=True)
             log_emission[flight] = np.log(q)
 
+    # Aerial duels: causal flight frames where ``aerial.launch_track`` froze the launching
+    # team.  The ATD ball is a ground projection, so while the ball is in the air the nearest
+    # player is often one *under* the flight and the proximity Gaussian actively votes for the
+    # wrong team; the speed gate above has already erased most of that vote, and this restores
+    # it to the last toucher.  Support only the launch team and leave D's mass untouched;
+    # out-of-play frames are a hard override and get no bonus.
+    if params.w_air and hasattr(features, "air"):
+        air = np.asarray(features.air, dtype=bool)
+        if air.size == n and air.any():
+            launch_team = np.asarray(features.air_team, dtype=np.int8)
+            dead = (
+                np.asarray(getattr(features, "stop_dead", False), dtype=bool)
+                | np.asarray(getattr(features, "goal_dead", False), dtype=bool)
+                | np.asarray(getattr(features, "parked_edge", False), dtype=bool)
+            )
+            hit = air & present & ~out_of_play & ~dead & (launch_team >= 0)
+            if hit.any():
+                rows = np.flatnonzero(hit)
+                log_emission[rows, launch_team[hit]] += params.w_air
+
     # Tracker reconstruction for short holes.  The tracker only fills up to a bounded time and
     # its confidence decays with age, so this cannot invent possession across a long dead-ball gap.
     if params.est_blend > 0 and missing.any() and hasattr(features, "est_confidence"):
@@ -413,7 +434,7 @@ def merge_isolated_runs(codes: np.ndarray, min_frames: int = FPS) -> np.ndarray:
     for start, stop in zip(starts, stops):
         if (
             stop - start < min_frames
-            and 0 < start
+            and start > 0
             and stop < out.size
             and out[start] != X
             and out[start - 1] == out[stop] != X
