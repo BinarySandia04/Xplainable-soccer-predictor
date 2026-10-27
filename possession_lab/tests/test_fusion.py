@@ -6,25 +6,25 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest import mock
 
 import numpy as np
 
 from possession_lab.config import A, D, H
 from possession_lab.data import TagTable, TrackingData
 from possession_lab.features import extract_features
-from possession_lab.fusion import (
-    _reason,
-    _resample_perception,
-    build_fusion,
-    load_fusion,
-    save_fusion,
-)
+from possession_lab.fusion import build_fusion, load_fusion, save_fusion
+from possession_lab.fusion.ballot import ballot_reason
+from possession_lab.fusion.resample import resample_perception
 from possession_lab.perception import _empty_perception
 
 
+def graded(n: int) -> tuple[tuple[int, int], ...]:
+    """One graded window covering the whole synthetic clip, for deterministic decodes."""
+    return ((0, n),)
+
+
 def make_tracking(n: int = 80) -> TrackingData:
-    # The ball is firmly with Barcelona for the first half and Athletic for the second.  The
+    # The ball is firmly with Barcelona for the first half and Athletic for the second. The
     # synthetic geometry is deliberately simple: fusion tests are about ballots, not football.
     players = np.zeros((n, 2, 2), dtype=np.float32)
     players[:, 0] = [10.0, 34.0]
@@ -56,13 +56,13 @@ class FusionBuildTest(unittest.TestCase):
 
     def test_ballots_anchor_on_the_validated_hmm_and_keep_roles(self):
         tracking, tags, features, baseline = self._build()
-        with mock.patch("possession_lab.fusion.GRADED_HALVES", ((0, tracking.n_frames),)):
-            result = build_fusion(
-                tracking,
-                tags,
-                features=features,
-                baseline_codes=baseline,
-            )
+        result = build_fusion(
+            tracking,
+            tags,
+            features=features,
+            baseline_codes=baseline,
+            halves=graded(tracking.n_frames),
+        )
         self.assertEqual(result.codes.shape, (tracking.n_frames,))
         self.assertEqual(result.fused_probability.shape, (tracking.n_frames, 3))
         np.testing.assert_allclose(result.fused_probability.sum(axis=1), 1.0, atol=1e-9)
@@ -102,14 +102,14 @@ class FusionBuildTest(unittest.TestCase):
             goal_dead=goal,
             stop_dead=np.zeros(tracking.n_frames, dtype=bool),
         )
-        with mock.patch("possession_lab.fusion.GRADED_HALVES", ((0, tracking.n_frames),)):
-            result = build_fusion(
-                tracking,
-                tags,
-                features=features,
-                events=events,
-                baseline_codes=baseline,
-            )
+        result = build_fusion(
+            tracking,
+            tags,
+            features=features,
+            events=events,
+            baseline_codes=baseline,
+            halves=graded(tracking.n_frames),
+        )
         self.assertTrue(result.event_dead[40:45].all())
         np.testing.assert_array_equal(result.codes[40:45], np.full(5, D, dtype=np.int8))
         self.assertFalse(result.event_dead[39])
@@ -117,34 +117,35 @@ class FusionBuildTest(unittest.TestCase):
 
     def test_linear_pool_is_available_and_unknown_modes_are_rejected(self):
         tracking, tags, features, baseline = self._build(40)
-        with mock.patch("possession_lab.fusion.GRADED_HALVES", ((0, tracking.n_frames),)):
-            linear = build_fusion(
+        linear = build_fusion(
+            tracking,
+            tags,
+            features=features,
+            baseline_codes=baseline,
+            combine_mode="linear",
+            halves=graded(tracking.n_frames),
+        )
+        self.assertEqual(linear.fused_probability.shape, (tracking.n_frames, 3))
+        with self.assertRaises(ValueError):
+            build_fusion(
                 tracking,
                 tags,
                 features=features,
                 baseline_codes=baseline,
-                combine_mode="linear",
+                combine_mode="magic",
+                halves=graded(tracking.n_frames),
             )
-            self.assertEqual(linear.fused_probability.shape, (tracking.n_frames, 3))
-            with self.assertRaises(ValueError):
-                build_fusion(
-                    tracking,
-                    tags,
-                    features=features,
-                    baseline_codes=baseline,
-                    combine_mode="magic",
-                )
 
     def test_cache_round_trip_preserves_codes_and_combine_mode(self):
         tracking, tags, features, baseline = self._build(40)
-        with mock.patch("possession_lab.fusion.GRADED_HALVES", ((0, tracking.n_frames),)):
-            result = build_fusion(
-                tracking,
-                tags,
-                features=features,
-                baseline_codes=baseline,
-                combine_mode="linear",
-            )
+        result = build_fusion(
+            tracking,
+            tags,
+            features=features,
+            baseline_codes=baseline,
+            combine_mode="linear",
+            halves=graded(tracking.n_frames),
+        )
         with TemporaryDirectory() as temp:
             path = Path(temp) / "fusion.npz"
             save_fusion(path, result)
@@ -159,14 +160,14 @@ class FusionBuildTest(unittest.TestCase):
 
     def test_cache_can_omit_the_baseline_comparison(self):
         tracking, tags, features, baseline = self._build(40)
-        with mock.patch("possession_lab.fusion.GRADED_HALVES", ((0, tracking.n_frames),)):
-            result = build_fusion(
-                tracking,
-                tags,
-                features=features,
-                baseline_codes=baseline,
-                include_baseline=False,
-            )
+        result = build_fusion(
+            tracking,
+            tags,
+            features=features,
+            baseline_codes=baseline,
+            include_baseline=False,
+            halves=graded(tracking.n_frames),
+        )
         self.assertIsNone(result.baseline_codes)
         with TemporaryDirectory() as temp:
             path = Path(temp) / "fusion.npz"
@@ -188,7 +189,7 @@ class SourceReasonTest(unittest.TestCase):
             "count": np.array([18], dtype=np.int16),
             "source": np.array([3], dtype=np.int8),
         }
-        reason = _reason("video_ball", 0, details, active=True)
+        reason = ballot_reason("video_ball", 0, details, active=True)
         self.assertIn("anclado a ATD", reason)
         self.assertIn("Barça 2.5 m", reason)
         self.assertIn("18 jugadores", reason)
@@ -212,7 +213,7 @@ class PerceptionResampleTest(unittest.TestCase):
         perception.ball_source[0] = 0
         perception.ball_pitch[0] = [52.65, 34.0]
         perception.ball_confidence[0] = 0.9
-        video = _resample_perception(perception, 30)
+        video = resample_perception(perception, 30)
         self.assertEqual(video["ball_source"][0], 0)
         self.assertEqual(video["ball_source"][8], 0)
         self.assertEqual(video["ball_source"][9], 2)
@@ -236,7 +237,7 @@ class PerceptionResampleTest(unittest.TestCase):
             perception.yolo_ball_present[sample, 0] = True
             perception.yolo_ball_pitch[sample, 0] = point
             perception.yolo_ball_confidence[sample, 0] = 0.9
-        video = _resample_perception(perception, 30)
+        video = resample_perception(perception, 30)
         self.assertTrue(video["yolo_ball_present"][5, 0])
         np.testing.assert_allclose(video["yolo_ball"][5, 0], [10.2, 10.0], atol=1e-6)
         self.assertFalse(video["yolo_ball_present"][10, 0])

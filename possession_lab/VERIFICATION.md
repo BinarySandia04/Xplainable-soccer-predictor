@@ -7,7 +7,7 @@ Unless noted, commands run from the repository root.
 
 ```text
 $ .venv/bin/python -m pytest -q possession_lab/tests
-162 passed, 4 subtests passed in 10.57s
+169 passed, 4 subtests passed in 10.60s
 
 $ .venv/bin/python -m compileall -q possession_lab
 $ node --check possession_lab/viewer_assets/viewer.js
@@ -24,7 +24,9 @@ byte ranges, HTTP 206/416/HEAD, API, and route whitelist). `test_kalman.py` adds
 the constant-velocity fit, short-hole prediction, long-hole refusal, outlier rejection, missing
 observations, and gap age. `test_aerial.py` adds seven tests for the causal flight detector and
 launch-team freeze (speed impulse, height trigger, hold, landing, rekick re-anchor, and
-past-only decisions).
+past-only decisions). `test_voters.py` adds seven contract tests for the voter registry
+(protocol conformance, key/weight coverage, the pinned accumulation order, the role map,
+ballot shape, prior/override weight semantics, and the diagnostics cache round trip).
 
 ## Regenerated outputs
 
@@ -125,6 +127,32 @@ proximity votes against the toucher 28.4% of the time — but inside the only gr
 dynamic detector's launch attribution does not beat proximity, and the Viterbi amplifies the 17
 broken frames into one spell flip that costs spellF1. The mechanism is fully tested and stays
 shipped at zero weight, ready for any future window that carries ball z.
+
+## Fusion voter architecture (refactor, no behavior change)
+
+The 1,047-line `fusion.py` became the `possession_lab/fusion/` package: one concern per module
+(`ballot` contracts, `geometry` primitives, `resample` perception adapter, `voters` registry,
+`pool` tally, `build` orchestrator, `cache` persistence). Each of the nine sources is now a named
+class behind one contract — `Voter.cast(context) -> SourceVote` — with identity (`key`, `label`,
+`role`) as class attributes; the pool filters by `VoterRole` (`prior`/`override`/`redundant`/
+`evidence`) instead of hard-coded key sets, and `build_fusion` keeps only the sequence
+(context → poll → pool → decode). `VOTERS` order is documented and test-pinned as the pool's
+float accumulation order. Two interface changes, both in-repo consumers updated: `build_fusion`
+now takes `halves=` (mirroring `predict_full`) instead of the tests patching
+`possession_lab.fusion.GRADED_HALVES`, and the poll's summary stats ride on
+`SourceVote.diagnostics` so the npz array set is unchanged (roles/diagnostics persist additively
+in the version-1 JSON meta; older archives still load).
+
+Preservation evidence, measured after the move:
+
+```text
+$ .venv/bin/python -m possession_lab fusion
+fusion: spellF1 0.6519 | macroF1 0.9469 | accuracy 0.9420 | D-F1 0.9733 | segments 14
+baseline: spellF1 0.6519 | macroF1 0.9466 | accuracy 0.9417 | D-F1 0.9727 | segments 15
+
+fusion_predictions.csv  648cd7885e556a4677cfebf34185f13d   (regenerated, unchanged)
+predictions.csv         75b1968adad6795169aca4813d4ef38e   (prediction path untouched)
+```
 
 ## Events
 

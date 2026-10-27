@@ -153,12 +153,13 @@ The match is modeled as a discrete first-order Markov chain over states $\mathca
 - **Homography Projection:** Maps 2D video pixel detections into 2D pitch coordinates $[X, Y]$ in metres.
 - **Kinematic Continuity Gating:** To prevent spurious ball detections from corrupting trajectories, detections must satisfy a physical velocity cap ($v \le 40\text{ m/s}$ plus projection tolerance). Track reacquisition requires two mutually reachable detections across consecutive frames.
 
-### 3.7 Multi-Source Consensus Fusion (`fusion.py`)
-- Combines four independent modalities:
-  1. Tracking HMM (`hmm_atd`)
-  2. Video Perception (`yolo_video`)
-  3. Tactical Audio (`audio_whistle`)
-  4. Smart Tagging Events (`smart_tags`)
+### 3.7 Multi-Source Consensus Fusion (`fusion/` package)
+- Nine independent voters behind a single contract (`Voter.cast(context) -> SourceVote`), registered in a deterministic, accumulation-pinned order (`VOTERS`); roles (`prior`, `override`, `redundant`, `evidence`) govern pooling instead of per-key logic:
+  1. Tracking HMM (`hmm_atd`, the pool's prior)
+  2. Video Perception (`video_players`, `video_ball`, `yolo_ball`)
+  3. Tactical Audio (`audio`)
+  4. Smart Tagging Events (`tags`) and confirmed events (`events`, hard `D` override)
+  5. ATD geometry (`atd_ball`, `atd_shape`)
 - Evaluates per-frame source ballots with confidence weighting and decodes joint posteriors, improving per-frame macro F1 to **0.9469** while maintaining structural spell consistency.
 
 ### 3.8 Explainability Engine (`explain.py`)
@@ -206,14 +207,21 @@ Xplainable-soccer-predictor/
     ├── features.py                    # Geometric possession zones & kinematic features
     ├── model.py                       # Gap-aware 3-state HMM, Viterbi & posterior decoding
     ├── events.py                      # Smart tag parsing, goal/stoppage event overrides
-    ├── fusion.py                      # Multi-source weighted ballot consensus
+    ├── fusion/                        # Multi-source poll: voter registry, pooling, cache
+    │   ├── ballot.py                  # SourceVote/FusionResult/VoterRole contracts
+    │   ├── voters.py                  # One class per source + ordered VOTERS registry
+    │   ├── pool.py                    # Log/linear pooling by role; consensus ball
+    │   ├── geometry.py                # Shared geometry-ballot primitives
+    │   ├── resample.py                # Perception cache → per-frame voter inputs
+    │   ├── build.py                   # build_fusion orchestrator
+    │   └── cache.py                   # npz persistence
     ├── explain.py                     # Explainability engine & switch causal attribution
     ├── evaluate.py                    # Public GT evaluation & synthetic stress benchmarks
     ├── visualize.py                   # Diagnostic plotting suite (8 publication figures)
     ├── viewer.py                      # Interactive diagnostic web viewer & local server
     ├── viewer_assets/                 # Viewer web client (index.html, viewer.js, viewer.css)
     ├── cli.py                         # Unified CLI (python -m possession_lab <cmd>)
-    ├── tests/                         # Comprehensive unit test suite (162 tests passing)
+    ├── tests/                         # Comprehensive unit test suite (169 tests passing)
     └── outputs/                       # Generated predictions, metrics, and figures
 ```
 
@@ -233,7 +241,7 @@ pip install -r requirements-possession.txt
 
 ### 5.2 Verification Suite
 ```bash
-# Run all 162 unit tests
+# Run all 169 unit tests
 pytest -q possession_lab/tests
 
 # Code quality check (0 errors, 0 warnings)
