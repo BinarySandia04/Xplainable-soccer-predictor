@@ -11,8 +11,11 @@ Hardware-aware: it measures the FREE memory on every GPU (other processes - e.g.
 llama-server - are respected), then picks the largest YOLO26 model, resolution and batch that
 fits, and uses every GPU that has room (DDP across them).
 
-Run on the cluster (merit-gpu1), inside tmux or nohup so it survives detach:
+Run on the cluster (merit-gpu1), inside tmux or nohup so it survives detach. The helper repo
+is PRIVATE: give the clone a read-only token (fine-grained PAT of the repo, or `gh auth
+token` on a logged-in machine):
 
+    export GH_TOKEN=github_pat_...                  # or BALLKIT_REPO_URL=git@github.com:... for ssh
     python3 train_cluster.py                        # auto-pick GPUs, model, batch
     python3 train_cluster.py --dry-run              # show exactly what would run
     python3 train_cluster.py --device 1,2,3         # pin GPUs explicitly
@@ -75,9 +78,19 @@ def is_ddp_child() -> bool:
 def clone_repo() -> None:
     if (REPO / ".git").exists():
         return
+    url = os.environ.get("BALLKIT_REPO_URL") or REPO_URL
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    auth_url = url
+    if token and url.startswith("https://"):
+        auth_url = url.replace("https://", f"https://x-access-token:{token}@", 1)
     log(f"cloning helper repo ({REPO_BRANCH}) -> {REPO}")
     DATA.mkdir(parents=True, exist_ok=True)
-    sh(["git", "clone", "--depth", "1", "-b", REPO_BRANCH, REPO_URL, REPO])
+    try:
+        sh(["git", "clone", "--depth", "1", "-b", REPO_BRANCH, auth_url, REPO])
+    finally:
+        # never leave the token inside ball_data/repo/.git/config
+        if (REPO / ".git").exists():
+            subprocess.run(["git", "-C", str(REPO), "remote", "set-url", "origin", url], check=False)
 
 
 def bootstrap_python() -> None:
