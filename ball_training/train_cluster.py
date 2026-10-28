@@ -478,8 +478,12 @@ def ensure_base_weights(model: str) -> str:
     from huggingface_hub import hf_hub_download
 
     weights_dir = DATA / "base_weights"
-    uutils.WEIGHTS_DIR = weights_dir  # keep checkpoints inside ball_data/
     weights_dir.mkdir(parents=True, exist_ok=True)
+    # DDP workers re-import ultralytics in fresh processes, so the weights directory
+    # has to be recorded in the settings file, not only in this process' module attr.
+    if Path(uutils.SETTINGS["weights_dir"]).resolve() != weights_dir.resolve():
+        uutils.SETTINGS["weights_dir"] = str(weights_dir)
+    uutils.WEIGHTS_DIR = weights_dir
 
     stem = model if model.endswith(".pt") else f"{model}.pt"
     if Path(model).is_file():  # user-supplied local checkpoint
@@ -526,8 +530,11 @@ def train(model: str, imgsz: int, batch: int, device: str, epochs: int, patience
 
     weights = ensure_base_weights(model)
     workers = max(2, min(workers, (os.cpu_count() or 8) // max(1, n_gpus)))
-    log(f"training {Path(weights).name}: imgsz={imgsz} batch={batch}/gpu epochs<={epochs} "
-        f"patience={patience} device={device} workers={workers}/gpu")
+    # ultralytics reads `batch` as the GLOBAL batch and gives each rank batch/world_size,
+    # so a per-GPU figure below the GPU count would divide down to 0.
+    global_batch = max(batch, 1) * max(n_gpus, 1)
+    log(f"training {Path(weights).name}: imgsz={imgsz} batch={batch}/gpu ({global_batch} total) "
+        f"epochs<={epochs} patience={patience} device={device} workers={workers}/gpu")
     try:
         net = YOLO(weights)
     except Exception as exc:
@@ -539,7 +546,7 @@ def train(model: str, imgsz: int, batch: int, device: str, epochs: int, patience
         data=str(DATASET / "data.yaml"),
         imgsz=imgsz,
         epochs=epochs,
-        batch=batch,
+        batch=global_batch,
         workers=workers,
         device=device,
         patience=patience,
