@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Train the best possible soccer-ball detector on a multi-GPU server.
 
-ONE FILE - paste it with nano, run it. No repo, no git, no GitHub, no token.
+ONE FILE - paste it with nano, run it. No repo, no git, no token, no code
+hosting: datasets and base weights come only from Zenodo and Hugging Face.
 
     python3 train_cluster.py                    # full run
     python3 train_cluster.py --dry-run          # show the plan, change nothing
@@ -109,6 +110,12 @@ THRESHOLDS = (0.05, 0.1, 0.2, 0.3, 0.5)
 CLIP_START, CLIP_END = 11197, 11567   # laptop reference clip, end exclusive
 
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png")
+
+# base checkpoints + the AMP-check model come from these official HF mirrors
+HF_WEIGHT_REPOS = {"yolo26": "Ultralytics/YOLO26",
+                   "yolo11": "Ultralytics/YOLO11",
+                   "yolov8": "Ultralytics/YOLOv8",
+                   "yolo8": "Ultralytics/YOLOv8"}
 
 
 def log(msg: str) -> None:
@@ -460,6 +467,48 @@ def build_dataset(force: bool = False) -> None:
 
 
 # ------------------------------------------------------------------- train
+def ensure_base_weights(model: str) -> str:
+    """Resolve base weights locally, downloading from Hugging Face only.
+
+    Ultralytics' own loader fetches yolo*.pt from its release-asset page, and
+    its AMP check does the same for yolo26n.pt. That host may be unreachable on
+    this server, so every checkpoint is pulled from the official HF mirrors.
+    """
+    import ultralytics.utils as uutils
+    from huggingface_hub import hf_hub_download
+
+    weights_dir = DATA / "base_weights"
+    uutils.WEIGHTS_DIR = weights_dir  # keep checkpoints inside ball_data/
+    weights_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = model if model.endswith(".pt") else f"{model}.pt"
+    if Path(model).is_file():  # user-supplied local checkpoint
+        return model
+    if not (weights_dir / stem).is_file():
+        repo = next((r for k, r in HF_WEIGHT_REPOS.items() if stem.startswith(k)), None)
+        if repo is None:
+            raise SystemExit(f"unknown base model {stem!r} - pass a local .pt with --model")
+        log(f"downloading base weights {stem} from Hugging Face ({repo})")
+        hf_hub_download(repo_id=repo, filename=stem, local_dir=str(weights_dir))
+    # the AMP check hardcodes yolo26n.pt; pre-place it so it never goes online
+    amp = weights_dir / "yolo26n.pt"
+    if not amp.is_file():
+        log("downloading AMP-check weights yolo26n.pt from Hugging Face")
+        hf_hub_download(repo_id="Ultralytics/YOLO26", filename="yolo26n.pt",
+                        local_dir=str(weights_dir))
+    # plots look for Arial.ttf online; a local font skips that probe entirely
+    font = uutils.USER_CONFIG_DIR / "Arial.ttf"
+    if not font.is_file():
+        try:
+            from matplotlib import font_manager
+
+            uutils.USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copy(font_manager.findfont("DejaVu Sans"), font)
+        except Exception:
+            pass
+    return str(weights_dir / stem)
+
+
 def train(model: str, imgsz: int, batch: int, device: str, epochs: int, patience: int,
           workers: int, name: str, n_gpus: int, resume: bool) -> Path:
     from ultralytics import YOLO
@@ -475,17 +524,16 @@ def train(model: str, imgsz: int, batch: int, device: str, epochs: int, patience
         YOLO(str(last)).train(resume=True)
         return run_dir
 
-    weights = model if model.endswith(".pt") else f"{model}.pt"
+    weights = ensure_base_weights(model)
     workers = max(2, min(workers, (os.cpu_count() or 8) // max(1, n_gpus)))
-    log(f"training {weights}: imgsz={imgsz} batch={batch}/gpu epochs<={epochs} "
+    log(f"training {Path(weights).name}: imgsz={imgsz} batch={batch}/gpu epochs<={epochs} "
         f"patience={patience} device={device} workers={workers}/gpu")
     try:
         net = YOLO(weights)
     except Exception as exc:
         raise SystemExit(
             f"could not load {weights}: {exc}\n"
-            f"If this server cannot reach GitHub, upload {weights} next to this script "
-            f"and rerun with --model ./{weights}"
+            f"Download that checkpoint manually and rerun with --model /path/to/{Path(weights).name}"
         ) from exc
     net.train(
         data=str(DATASET / "data.yaml"),
@@ -787,7 +835,8 @@ def main() -> int:
     imgsz = args.imgsz or imgsz
     batch = args.batch or batch
     device = ",".join(str(i) for i in ids)
-    name = f"ball_{re.sub(r'[^a-z0-9]', '', model.lower().replace('.pt', ''))}_{imgsz}_clu"
+    stem = Path(model).stem if model.endswith(".pt") else model
+    name = f"ball_{re.sub(r'[^a-z0-9]', '', stem.lower())}_{imgsz}_clu"
     log(f"config: {model} @ imgsz {imgsz}, batch {batch}/gpu on GPU[{device}] "
         f"(tightest card: {min(free[i] for i in ids):.1f} GB free)")
 
