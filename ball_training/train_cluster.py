@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Download the best ball datasets and train the best ball detector on a GPU cluster.
 
-Self-bootstrapping single file - upload it anywhere and run it. It fetches the repo helpers
-(build_dataset.py / eval_detector.py) from GitHub, downloads the three best public ball
-sources, merges them into one YOLO set, then trains and evaluates on the val split.
+Self-bootstrapping single file - upload it anywhere and run it. It installs every dependency
+(torch cu128, ultralytics, opencv, scipy, huggingface_hub, numpy stack; auto-venvs if system
+pip is externally managed), fetches the repo helpers (build_dataset.py / eval_detector.py)
+from GitHub, downloads the three best public ball sources, merges them into one YOLO set,
+then trains and evaluates on the val split.
 
 Hardware-aware: it measures the FREE memory on every GPU (other processes - e.g. a running
 llama-server - are respected), then picks the largest YOLO26 model, resolution and batch that
@@ -38,6 +40,8 @@ from pathlib import Path
 
 REPO_URL = "https://github.com/BinarySandia04/Xplainable-soccer-predictor.git"
 REPO_BRANCH = "feature/ball-detector-retraining"
+MIN_PY = (3, 10)
+DEP_CHECK = ("import torch, torchvision, ultralytics, cv2, scipy, numpy, huggingface_hub")
 
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "ball_data"           # everything this script creates lives here
@@ -76,24 +80,50 @@ def clone_repo() -> None:
     sh(["git", "clone", "--depth", "1", "-b", REPO_BRANCH, REPO_URL, REPO])
 
 
-def ensure_deps() -> None:
-    try:
-        import cv2  # noqa: F401
-        import huggingface_hub  # noqa: F401
-        import scipy  # noqa: F401
-        import torch  # noqa: F401
-        import ultralytics  # noqa: F401
-    except ImportError:
-        pass
-    else:
-        return
-    log("installing python deps (few minutes)")
-    pip = [sys.executable, "-m", "pip", "install", "-q"]
+def bootstrap_python() -> None:
+    """Fail fast on the two things pip cannot fix: an old python and a missing git."""
+    if sys.version_info < MIN_PY:
+        raise SystemExit(
+            f"python {'.'.join(map(str, MIN_PY))}+ is required (ultralytics/torch), found "
+            f"{sys.version.split()[0]}. Load a newer python (module/conda), then rerun."
+        )
+    if not shutil.which("git"):
+        raise SystemExit("git is required (helper clone + SoccerNet source). Load/install git, then rerun.")
+
+
+def deps_present(python: str) -> bool:
+    probe = subprocess.run([python, "-c", DEP_CHECK], capture_output=True)
+    return probe.returncode == 0
+
+
+def install_into(python: str) -> None:
+    pip = [python, "-m", "pip", "install", "-q"]
     index = os.environ.get("TORCH_PIP_INDEX", "https://download.pytorch.org/whl/cu128")
     sh([*pip, "torch==2.11.0", "torchvision==0.26.0", "--index-url", index])
-    sh([*pip, "ultralytics>=8.4.188", "opencv-python-headless", "scipy", "huggingface_hub"])
-    if (REPO / "requirements-possession.txt").exists():
-        sh([*pip, "-r", str(REPO / "requirements-possession.txt")])
+    sh([*pip, "ultralytics>=8.4.188", "opencv-python-headless", "scipy",
+        "huggingface_hub", "nvidia-ml-py", "-r", str(REPO / "requirements-possession.txt")])
+
+
+def ensure_deps() -> None:
+    if deps_present(sys.executable):
+        return
+    log("installing python deps (few minutes)")
+    try:
+        install_into(sys.executable)
+    except subprocess.CalledProcessError:
+        if sys.prefix != sys.base_prefix:
+            raise  # already inside a venv/conda env: the failure is real, show it
+        log("system python refuses pip (externally managed) - bootstrapping ball_data/.venv")
+        DATA.mkdir(parents=True, exist_ok=True)
+        venv = DATA / ".venv"
+        sh([sys.executable, "-m", "venv", str(venv)])
+        vpy = str(venv / "bin" / "python")
+        sh([vpy, "-m", "pip", "install", "-q", "--upgrade", "pip"])
+        install_into(vpy)
+        log("re-executing this script inside the venv")
+        os.execv(vpy, [vpy, *sys.argv])
+    if not deps_present(sys.executable):  # execv did not happen and imports still fail
+        raise SystemExit("deps installed but imports still fail - check the pip log above")
 
 
 def gpu_free_gb() -> dict[int, float]:
@@ -266,6 +296,7 @@ def main() -> int:
     args = p.parse_args()
 
     t0 = time.time()
+    bootstrap_python()
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     clone_repo()
