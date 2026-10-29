@@ -110,3 +110,83 @@ fusion and viewer are unchanged).  `VideoBallTracker` was tuned for it: a confid
 (≥ 0.35) within 5 m overrides a sloppy ATD anchor, and the anchor-agreement confidence floor is
 0.06.  In the public window this lifted ball-visible frames from 72.9% to 79.6% with fusion
 metrics unchanged (spellF1 0.6519, macroF1 0.9469 vs baseline 0.9466).
+
+---
+
+# Player detector retraining (YOLO26, multi-GPU)
+
+`train_players_cluster.py` is a **single self-contained file**: no repo, no git, no token, no
+code hosting. Datasets and base weights come only from Hugging Face.
+It trains three person classes — `player`, `goalkeeper`, `referee` — and ignores the ball,
+which the detector above owns.
+
+## Data (all public, nothing committed)
+
+| source | licence | what it adds |
+|--------|---------|--------------|
+| `SoccerNet/SN-Tracking-2023` (HF) | SoccerNet research terms | 57 broadcast train games / 49 test games, MOT boxes + per-track id classes |
+| `martinjolif/football-player-detection` (HF) | CC-BY-4.0 | ~600 Roboflow images, 4 classes |
+| `keremberke/football-object-detection` (HF) | CC-BY-4.0 | 1,232 Roboflow images |
+| `manot/football-players` (HF) | MIT | 206 Roboflow images |
+
+SoccerNet `gt.txt` only stores track ids; `gameinfo.ini` maps each id to player / goalkeeper /
+referee / ball. The script reads that mapping, drops every ball box, and links images into
+`player_data/dataset/` (symlinks — no second copy). Train uses the official 57 train games,
+val the official 49 test games: whole games are held out, never neighbouring frames.
+SoccerNet is capped at ~24k train / ~3k val frames with a deterministic stride so the run
+stays comparable to the ball run; the Roboflow sets are small and used in full.
+
+## Training on the cluster
+
+The script reuses `~/ball_data/.venv` (override with `PLAYER_VENV`), measures free VRAM per
+GPU and trains the largest YOLO26 / resolution / batch that fits (on three idle 32 GB cards
+this is typically `yolo26x` at 1024–1280), DDP across every GPU with at least 8 GB free.
+Cards with far less headroom than the roomiest one are left out automatically, so the card
+shared with `llama-server` cannot drag every rank down to its batch size. `llama-server` is
+never touched: it is only measured. Peak disk is ~36 GB (zips are deleted after each verified
+extraction; the script refuses below 35 GB free).
+
+```bash
+# local: copy the single file to the server (or paste it with nano)
+scp ball_training/train_players_cluster.py user@server:~/ball_data/
+
+# server: sanity check - plan + per-GPU VRAM, changes nothing
+cd ~/ball_data
+.venv/bin/python train_players_cluster.py --dry-run
+
+# server: full run, detached
+setsid nohup .venv/bin/python train_players_cluster.py > train_players.log 2>&1 &
+tail -f train_players.log
+```
+
+Run it only after the ball training has finished: both scripts pick GPUs by free VRAM, and
+starting this one early would put two jobs on the same cards.
+
+The match video is auto-detected: any mp4 in `player_data/video/`, then the ball run's copy at
+`~/ball_data/video/BAR-ATH_tactical.mp4` — no second 4.9 GB upload.
+
+## Outputs (`player_data/`)
+
+| path | contents |
+|------|----------|
+| `weights/players_best.pt` | stable copy of the best checkpoint |
+| `runs/players_*/` | full run (`results.png`, `args.yaml`, `weights/`) |
+| `eval/players_*.json` | per-class recall / precision / F1 at IoU 0.5, conf 0.05–0.5, per-source breakdown, player-count MAE |
+| `inference/*_full_match_players.json` | player-count coverage over the whole match |
+| `inference/*_clip_11197-11566_players.mp4` | annotated BAR-ATH clip, green player / yellow GK / magenta referee |
+
+Re-run pieces directly:
+
+```bash
+cd ~/ball_data
+
+# rebuild the merged dataset after changing a source
+.venv/bin/python train_players_cluster.py --force-build
+
+# resume an interrupted run
+.venv/bin/python train_players_cluster.py --resume
+
+# pin GPUs / force a model / change clip bounds
+.venv/bin/python train_players_cluster.py --device 1,2,3 --model yolo26x \
+    --clip-start 11197 --clip-end 11567
+```
