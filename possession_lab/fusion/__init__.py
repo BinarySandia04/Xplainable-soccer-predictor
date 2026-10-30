@@ -22,6 +22,9 @@ Package map (each concern in exactly one module):
     ``VOTERS`` registry whose order is the pool's float accumulation order.
 ``pool``
     The tally: log/linear pooling filtered by role, and the consensus-ball blend.
+``transitions``
+    The event-gated possession-change layer applied after the pool decode
+    (:func:`apply_transition_layer`).
 ``build``
     :func:`build_fusion` — assemble, poll, pool, decode; no arithmetic of its own.
 ``cache``
@@ -40,6 +43,14 @@ from .cache import load_fusion, save_fusion
 from .geometry import EPS, PRIOR, PRIOR_WEIGHT, geometry_ballot
 from .pool import blend_ball_positions, pool_ballots
 from .resample import resample_perception
+from .transitions import (
+    DEFAULT_TRANSITION_PARAMS,
+    TransitionEvent,
+    TransitionLayerResult,
+    TransitionParams,
+    apply_transition_layer,
+    events_to_rows,
+)
 from .voters import (
     DEFAULT_WEIGHTS,
     ROLE_BY_KEY,
@@ -74,6 +85,10 @@ __all__ = [
     "ROLE_BY_KEY",
     "SOURCE_LABELS",
     "STATUS_NAMES",
+    "DEFAULT_TRANSITION_PARAMS",
+    "TransitionEvent",
+    "TransitionLayerResult",
+    "TransitionParams",
     "SourceVote",
     "TagsVoter",
     "VideoBallVoter",
@@ -82,9 +97,11 @@ __all__ = [
     "VOTERS",
     "VotingContext",
     "YoloBallVoter",
+    "apply_transition_layer",
     "ballot_reason",
     "blend_ball_positions",
     "build_fusion",
+    "events_to_rows",
     "geometry_ballot",
     "load_fusion",
     "pool_ballots",

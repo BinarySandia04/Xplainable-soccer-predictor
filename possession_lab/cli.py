@@ -488,6 +488,117 @@ def cmd_fusion(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_transitions(args: argparse.Namespace) -> int:
+    """Layer event-gated control transitions onto a cached fusion pass, then score it."""
+    import numpy as np
+
+    from .config import OUTPUT_DIR
+    from .evaluate import full_match_stats, public_metrics
+    from .fusion.ballot import VoterRole
+    from .fusion.transitions import apply_transition_layer, events_to_rows, evidence_probability
+    from .fusion.voters import ROLE_BY_KEY
+    from .pipeline import load_lab, validate_codes, write_submission
+
+    output_dir = Path(args.output_dir or OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lab = load_lab(args.data_dir)
+    fusion_path = Path(args.fusion) if args.fusion else output_dir / "fusion.npz"
+    with np.load(fusion_path, allow_pickle=False) as z:
+        arrays = {key: np.asarray(z[key]) for key in z.files}
+    n = int(arrays["codes"].shape[0])
+    evidence_keys = sorted(
+        key
+        for key, role in ROLE_BY_KEY.items()
+        if role in (VoterRole.EVIDENCE, VoterRole.REDUNDANT) and f"src_{key}_probability" in arrays
+    )
+    if not evidence_keys:
+        print("transitions: fusion cache has no evidence ballots; run fusion first")
+        return 1
+    probabilities = {key: arrays[f"src_{key}_probability"] for key in evidence_keys}
+    weights = {key: arrays[f"src_{key}_weight"] for key in evidence_keys}
+    player_sets: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = [
+        (lab.tracking.players, lab.tracking.teams, lab.tracking.player_present)
+    ]
+    if not args.no_perception:
+        perception_path = Path(args.perception) if args.perception else output_dir / "perception.npz"
+        if perception_path.is_file():
+            with np.load(perception_path, allow_pickle=False) as z:
+                vpitch = np.asarray(z["players_pitch"])
+                vteam = np.asarray(z["players_team"])
+                vpresent = np.asarray(z["players_present"])
+            if vpitch.shape[0] != n:
+                print(
+                    f"transitions: perception cache covers {vpitch.shape[0]} samples but fusion has "
+                    f"{n} frames; supply a full-frame perception cache"
+                )
+                return 1
+            player_sets.insert(0, (vpitch, vteam, vpresent))
+        else:
+            print(f"transitions: no perception cache at {perception_path}; ATD players only")
+    result = apply_transition_layer(
+        codes_pooled=arrays["codes"].astype(np.int8),
+        fused_probability=arrays["fused_probability"].astype(np.float64),
+        event_dead=arrays["event_dead"].astype(bool),
+        consensus_ball=arrays["consensus_ball"].astype(np.float64),
+        evidence_prob=evidence_probability(probabilities, weights),
+        player_sets=player_sets,
+    )
+    events_path = output_dir / "transition_events.csv"
+    rows = events_to_rows(result.events)
+    pd.DataFrame(
+        {
+            "start_frame": rows[:, 0].astype(int),
+            "event_frame": rows[:, 1].astype(int),
+            "kind": ["kick" if k == 0 else "onset" for k in rows[:, 2]],
+            "team": ["H" if t == 0 else "A" for t in rows[:, 3]],
+            "distance_m": rows[:, 4],
+            "support": rows[:, 5],
+        }
+    ).to_csv(events_path, index=False)
+    out_npz = output_dir / "fusion_transitioned.npz"
+    np.savez_compressed(
+        out_npz,
+        codes=result.codes,
+        events=rows,
+        consensus_ball=arrays["consensus_ball"],
+        event_dead=arrays["event_dead"],
+        source_fusion=str(fusion_path),
+    )
+    submission = write_submission(result.codes, output_dir / "transition_predictions.csv")
+    metrics = public_metrics(result.codes, lab.gt, bootstrap_n=args.bootstrap_n)
+    baseline = public_metrics(arrays["codes"].astype(np.int8), lab.gt, bootstrap_n=args.bootstrap_n)
+    report = {
+        "transition_layer": metrics,
+        "fusion_baseline": baseline,
+        "events_total": int(len(result.events)),
+        "events_detected": {"kicks": result.n_kicks, "onsets": result.n_onsets},
+        "events_gated_out": result.n_gated_out,
+        "evidence_keys": evidence_keys,
+        "validation": validate_codes(result.codes),
+        "full_match": full_match_stats(result.codes),
+    }
+    _json(output_dir / "transition_metrics_public.json", report)
+    print(
+        "transitions: spellF1 {:.4f} | macroF1 {:.4f} | accuracy {:.4f} | events {} "
+        "(kicks {} onsets {}, gated out {})".format(
+            metrics["spell_f1_mean"],
+            metrics["macro_f1"],
+            metrics["accuracy"],
+            len(result.events),
+            result.n_kicks,
+            result.n_onsets,
+            result.n_gated_out,
+        )
+    )
+    print(
+        "fusion    : spellF1 {:.4f} | macroF1 {:.4f} | accuracy {:.4f}".format(
+            baseline["spell_f1_mean"], baseline["macro_f1"], baseline["accuracy"]
+        )
+    )
+    print("transitions: wrote", out_npz, "and", submission)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m possession_lab",
@@ -507,6 +618,7 @@ def build_parser() -> argparse.ArgumentParser:
             "explain",
             "perceive",
             "fusion",
+            "transitions",
         ],
     )
     parser.add_argument("--data-dir", default=None, help="gated data directory (default: data/)")
@@ -594,6 +706,7 @@ def main(argv: list[str] | None = None) -> int:
         "explain": cmd_explain,
         "perceive": cmd_perceive,
         "fusion": cmd_fusion,
+        "transitions": cmd_transitions,
     }
     return commands[args.command](args)
 
