@@ -1159,9 +1159,29 @@ def _team_match(
         return np.full(detections.shape[0], -1, dtype=np.int8), np.zeros(detections.shape[0], dtype=np.float32)
     projected = pitch_to_pixel(homography, atd_players, pitch)
     costs = np.linalg.norm(detections[:, None, :] - projected[None, :, :], axis=2)
-    from scipy.optimize import linear_sum_assignment
-
-    rows, cols = linear_sum_assignment(costs)
+    try:
+        from scipy.optimize import linear_sum_assignment
+    except ModuleNotFoundError:
+        # The farm bundle deliberately avoids pandas/scipy.  A greedy one-to-one match is not
+        # globally optimal, but it is identical in practice for these ~40x46 pixel distances.
+        rows: list[int] = []
+        cols: list[int] = []
+        used_rows: set[int] = set()
+        used_cols: set[int] = set()
+        for flat in np.argsort(costs, axis=None):
+            row, col = (int(value) for value in np.unravel_index(int(flat), costs.shape))
+            if row in used_rows or col in used_cols:
+                continue
+            rows.append(row)
+            cols.append(col)
+            used_rows.add(row)
+            used_cols.add(col)
+            if len(rows) >= min(costs.shape):
+                break
+        rows = np.asarray(rows, dtype=np.intp)
+        cols = np.asarray(cols, dtype=np.intp)
+    else:
+        rows, cols = linear_sum_assignment(costs)
     teams = np.full(detections.shape[0], -1, dtype=np.int8)
     confidence = np.zeros(detections.shape[0], dtype=np.float32)
     for row, col in zip(rows, cols):
@@ -1198,7 +1218,9 @@ def perceive_video(
     stop: int | None = None,
     step: int = 1,
     model: str = "yolo11x.pt",
+    players_model: str | None = None,
     ball_model: str | None = None,
+    players_imgsz: int | None = None,
     ball_imgsz: int = 1280,
     device: str | int | None = None,
     imgsz: int = 1920,
@@ -1207,6 +1229,7 @@ def perceive_video(
     max_players: int = MAX_PLAYERS,
     max_ball_detections: int = MAX_BALL_DETECTIONS,
     seed_from_atd: bool = True,
+    stage: str = "both",
     progress: bool = True,
 ) -> VideoPerception:
     """Run the video perception on a frame range and return a compact sample array.
@@ -1214,6 +1237,10 @@ def perceive_video(
     ``step`` is useful for a full-match pass: 5 gives 5 fps while preserving the video's 25 fps
     timeline.  The ball tracker uses the real frame gap, so it still predicts across skipped
     frames.  For the public evaluation window, step 1 is practical.
+
+    ``stage`` runs one detector family at a time.  ``"ball"`` and ``"players"`` leave the other
+    family's arrays empty, which lets a farm run the dedicated ball model first and the player
+    model second without paying for both on every frame.  ``"both"`` keeps the original behaviour.
     """
     import cv2
     from ultralytics import YOLO
@@ -1231,6 +1258,11 @@ def perceive_video(
     step = max(1, int(step))
     max_players = max(1, min(MAX_PLAYERS, int(max_players)))
     max_ball_detections = max(1, min(MAX_BALL_DETECTIONS, int(max_ball_detections)))
+    stage = str(stage).lower()
+    if stage not in {"both", "ball", "players"}:
+        raise ValueError(f"stage must be 'both', 'ball' or 'players', got {stage!r}")
+    run_players = stage in {"both", "players"}
+    run_ball = stage in {"both", "ball"}
     if stop <= start:
         raise ValueError(f"invalid video range [{start}, {stop})")
     if device is None:
@@ -1245,6 +1277,16 @@ def perceive_video(
     cap.set(cv2.CAP_PROP_POS_FRAMES, start)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
+    player_weights = str(players_model or model) if run_players else None
+    ball_weights = str(ball_model or model) if run_ball else None
+    if stage == "players":
+        model_label = f"players:{player_weights}"
+    elif stage == "ball":
+        model_label = f"ball:{ball_weights}"
+    elif player_weights == ball_weights:
+        model_label = str(player_weights)
+    else:
+        model_label = f"players:{player_weights} + ball:{ball_weights}"
     perception = _empty_perception(
         samples=n_samples,
         n_frames=n_frames,
@@ -1252,13 +1294,42 @@ def perceive_video(
         step=step,
         start=start,
         stop=stop,
-        model=str(model) if not ball_model or str(ball_model) == str(model) else f"{model} + ball:{ball_model}",
+        model=model_label,
         device=device,
         video_width=width,
         video_height=height,
     )
-    yolo = YOLO(model)
-    ball_yolo = YOLO(ball_model) if ball_model and str(ball_model) != str(model) else None
+    player_yolo = YOLO(player_weights) if run_players and player_weights else None
+    if run_ball and ball_weights:
+        ball_yolo = (
+            player_yolo
+            if player_yolo is not None and ball_weights == player_weights
+            else YOLO(ball_weights)
+        )
+    else:
+        ball_yolo = None
+    shared_yolo = player_yolo if run_ball and player_yolo is ball_yolo else None
+    shared_names = getattr(shared_yolo, "names", {}) or {}
+    if shared_yolo is not None and not {PERSON_CLASS, BALL_CLASS}.issubset(shared_names):
+        raise ValueError(
+            "one shared model needs COCO person and ball classes; pass separate "
+            "--players-model and --ball-model weights"
+        )
+    dedicated_players = run_players and players_model is not None
+    ball_names = getattr(ball_yolo, "names", {}) or {}
+    dedicated_ball = (
+        run_ball
+        and ball_yolo is not None
+        and len(ball_names) == 1
+        and str(ball_names.get(0, "")).lower() in {"ball", "sports ball"}
+    )
+    perception.meta.update(
+        {
+            "stage": stage,
+            "players_model": player_weights,
+            "ball_model": ball_weights,
+        }
+    )
     tracker = _GreedyTracker()
     ball_tracker = VideoBallTracker()
     sample = 0
@@ -1278,125 +1349,153 @@ def perceive_video(
                 continue
             if sample >= n_samples:
                 break
-            result = yolo.predict(
-                frame,
-                classes=[PERSON_CLASS] if ball_yolo is not None else [PERSON_CLASS, BALL_CLASS],
-                conf=min(player_conf, ball_conf),
-                iou=0.5,
-                imgsz=int(imgsz),
-                device=device,
-                verbose=False,
-                max_det=120,
-            )[0]
-            boxes, confidence, classes = _parse_boxes(result)
-            if ball_yolo is not None:
-                # dedicated ball detector; its class 0 is re-stamped as COCO's ball id
-                ball_result = ball_yolo.predict(
+            boxes = np.zeros((0, 4), dtype=np.float32)
+            confidence = np.zeros(0, dtype=np.float32)
+            classes = np.zeros(0, dtype=np.int16)
+            if shared_yolo is not None:
+                result = shared_yolo.predict(
                     frame,
-                    conf=ball_conf,
+                    classes=[PERSON_CLASS, BALL_CLASS],
+                    conf=min(player_conf, ball_conf),
                     iou=0.5,
-                    imgsz=int(ball_imgsz),
+                    imgsz=int(imgsz),
                     device=device,
                     verbose=False,
-                    max_det=4 * max_ball_detections,
+                    max_det=120,
                 )[0]
-                ball_boxes, ball_scores, _ = _parse_boxes(ball_result)
-                if ball_boxes.size:
-                    boxes = np.concatenate([boxes, ball_boxes])
-                    confidence = np.concatenate([confidence, ball_scores])
-                    classes = np.concatenate([classes, np.full(len(ball_boxes), BALL_CLASS, dtype=np.int16)])
-            matrix = np.asarray(homography.matrices[current], dtype=np.float64)
-            person_mask = (classes == PERSON_CLASS) & (confidence >= player_conf)
-            person_boxes = boxes[person_mask]
-            person_conf = confidence[person_mask]
-            ball_mask = (classes == BALL_CLASS) & (confidence >= ball_conf)
-            ball_boxes = boxes[ball_mask]
-            ball_conf_values = confidence[ball_mask]
-
-            # Players: reject crowd/staff by the foot point, then assign teams and track ids.
-            player_pixel = _box_foot_points(person_boxes) if person_boxes.size else np.zeros((0, 2))
-            player_pitch = (
-                pixel_to_pitch(matrix, player_pixel, perception.pitch)
-                if player_pixel.size
-                else np.zeros((0, 2))
-            )
-            valid_players = _inside_pitch(player_pitch, perception.pitch, PITCH_MARGIN)
-            person_boxes = person_boxes[valid_players]
-            person_conf = person_conf[valid_players]
-            player_pixel = player_pixel[valid_players]
-            player_pitch = player_pitch[valid_players]
-            if atd_players is not None and atd_teams is not None and current < len(atd_players):
-                teams, team_confidence = _team_match(
-                    player_pixel,
-                    np.asarray(atd_players[current], dtype=np.float64),
-                    np.asarray(atd_teams),
-                    matrix,
-                    perception.pitch,
-                )
+                boxes, confidence, classes = _parse_boxes(result)
             else:
-                teams = np.full(len(person_boxes), -1, dtype=np.int8)
-                team_confidence = np.zeros(len(person_boxes), dtype=np.float32)
-            track_ids = tracker.update(person_boxes, current)
-            order = np.argsort(person_conf)[::-1][:max_players]
-            for slot, source_row in enumerate(order):
-                if slot >= max_players:
-                    break
-                box = person_boxes[source_row]
-                perception.players_box[sample, slot] = box
-                perception.players_pixel[sample, slot] = player_pixel[source_row]
-                perception.players_pitch[sample, slot] = player_pitch[source_row]
-                perception.players_team[sample, slot] = teams[source_row]
-                perception.players_confidence[sample, slot] = person_conf[source_row]
-                perception.players_present[sample, slot] = True
-                perception.players_track[sample, slot] = track_ids[source_row]
-                perception.players_team_confidence[sample, slot] = team_confidence[source_row]
+                if player_yolo is not None:
+                    result = player_yolo.predict(
+                        frame,
+                        classes=None if dedicated_players else [PERSON_CLASS],
+                        conf=player_conf,
+                        iou=0.5,
+                        imgsz=int(players_imgsz or imgsz),
+                        device=device,
+                        verbose=False,
+                        max_det=120,
+                    )[0]
+                    boxes, confidence, classes = _parse_boxes(result)
+                    if dedicated_players and classes.size:
+                        # The dedicated player model's player/goalkeeper/referee classes all become
+                        # COCO's person id, so the tracker, fusion and viewer need no special case.
+                        classes = np.full(classes.shape, PERSON_CLASS, dtype=np.int16)
+                if ball_yolo is not None:
+                    ball_result = ball_yolo.predict(
+                        frame,
+                        classes=None if dedicated_ball else [BALL_CLASS],
+                        conf=ball_conf,
+                        iou=0.5,
+                        imgsz=int(ball_imgsz),
+                        device=device,
+                        verbose=False,
+                        max_det=4 * max_ball_detections,
+                    )[0]
+                    ball_boxes, ball_scores, _ = _parse_boxes(ball_result)
+                    if ball_boxes.size:
+                        boxes = np.concatenate([boxes, ball_boxes])
+                        confidence = np.concatenate([confidence, ball_scores])
+                        classes = np.concatenate(
+                            [classes, np.full(len(ball_boxes), BALL_CLASS, dtype=np.int16)]
+                        )
+            matrix = np.asarray(homography.matrices[current], dtype=np.float64)
+            if run_players:
+                person_mask = (classes == PERSON_CLASS) & (confidence >= player_conf)
+                person_boxes = boxes[person_mask]
+                person_conf = confidence[person_mask]
 
-            # Raw YOLO ball detections, filtered by their centre's pitch projection.
-            ball_centres = _box_centres(ball_boxes) if ball_boxes.size else np.zeros((0, 2))
-            ball_points = (
-                pixel_to_pitch(matrix, ball_centres, perception.pitch)
-                if ball_centres.size
-                else np.zeros((0, 2))
-            )
-            valid_balls = _inside_pitch(ball_points, perception.pitch, BALL_MARGIN)
-            candidates: list[dict[str, Any]] = []
-            for row in np.flatnonzero(valid_balls):
-                point = ball_points[row]
-                candidates.append(
-                    {
-                        "pixel": [float(ball_centres[row, 0]), float(ball_centres[row, 1])],
-                        "pitch": [float(point[0]), float(point[1])],
-                        "confidence": float(ball_conf_values[row]),
-                        "origin": "yolo",
-                    }
+                # Players: reject crowd/staff by the foot point, then assign teams and track ids.
+                player_pixel = (
+                    _box_foot_points(person_boxes) if person_boxes.size else np.zeros((0, 2))
                 )
-            candidates.sort(key=lambda item: float(item["confidence"]), reverse=True)
-            for slot, candidate in enumerate(candidates[:max_ball_detections]):
-                perception.yolo_ball_pixel[sample, slot] = candidate["pixel"]
-                perception.yolo_ball_pitch[sample, slot] = candidate["pitch"]
-                perception.yolo_ball_confidence[sample, slot] = candidate["confidence"]
-                perception.yolo_ball_present[sample, slot] = True
-            seed = None
-            if (
-                seed_from_atd
-                and atd_ball is not None
-                and atd_present is not None
-                and current < len(atd_ball)
-                and bool(atd_present[current])
-                and np.isfinite(atd_ball[current]).all()
-            ):
-                seed = np.asarray(atd_ball[current], dtype=np.float64)
-            tracked = ball_tracker.update(
-                frame,
-                current,
-                matrix,
-                candidates,
-                atd_anchor=seed,
-            )
-            perception.ball_pixel[sample] = tracked["pixel"]
-            perception.ball_pitch[sample] = tracked["pitch"]
-            perception.ball_confidence[sample] = tracked["confidence"]
-            perception.ball_source[sample] = tracked["source"]
+                player_pitch = (
+                    pixel_to_pitch(matrix, player_pixel, perception.pitch)
+                    if player_pixel.size
+                    else np.zeros((0, 2))
+                )
+                valid_players = _inside_pitch(player_pitch, perception.pitch, PITCH_MARGIN)
+                person_boxes = person_boxes[valid_players]
+                person_conf = person_conf[valid_players]
+                player_pixel = player_pixel[valid_players]
+                player_pitch = player_pitch[valid_players]
+                if atd_players is not None and atd_teams is not None and current < len(atd_players):
+                    teams, team_confidence = _team_match(
+                        player_pixel,
+                        np.asarray(atd_players[current], dtype=np.float64),
+                        np.asarray(atd_teams),
+                        matrix,
+                        perception.pitch,
+                    )
+                else:
+                    teams = np.full(len(person_boxes), -1, dtype=np.int8)
+                    team_confidence = np.zeros(len(person_boxes), dtype=np.float32)
+                track_ids = tracker.update(person_boxes, current)
+                order = np.argsort(person_conf)[::-1][:max_players]
+                for slot, source_row in enumerate(order):
+                    if slot >= max_players:
+                        break
+                    box = person_boxes[source_row]
+                    perception.players_box[sample, slot] = box
+                    perception.players_pixel[sample, slot] = player_pixel[source_row]
+                    perception.players_pitch[sample, slot] = player_pitch[source_row]
+                    perception.players_team[sample, slot] = teams[source_row]
+                    perception.players_confidence[sample, slot] = person_conf[source_row]
+                    perception.players_present[sample, slot] = True
+                    perception.players_track[sample, slot] = track_ids[source_row]
+                    perception.players_team_confidence[sample, slot] = team_confidence[source_row]
+
+            if run_ball:
+                ball_mask = (classes == BALL_CLASS) & (confidence >= ball_conf)
+                ball_boxes = boxes[ball_mask]
+                ball_conf_values = confidence[ball_mask]
+
+                # Raw YOLO ball detections, filtered by their centre's pitch projection.
+                ball_centres = _box_centres(ball_boxes) if ball_boxes.size else np.zeros((0, 2))
+                ball_points = (
+                    pixel_to_pitch(matrix, ball_centres, perception.pitch)
+                    if ball_centres.size
+                    else np.zeros((0, 2))
+                )
+                valid_balls = _inside_pitch(ball_points, perception.pitch, BALL_MARGIN)
+                candidates: list[dict[str, Any]] = []
+                for row in np.flatnonzero(valid_balls):
+                    point = ball_points[row]
+                    candidates.append(
+                        {
+                            "pixel": [float(ball_centres[row, 0]), float(ball_centres[row, 1])],
+                            "pitch": [float(point[0]), float(point[1])],
+                            "confidence": float(ball_conf_values[row]),
+                            "origin": "yolo",
+                        }
+                    )
+                candidates.sort(key=lambda item: float(item["confidence"]), reverse=True)
+                for slot, candidate in enumerate(candidates[:max_ball_detections]):
+                    perception.yolo_ball_pixel[sample, slot] = candidate["pixel"]
+                    perception.yolo_ball_pitch[sample, slot] = candidate["pitch"]
+                    perception.yolo_ball_confidence[sample, slot] = candidate["confidence"]
+                    perception.yolo_ball_present[sample, slot] = True
+                seed = None
+                if (
+                    seed_from_atd
+                    and atd_ball is not None
+                    and atd_present is not None
+                    and current < len(atd_ball)
+                    and bool(atd_present[current])
+                    and np.isfinite(atd_ball[current]).all()
+                ):
+                    seed = np.asarray(atd_ball[current], dtype=np.float64)
+                tracked = ball_tracker.update(
+                    frame,
+                    current,
+                    matrix,
+                    candidates,
+                    atd_anchor=seed,
+                )
+                perception.ball_pixel[sample] = tracked["pixel"]
+                perception.ball_pitch[sample] = tracked["pitch"]
+                perception.ball_confidence[sample] = tracked["confidence"]
+                perception.ball_source[sample] = tracked["source"]
             perception.frame_index[sample] = current
             sample += 1
             if progress and sample - last_log >= 200:
@@ -1444,6 +1543,66 @@ def _slice_perception(perception: VideoPerception, samples: int) -> VideoPercept
         video_height=perception.video_height,
         pitch=perception.pitch,
         meta=perception.meta,
+    )
+
+
+def merge_perception(
+    players: VideoPerception,
+    ball: VideoPerception,
+) -> VideoPerception:
+    """Combine a players-only cache and a ball-only cache taken over the same frame range.
+
+    The two passes must have sampled exactly the same video frames.  Player geometry comes from
+    ``players``, ball detections and the accepted ball track come from ``ball``; all unaffected
+    arrays stay empty.  The resulting cache has the ordinary :class:`VideoPerception` layout, so
+    the viewer and fusion need no special case.
+    """
+    if players.samples != ball.samples:
+        raise ValueError(
+            f"perception stages have different sample counts: {players.samples} != {ball.samples}"
+        )
+    if not np.array_equal(players.frame_index, ball.frame_index):
+        raise ValueError("perception stages sampled different video frames")
+    if tuple(players.pitch) != tuple(ball.pitch):
+        raise ValueError(f"perception stages use different pitches: {players.pitch} != {ball.pitch}")
+    meta = {**ball.meta, **players.meta}
+    meta.update(
+        {
+            "stage": "both",
+            "players_model": players.meta.get("players_model"),
+            "ball_model": ball.meta.get("ball_model"),
+            "stage_meta": {"players": players.meta, "ball": ball.meta},
+        }
+    )
+    return VideoPerception(
+        frame_index=players.frame_index,
+        players_box=players.players_box,
+        players_pixel=players.players_pixel,
+        players_pitch=players.players_pitch,
+        players_team=players.players_team,
+        players_confidence=players.players_confidence,
+        players_present=players.players_present,
+        players_track=players.players_track,
+        players_team_confidence=players.players_team_confidence,
+        ball_pixel=ball.ball_pixel,
+        ball_pitch=ball.ball_pitch,
+        ball_confidence=ball.ball_confidence,
+        ball_source=ball.ball_source,
+        yolo_ball_pixel=ball.yolo_ball_pixel,
+        yolo_ball_pitch=ball.yolo_ball_pitch,
+        yolo_ball_confidence=ball.yolo_ball_confidence,
+        yolo_ball_present=ball.yolo_ball_present,
+        n_frames=players.n_frames,
+        fps=players.fps,
+        step=players.step,
+        start=players.start,
+        stop=players.stop,
+        model=f"{players.model} + {ball.model}",
+        device=players.device,
+        video_width=players.video_width,
+        video_height=players.video_height,
+        pitch=players.pitch,
+        meta=meta,
     )
 
 

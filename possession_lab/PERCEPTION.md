@@ -99,6 +99,21 @@ stay `X`, exactly like the baseline.
   --ball-model ball_training/weights/ball_yolo11s_best.pt \
   --perception possession_lab/outputs/perception_public.npz
 
+# Dedicated player + ball checkpoints.  The player model's player/goalkeeper/referee classes
+# are all re-stamped as COCO person so tracking, team matching and the viewer are unchanged.
+# `--stage players` (or `--stage ball`) runs only one family; the farm script below uses that to
+# run the two models sequentially and merge the two caches.
+.venv/bin/python -m possession_lab perceive \
+  --start 11185 --stop 18685 --step 1 \
+  --players-model weights/players_weights/players_yolo26x_1024_clu.pt \
+  --ball-model weights/moncuniserver/ball_yolo26x_1024_clu.pt \
+  --imgsz 1024 --perception possession_lab/outputs/perception_models.npz
+
+# SLURM farm: ball pass first, player pass second, then merge.  The bundle contains only the
+# two package files the farm needs (no pandas/scipy).  See FARM_README.txt for the full recipe.
+#   python farm_perceive.py --list
+#   sbatch farm_perceive.sbatch
+
 # Fusion with the public cache.  Writes fusion.npz, fusion_predictions.csv,
 # fusion_metrics_public.json, and fusion_validation.json.
 .venv/bin/python -m possession_lab fusion \

@@ -45,7 +45,13 @@ from .model import (
     merge_isolated_runs,
     viterbi,
 )
-from .perception import VideoBallTracker, VideoPerception, load_perception, save_perception
+from .perception import (
+    VideoBallTracker,
+    VideoPerception,
+    load_perception,
+    merge_perception,
+    save_perception,
+)
 from .pipeline import (
     LabData,
     decode_public,
@@ -98,6 +104,7 @@ __all__ = [
     "VideoPerception",
     "VideoBallTracker",
     "load_perception",
+    "merge_perception",
     "save_perception",
     # Features
     "Features",

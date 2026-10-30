@@ -358,7 +358,8 @@ def cmd_perceive(args: argparse.Namespace) -> int:
     stop = int(args.stop if args.stop is not None else PUBLIC_STOP)
     path = Path(args.perception) if args.perception else output_dir / "perception.npz"
     print(
-        f"perception: {start:,}..{stop:,} step {args.step}, model {args.model}"
+        f"perception: {start:,}..{stop:,} step {args.step}, stage {args.stage}, model {args.model}"
+        + (f" + players:{args.players_model}" if args.players_model else "")
         + (f" + ball:{args.ball_model}" if args.ball_model else "")
         + f", device {args.device or 'auto'}"
     )
@@ -370,10 +371,13 @@ def cmd_perceive(args: argparse.Namespace) -> int:
         stop=stop,
         step=args.step,
         model=args.model,
+        players_model=args.players_model,
         ball_model=args.ball_model,
+        players_imgsz=args.players_imgsz,
         ball_imgsz=args.ball_imgsz,
         device=args.device,
         imgsz=args.imgsz,
+        stage=args.stage,
         progress=True,
     )
     saved = save_perception(path, perception)
@@ -521,11 +525,28 @@ def build_parser() -> argparse.ArgumentParser:
     perception.add_argument("--step", type=int, default=1, help="process every Nth video frame (default: 1)")
     perception.add_argument("--model", default="yolo11x.pt", help="Ultralytics weights (default: yolo11x.pt)")
     perception.add_argument(
+        "--players-model",
+        default=None,
+        help="dedicated player weights (player/GK/ref classes are all treated as people)",
+    )
+    perception.add_argument(
+        "--players-imgsz",
+        type=int,
+        default=None,
+        help="inference size for --players-model (default: --imgsz)",
+    )
+    perception.add_argument(
         "--ball-model",
         default=None,
         help="dedicated ball weights (e.g. ball_training/weights/ball_yolo11s_best.pt); default: ball from --model",
     )
     perception.add_argument("--ball-imgsz", type=int, default=1280, help="inference size for --ball-model (default: 1280)")
+    perception.add_argument(
+        "--stage",
+        choices=["both", "players", "ball"],
+        default="both",
+        help="run both detector families or only one of them (default: both)",
+    )
     perception.add_argument("--device", default=None, help="YOLO device, e.g. 0 or cpu (default: auto)")
     perception.add_argument("--imgsz", type=int, default=1920, help="YOLO inference size (default: 1920)")
     perception.add_argument("--combine-mode", choices=["log", "linear"], default="log", help="ballot pool (default: log)")
