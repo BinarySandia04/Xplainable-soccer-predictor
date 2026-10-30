@@ -52,6 +52,7 @@ ball_training/external/
 ball_training/match/
 ball_training/runs/
 ball_training/visualizations/
+ball_training/ball_data/
 
 # -- internal documents ---------------------------------------------------------------------------
 # OVERVIEW.md -- the institutional description of the competition -- IS committed. It is the only
@@ -100,3 +101,4 @@ env/
 *.tmp
 *.swp
 *~
+match.tar
