@@ -485,6 +485,49 @@ class FrameStoreMultiSourceTest(unittest.TestCase):
         self.assertEqual(payload["fusion"]["sources"][0]["role"], "prior")
 
 
+class AtdKeeperTeamTest(unittest.TestCase):
+    """The 2D ATD dot of a keeper follows the goal he stands in, not the slot's club id."""
+
+    @staticmethod
+    def _store() -> FrameStore:
+        n = 20000
+        players = np.zeros((n, 2, 2), dtype=np.float32)
+        players[:, 0] = [10.0, 34.0]
+        players[:, 1] = [95.0, 34.0]
+        players[19814, 1] = [16.2, 29.6]  # Athletic's keeper slot follows Barcelona's keeper
+        tracking = SimpleNamespace(
+            n_frames=n,
+            ball=np.zeros((n, 2), dtype=np.float32),
+            ball_present=np.ones(n, dtype=bool),
+            players=players,
+            speeds=np.zeros((n, 2), dtype=np.float32),
+            player_present=np.ones((n, 2), dtype=bool),
+            teams=np.array([0, 1], dtype=np.int8),
+            pitch=(105.3, 68.0),
+        )
+        homography = SimpleNamespace(matrices=np.repeat(np.eye(3)[None], n, axis=0))
+        combined = SimpleNamespace(
+            source=np.zeros(n, dtype=np.int8),
+            estimate=np.zeros((n, 2), dtype=np.float32),
+            confidence=np.ones(n, dtype=np.float32),
+            gap_s=np.zeros(n, dtype=np.float32),
+            out_of_play=np.zeros(n, dtype=bool),
+        )
+        return FrameStore(
+            tracking,
+            homography,
+            combined,
+            SimpleNamespace(goals=(), stoppages=()),
+            SimpleNamespace(start=0),
+        )
+
+    def test_keeper_dot_uses_the_goal_side_not_the_slot_id(self):
+        store = self._store()
+        self.assertEqual(store._atd_team(19814, 1, 16.2, 29.6), 0)
+        self.assertEqual(store._atd_team(19814, 1, 95.0, 34.0), 1)
+        self.assertEqual(store._atd_team(19814, 0, 10.0, 34.0), 0)
+
+
 class UserTruthTest(unittest.TestCase):
     def test_scores_prediction_against_labeled_runs_only(self):
         pred = np.array([H, H, A, A, X, X], dtype=np.int8)

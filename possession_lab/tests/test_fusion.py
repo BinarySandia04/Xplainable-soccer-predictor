@@ -15,6 +15,7 @@ from possession_lab.features import extract_features
 from possession_lab.fusion import build_fusion, load_fusion, save_fusion
 from possession_lab.fusion.ballot import ballot_reason
 from possession_lab.fusion.resample import resample_perception
+from possession_lab.fusion.voters import video_gap_dead
 from possession_lab.perception import _empty_perception
 
 
@@ -179,6 +180,44 @@ class FusionBuildTest(unittest.TestCase):
     def test_missing_fusion_cache_returns_none(self):
         with TemporaryDirectory() as temp:
             self.assertIsNone(load_fusion(Path(temp) / "absent.npz"))
+
+
+class VideoGapDeadTest(unittest.TestCase):
+    """A blind window with the ball out on both sides is a retrieval gap, not live play."""
+
+    @staticmethod
+    def arrays(n: int = 240, gap_end: int = 160, last_out: bool = True, re_out: bool = True):
+        atd_present = np.ones(n, dtype=bool)
+        atd_present[55:gap_end] = False
+        atd_ball = np.tile(np.array([50.0, 34.0]), (n, 1))
+        atd_ball[gap_end:] = [50.0, -2.0] if re_out else [50.0, 34.0]
+        video_ball = np.full((n, 2), np.nan)
+        video_ball[:60] = [50.0, -1.0] if last_out else [50.0, 1.0]
+        video_conf = np.zeros(n)
+        video_conf[:60] = 0.5
+        return atd_present, atd_ball, video_ball, video_conf
+
+    def test_gap_between_two_outside_observations_is_dead(self):
+        arrays = self.arrays()
+        dead = video_gap_dead(*arrays, (105.0, 68.0))
+        self.assertTrue(dead[60:160].all())
+        self.assertFalse(dead[59])
+        self.assertFalse(dead[160])
+
+    def test_camera_cut_that_returns_inside_is_not_dead(self):
+        arrays = self.arrays(re_out=False)
+        dead = video_gap_dead(*arrays, (105.0, 68.0))
+        self.assertFalse(dead.any())
+
+    def test_gap_that_starts_inside_is_not_dead(self):
+        arrays = self.arrays(last_out=False)
+        dead = video_gap_dead(*arrays, (105.0, 68.0))
+        self.assertFalse(dead.any())
+
+    def test_short_gap_is_not_dead(self):
+        arrays = self.arrays()
+        dead = video_gap_dead(*arrays, (105.0, 68.0), min_gap_frames=120)
+        self.assertFalse(dead.any())
 
 
 class SourceReasonTest(unittest.TestCase):

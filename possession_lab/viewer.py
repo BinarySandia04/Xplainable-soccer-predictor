@@ -57,6 +57,7 @@ from .config import (
     asset_paths,
 )
 from .data import TagTable, load_public_gt, load_smart_tags, load_submission
+from .keepers import derive_keeper_slots, half_index
 from .perception import _run_ball_track
 
 # Viewer-only ball association.  The yolo layer recomputes the ball track when the viewer loads, so
@@ -499,6 +500,12 @@ class FrameStore:
         self.fusion = fusion
         self.trail_frames = max(1, int(trail_frames))
         self.n_frames = int(tracking.n_frames)
+        # ATD swaps or freezes its keeper slots under pressure (measured 19 814: the Barcelona
+        # keeper is carried by Athletic's roster slot).  The roster geometry still says which
+        # team defends each goal, so the 2D dots can relabel a keeper by the area he stands in.
+        self.keeper_slots = derive_keeper_slots(
+            tracking.players, tracking.teams, tuple(tracking.pitch), GRADED_HALVES
+        )
         self._yolo_ball_pitch: np.ndarray | None = None
         self._yolo_ball_confidence: np.ndarray | None = None
         self._yolo_ball_selected: np.ndarray | None = None
@@ -541,6 +548,29 @@ class FrameStore:
         if values is None or len(values) != self.n_frames:
             return None
         return values[frame]
+
+    def _atd_team(self, frame: int, index: int, x: float, y: float) -> int:
+        """Team for an ATD dot, with a keeper relabelled by the goal he stands in.
+
+        The slot's nominal team is the ATD opinion; when the slot is one of the half's two
+        keepers and its feet are inside a penalty area, the roster geometry of *that* goal
+        is stronger evidence than the slot id (the two keeper slots swap under pressure).
+        """
+        team = int(self.tracking.teams[index]) if index < len(self.tracking.teams) else -1
+        h = half_index(frame, GRADED_HALVES)
+        if h < 0:
+            return team
+        slots = {int(slot) for slot in self.keeper_slots.slot[h] if int(slot) >= 0}
+        if index not in slots:
+            return team
+        length, width = (float(value) for value in self.tracking.pitch)
+        side = 0 if x < length / 2.0 else 1
+        goal_x = 0.0 if side == 0 else length
+        if abs(x - goal_x) <= 18.5 and abs(y - width / 2.0) <= 21.0:
+            right = int(self.keeper_slots.team[h, side])
+            if right >= 0:
+                return right
+        return team
 
     def _features_payload(self, frame: int) -> dict[str, Any]:
         names = (
@@ -958,7 +988,6 @@ class FrameStore:
         players_xy = self.tracking.players[frame]
         speeds = self.tracking.speeds[frame]
         present = self.tracking.player_present[frame]
-        teams = self.tracking.teams
         for index in range(players_xy.shape[0]):
             if not bool(present[index]):
                 continue
@@ -972,7 +1001,7 @@ class FrameStore:
                     "y": round(y, 2),
                     "px": pixel[0] if pixel is not None else None,
                     "py": pixel[1] if pixel is not None else None,
-                    "team": int(teams[index]) if index < len(teams) else -1,
+                    "team": self._atd_team(frame, index, x, y),
                     "speed": _finite(speeds[index]) if np.isfinite(speeds[index]) else None,
                 }
             )

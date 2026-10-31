@@ -772,6 +772,50 @@ class KeeperHoldTests(unittest.TestCase):
         holds = keeper_holds(ev, contain, dead, defs, (105.0, 68.0), halves, params)
         self.assertEqual(holds, [])
 
+    @staticmethod
+    def pass_world(interrupt: bool = False, n: int = 140, catch: int = 90):
+        """A keeper catch at 90, released by a teammate at 50 after a clean flight."""
+        dead = np.zeros(n, dtype=bool)
+        boxes = np.zeros((n, 3, 4))
+        boxes[:, 0] = [0.0, 0.0, 20.0, 40.0]  # keeper box, centre (10, 20)
+        boxes[:, 1] = [300.0, 0.0, 320.0, 40.0]  # passer, far from the held pixel
+        boxes[:, 2] = [600.0, 0.0, 620.0, 40.0]  # opponent, farther still
+        pitch = np.zeros((n, 3, 2))
+        pitch[:, 0] = [10.0, 34.0]  # keeper, own area
+        pitch[:, 1] = [30.0, 34.0]  # passer
+        pitch[:, 2] = [20.0, 34.0] if interrupt else [100.0, 34.0]
+        ball = np.full((n, 2), [500.0, 500.0])
+        ball[catch:120] = [40.0, 20.0]  # 30 px from the keeper box centre
+        ball_pitch = np.full((n, 2), np.nan)
+        ball_pitch[50:70] = [30.0, 34.0]  # control at the passer's feet
+        ball_pitch[70:catch, 0] = np.linspace(30.0, 10.0, catch - 70)
+        ball_pitch[70:catch, 1] = 34.0  # flight to the keeper
+        ball_pitch[catch:120] = [10.0, 34.0]  # held
+        ev = BoxEvidence(
+            boxes=boxes,
+            team=np.tile(np.array([H, H, A], dtype=np.int8), (n, 1)),
+            present=np.ones((n, 3), dtype=bool),
+            ball_yolo=ball,
+            ball_yolo_present=np.ones(n, dtype=bool),
+            ball_atd=ball.copy(),
+            pitch=pitch,
+            ball_pitch=ball_pitch,
+        )
+        contain = np.zeros(n, dtype=np.int8)
+        return dead, ev, contain, np.array([[H, A], [H, A]], dtype=np.int8), ((0, n),)
+
+    def test_hold_extends_back_through_the_pass_to_the_release(self):
+        dead, ev, contain, defs, halves = self.pass_world()
+        holds = keeper_holds(ev, contain, dead, defs, (105.0, 68.0), halves)
+        self.assertEqual(len(holds), 1)
+        self.assertEqual((holds[0].start, holds[0].frame, holds[0].team), (50, 119, H))
+
+    def test_an_opponent_touch_blocks_the_pass_extension(self):
+        dead, ev, contain, defs, halves = self.pass_world(interrupt=True)
+        holds = keeper_holds(ev, contain, dead, defs, (105.0, 68.0), halves)
+        self.assertEqual(len(holds), 1)
+        self.assertEqual(holds[0].start, 90)  # the catch, not the pass
+
 
 class DeadBlindCarryTests(unittest.TestCase):
     """A dead ball that went blind stays dead; live states keep decoding."""
