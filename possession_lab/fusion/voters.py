@@ -156,6 +156,83 @@ def _fit_event_mask(mask: np.ndarray, n: int) -> np.ndarray:
     return np.pad(mask, (0, n - mask.size))
 
 
+def _off_pitch(point: np.ndarray, pitch: tuple[float, float], margin: float) -> bool:
+    """True when a pitch point lies clearly beyond a touch/goal line."""
+    if not np.isfinite(point).all():
+        return False
+    length, width = float(pitch[0]), float(pitch[1])
+    return bool(
+        point[0] < -margin
+        or point[0] > length + margin
+        or point[1] < -margin
+        or point[1] > width + margin
+    )
+
+
+def video_gap_dead(
+    atd_present: np.ndarray,
+    atd_ball: np.ndarray,
+    video_ball: np.ndarray,
+    video_confidence: np.ndarray,
+    pitch: tuple[float, float],
+    *,
+    min_gap_frames: int = 60,
+    min_confidence: float = 0.02,
+    out_margin: float = 0.05,
+) -> np.ndarray:
+    """Dead-ball gaps proven by the ball being out on *both* sides of a blind window.
+
+    The ATD event rule only fires when the last *ATD* observation was beyond the line, so a
+    ball lost while still inside — the camera panned away as it crossed — is never dead.
+    The video ball closes that hole: when the most recent observation from either stream is
+    beyond the line, every stream then loses the ball for at least ``min_gap_frames``, and
+    the first observation afterwards is still beyond the line, the ball was out of play for
+    the whole gap.  Requiring the re-detection to be out too keeps a camera cut while the
+    ball is live (last out, next in) from becoming a false dead interval.
+    """
+    n = int(np.asarray(atd_present).shape[0])
+    dead = np.zeros(n, dtype=bool)
+    if n == 0:
+        return dead
+    atd = np.asarray(atd_present, dtype=bool)
+    atd_xy = np.asarray(atd_ball, dtype=np.float64)
+    video_xy = np.asarray(video_ball, dtype=np.float64)
+    conf = np.asarray(video_confidence, dtype=np.float64)
+    seen_atd = atd & np.isfinite(atd_xy).all(axis=1)
+    seen_video = np.isfinite(video_xy).all(axis=1) & (conf > float(min_confidence))
+    seen = seen_atd | seen_video
+    atd_idx = np.flatnonzero(seen_atd)
+    video_idx = np.flatnonzero(seen_video)
+    t = 0
+    while t < n:
+        if seen[t]:
+            t += 1
+            continue
+        start = t
+        while t < n and not seen[t]:
+            t += 1
+        stop = t
+        if stop - start < int(min_gap_frames):
+            continue
+        a_pos = int(np.searchsorted(atd_idx, start))
+        v_pos = int(np.searchsorted(video_idx, start))
+        last_atd = int(atd_idx[a_pos - 1]) if a_pos > 0 else -1
+        last_video = int(video_idx[v_pos - 1]) if v_pos > 0 else -1
+        last = max(last_atd, last_video)
+        if last < 0:
+            continue
+        last_point = atd_xy[last] if last == last_atd else video_xy[last]
+        a_next = int(atd_idx[a_pos]) if a_pos < atd_idx.size else n
+        v_next = int(video_idx[v_pos]) if v_pos < video_idx.size else n
+        nxt = min(a_next, v_next)
+        if nxt >= n:
+            continue
+        next_point = atd_xy[nxt] if nxt == a_next else video_xy[nxt]
+        if _off_pitch(last_point, pitch, out_margin) and _off_pitch(next_point, pitch, out_margin):
+            dead[start:nxt] = True
+    return dead
+
+
 # ------------------------------------------------------------------------ the voters
 
 
@@ -518,7 +595,15 @@ class EventsVoter:
             stop = _fit_event_mask(getattr(events, "stop_dead", stop), n)
         else:
             dead = goal | stop
-        kind = np.where(goal, 1, np.where(stop, 2, 0)).astype(np.int8)
+        video_dead = video_gap_dead(
+            ctx.atd.present,
+            ctx.atd.ball,
+            np.asarray(ctx.video.get("ball_pitch", np.full((n, 2), np.nan))),
+            np.asarray(ctx.video.get("ball_confidence", np.zeros(n))),
+            tuple(ctx.tracking.pitch),
+        )
+        dead = dead | video_dead
+        kind = np.where(goal, 1, np.where(stop | video_dead, 2, 0)).astype(np.int8)
         probability = np.tile(PRIOR, (n, 1))
         probability[dead] = np.array([0.0, 0.0, 1.0])
         weight = np.where(dead, 1.0, 0.0)

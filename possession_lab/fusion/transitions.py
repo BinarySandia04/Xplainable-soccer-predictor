@@ -141,6 +141,15 @@ class TransitionParams:
     keeper_hold_move_m: float = 8.0  # holder stays this near its hold median (detector id swaps)
     keeper_hold_opp_frac: float = 0.25  # max share of frames with an opponent box nearer
     keeper_hold_anchor_contain_max: int = 5  # opponent ball-in-box frames allowed across the hold
+    # The catch ends a pass: the camera watched the ball travel from a same-team player to
+    # the keeper without an opponent touching it, so the *pass itself* belongs to the
+    # catcher's team.  Extend the hold back over that flight to the last frame the ball was
+    # within ``keeper_hold_pass_m`` of an outfield teammate.  Measured 19 814-19 859: the
+    # fused spell read Athletic for the whole pass while Barcelona's player released it at
+    # 19 814 and the keeper caught it at 19 859.
+    keeper_hold_pass_m: float = 3.0  # ball-to-teammate radius that still counts as control
+    keeper_hold_pass_frames: int = 90  # max look-back through the pass (3.6 s)
+    keeper_hold_pass_gap: int = 8  # missing-ball frames tolerated inside the flight
 
 
 DEFAULT_TRANSITION_PARAMS = TransitionParams()
@@ -249,6 +258,7 @@ class BoxEvidence:
     ball_atd: np.ndarray  # (n, 2) float pixel, NaN where absent
     pitch: np.ndarray | None = None  # (n, p, 2) float metres, keeper-ness for the hold channel
     track: np.ndarray | None = None  # (n, p) int detector track ids (identity across occlusion)
+    ball_pitch: np.ndarray | None = None  # (n, 2) float metres, video ball for the pass extension
 
 
 def _contact_bits(
@@ -754,6 +764,80 @@ class KeeperHold:
     length: int  # frames held
 
 
+def _hold_pass_start(
+    catch: int,
+    team: int,
+    side: int,
+    ball_pitch: np.ndarray | None,
+    pitchp: np.ndarray,
+    teams: np.ndarray,
+    present: np.ndarray,
+    seen: np.ndarray,
+    pitch: tuple[float, float],
+    params: TransitionParams,
+) -> int:
+    """Walk a keeper catch back to the release of the pass that produced it.
+
+    The fused spell can flip to the other team while the ball is travelling to the keeper
+    (measured 19 814-19 858): the passer is beyond the possession boundary the gate already
+    passed, so the pass itself is never admitted as a contact.  The camera, however, saw a
+    clean flight: no opponent came within ``keeper_hold_pass_m`` of the ball between the
+    release and the catch.  Return the frame where the ball was last under a same-team
+    outfielder's control, or ``catch`` when there is no such release (a punt, a contested
+    ball, or no video ball position).
+    """
+    if (
+        ball_pitch is None
+        or params.keeper_hold_pass_frames <= 0
+        or params.keeper_hold_pass_m <= 0
+    ):
+        return catch
+    length, width = float(pitch[0]), float(pitch[1])
+    goal_x = 0.0 if side == 0 else length
+    lo = max(0, catch - int(params.keeper_hold_pass_frames))
+    anchor = catch
+    in_control = False
+    gap = 0
+    for k in range(catch - 1, lo - 1, -1):
+        point = ball_pitch[k]
+        if not bool(seen[k]) or not np.isfinite(point).all():
+            gap += 1
+            if gap > int(params.keeper_hold_pass_gap):
+                break
+            continue
+        gap = 0
+        d_team = np.inf
+        d_opp = np.inf
+        for i in range(pitchp.shape[1]):
+            if not bool(present[k, i]):
+                continue
+            px, py = float(pitchp[k, i, 0]), float(pitchp[k, i, 1])
+            if not (np.isfinite(px) and np.isfinite(py)):
+                continue
+            other = int(teams[k, i])
+            if other not in (H, 1):
+                continue
+            distance = float(np.hypot(px - float(point[0]), py - float(point[1])))
+            if other == team:
+                # the catcher's own area is the receiving end, not the passer
+                if (
+                    abs(px - goal_x) <= params.keeper_hold_depth_m
+                    and abs(py - width / 2.0) <= params.keeper_hold_half_width_m
+                ):
+                    continue
+                d_team = min(d_team, distance)
+            else:
+                d_opp = min(d_opp, distance)
+        if d_opp <= params.keeper_hold_pass_m:
+            break  # an opponent touched the ball: not a clean same-team pass
+        if d_team <= params.keeper_hold_pass_m:
+            anchor = k
+            in_control = True
+        elif in_control:
+            break  # the control run ended here: that next frame is the release
+    return anchor if in_control else catch
+
+
 def keeper_holds(
     evidence: BoxEvidence,
     contain: np.ndarray,
@@ -783,6 +867,11 @@ def keeper_holds(
     n = boxes.shape[0]
     yolo = np.asarray(evidence.ball_yolo, dtype=np.float64)
     atd = np.asarray(evidence.ball_atd, dtype=np.float64)
+    ball_pitch = (
+        np.asarray(evidence.ball_pitch, dtype=np.float64)
+        if evidence.ball_pitch is not None
+        else None
+    )
     y_ok = np.asarray(evidence.ball_yolo_present, dtype=bool) & np.isfinite(yolo).all(axis=1)
     a_ok = np.isfinite(atd).all(axis=1)
     ball = np.where(y_ok[:, None], yolo, atd)
@@ -855,7 +944,13 @@ def keeper_holds(
                 <= params.keeper_hold_anchor_contain_max
                 and float(dead[seg].mean()) <= params.dead_max
             ):
-                out.append(KeeperHold(start=rs, frame=t - 1, team=team, length=t - rs))
+                hx = float(pitchp[rs, int(holder[rs]), 0])
+                side = 0 if hx < length / 2.0 else 1
+                start = _hold_pass_start(
+                    rs, team, side, ball_pitch, pitchp, teams, present, seen,
+                    (length, width), params,
+                )
+                out.append(KeeperHold(start=start, frame=t - 1, team=team, length=t - rs))
         rs = -1
     return out
 

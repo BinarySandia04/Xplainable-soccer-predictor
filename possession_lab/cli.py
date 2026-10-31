@@ -551,6 +551,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                         ball_atd=np.asarray(z["ball_pixel"]),
                         pitch=vpitch,
                         track=np.asarray(z["players_track"]) if "players_track" in z else None,
+                        ball_pitch=np.asarray(z["ball_pitch"]) if "ball_pitch" in z else None,
                     )
             if vpitch.shape[0] != n:
                 print(
