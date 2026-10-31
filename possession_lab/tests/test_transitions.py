@@ -26,6 +26,7 @@ from possession_lab.fusion.transitions import (
     evidence_probability,
     gate_events,
     gate_pixel_events,
+    keeper_holds,
     pixel_contact,
     relay_contacts,
 )
@@ -627,6 +628,149 @@ class RelayContactTests(unittest.TestCase):
         self.assertEqual(relay_contacts(contact, contain, ev, all_dead, ballots), frozenset())
         short = [(400, 4.0, H, 1.0)]  # below the solid-run bar
         self.assertEqual(relay_contacts(short, contain, ev, codes, ballots), frozenset())
+
+
+class KeeperHoldTests(unittest.TestCase):
+    """A goalkeeper holding the ball inside his own area is possession from the catch."""
+
+    @staticmethod
+    def world(
+        n: int = 120,
+        hold: tuple[int, int] = (40, 80),
+        speed_px: float = 3.0,
+        pitch_x: float = 10.0,
+        defenders: tuple = ((H, A), (H, A)),
+        dead=None,
+    ):
+        codes = np.full(n, A, dtype=np.int8)  # the spell reads the *other* team
+        codes[100:] = D  # a dead-ball boundary the owned interval must stop at
+        prob = np.full((n, 3), 0.15)
+        prob[:, A] = 0.7
+        dead = np.zeros(n, dtype=bool) if dead is None else dead
+        boxes = np.zeros((n, 2, 4))
+        boxes[:, 0] = [0.0, 0.0, 20.0, 40.0]  # holder box, centre (10, 20)
+        boxes[:, 1] = [200.0, 0.0, 220.0, 40.0]  # opponent far away, centre (210, 20)
+        pitch = np.zeros((n, 2, 2))
+        pitch[:, 0] = [pitch_x, 34.0]  # holder stands on the goal line's area, x=0 side
+        pitch[:, 1] = [100.0, 34.0]
+        ball = np.full((n, 2), [500.0, 500.0])  # off scene: nobody holds the ball
+        seg = slice(hold[0], hold[1])
+        ball[seg] = [40.0, 20.0]  # 30 px from the holder box centre
+        ball[seg, 0] += (np.arange(hold[1] - hold[0]) % 2) * speed_px  # jitter sets pixel speed
+        ev = BoxEvidence(
+            boxes=boxes,
+            team=np.tile(np.array([H, A], dtype=np.int8), (n, 1)),
+            present=np.ones((n, 2), dtype=bool),
+            ball_yolo=ball,
+            ball_yolo_present=np.ones(n, dtype=bool),
+            ball_atd=ball.copy(),
+            pitch=pitch,
+        )
+        contain = np.zeros(n, dtype=np.int8)
+        defs = np.asarray(defenders, dtype=np.int8)
+        return codes, prob, dead, ev, contain, defs, ((0, n),)
+
+    def test_a_keeper_hold_inside_its_own_area_fires_and_owns_the_spell(self):
+        codes, prob, dead, ev, contain, defs, halves = self.world()
+        holds = keeper_holds(ev, contain, dead, defs, (105.0, 68.0), halves)
+        self.assertEqual(len(holds), 1)
+        self.assertEqual((holds[0].start, holds[0].frame, holds[0].team), (40, 79, H))
+        kept, intervals = gate_pixel_events([], [], contain, codes, prob, dead, (), holds=holds)
+        self.assertEqual([e.kind for e in kept], ["hold"])
+        # owned from the catch to the next fused code boundary, never into the dead ball
+        self.assertEqual([(a, b, t) for a, b, t in intervals], [(40, 100, H)])
+
+    def test_a_fast_ball_past_the_area_is_not_a_hold(self):
+        _codes, _prob, dead, ev, contain, defs, halves = self.world(speed_px=12.0)
+        self.assertEqual(keeper_holds(ev, contain, dead, defs, (105.0, 68.0), halves), [])
+
+    def test_a_hold_needs_the_defending_side_of_that_goal(self):
+        _codes, _prob, dead, ev, contain, defs, halves = self.world(defenders=((A, H), (A, H)))
+        self.assertEqual(keeper_holds(ev, contain, dead, defs, (105.0, 68.0), halves), [])
+
+    def test_a_hold_needs_the_penalty_area(self):
+        _codes, _prob, dead, ev, contain, defs, halves = self.world(pitch_x=40.0)
+        self.assertEqual(keeper_holds(ev, contain, dead, defs, (105.0, 68.0), halves), [])
+
+    def test_dead_frames_do_not_count_into_a_hold(self):
+        dead = np.zeros(120, dtype=bool)
+        dead[40:80] = True
+        _codes, _prob, dead, ev, contain, defs, halves = self.world(dead=dead)
+        self.assertEqual(keeper_holds(ev, contain, dead, defs, (105.0, 68.0), halves), [])
+
+    def test_opponent_containment_breaks_the_hold(self):
+        _codes, _prob, dead, ev, contain, defs, halves = self.world()
+        contain[50:56] = 2  # six opponent ball-in-box frames across the hold
+        self.assertEqual(keeper_holds(ev, contain, dead, defs, (105.0, 68.0), halves), [])
+
+    def test_holder_may_change_detector_id_inside_the_hold(self):
+        # identity is positional, not the detector id: the ball sits still while two
+        # overlapping boxes of the same keeper alternate as the nearest one
+        n = 80
+        dead = np.zeros(n, dtype=bool)
+        boxes = np.zeros((n, 3, 4))
+        boxes[:, 1] = [200.0, 0.0, 220.0, 40.0]  # opponent far away
+        for t in range(n):
+            if t % 2 == 0:
+                boxes[t, 0] = [24.0, 0.0, 32.0, 40.0]  # keeper box A, centre (28, 20)
+                boxes[t, 2] = [46.0, 0.0, 54.0, 40.0]  # keeper box B, centre (50, 20)
+            else:
+                boxes[t, 2] = [25.0, 0.0, 33.0, 40.0]  # now B is nearest (29, 20)
+                boxes[t, 0] = [46.0, 0.0, 54.0, 40.0]
+        pitch = np.zeros((n, 3, 2))
+        pitch[:, 0] = [10.0, 34.0]  # both boxes report the keeper's own-area pitch
+        pitch[:, 2] = [11.0, 34.0]
+        pitch[:, 1] = [100.0, 34.0]
+        ball = np.full((n, 2), [30.0, 20.0])  # the held ball: not moving
+        ev = BoxEvidence(
+            boxes=boxes,
+            team=np.tile(np.array([H, A, H], dtype=np.int8), (n, 1)),
+            present=np.ones((n, 3), dtype=bool),
+            ball_yolo=ball,
+            ball_yolo_present=np.ones(n, dtype=bool),
+            ball_atd=ball.copy(),
+            pitch=pitch,
+        )
+        holds = keeper_holds(ev, np.zeros(n, dtype=np.int8), dead,
+                             np.array([[H, A], [H, A]], dtype=np.int8), (105.0, 68.0), ((0, n),))
+        self.assertEqual(len(holds), 1)
+        self.assertEqual((holds[0].start, holds[0].frame, holds[0].team), (0, 79, H))
+
+    def test_gate_skips_a_hold_when_the_spell_is_already_dead(self):
+        codes, _prob, dead, ev, contain, defs, halves = self.world()
+        codes[:] = D
+        holds = keeper_holds(ev, contain, dead, defs, (105.0, 68.0), halves)
+        _, intervals = gate_pixel_events([], [], contain, codes, np.full((120, 3), 0.4), dead, (), holds=holds)
+        self.assertEqual(intervals, [])
+
+    def test_a_hold_hands_over_at_the_pixel_owned_front_edge(self):
+        # a relay contact decides the boundary itself: the hold keeps the catch up to
+        # that interval's front edge instead of losing the whole stretch to overlap
+        codes, prob, dead, ev, contain, defs, halves = self.world()
+        holds = keeper_holds(ev, contain, dead, defs, (105.0, 68.0), halves)
+        kept, intervals = gate_pixel_events(
+            [(99, 5.0, H)], [], contain, codes, prob, dead, (),
+            relay=frozenset({(99, H)}), holds=holds,
+        )
+        self.assertEqual([e.kind for e in kept], ["contact", "hold"])
+        self.assertEqual(sorted(intervals), [(40, 99, H), (99, 100, H)])
+
+    def test_gate_skips_a_hold_the_pixel_channel_already_owns_whole(self):
+        codes, prob, dead, ev, contain, defs, halves = self.world()
+        holds = keeper_holds(ev, contain, dead, defs, (105.0, 68.0), halves)
+        kept, _intervals = gate_pixel_events(
+            [(35, 5.0, H)], [], contain, codes, prob, dead, (),
+            relay=frozenset({(35, H)}), holds=holds,
+        )
+        self.assertEqual([e.kind for e in kept], ["contact"])
+
+    def test_channel_disabled_without_defenders_or_frames(self):
+        _codes, _prob, dead, ev, contain, defs, halves = self.world()
+        holds = keeper_holds(ev, contain, dead, None, (105.0, 68.0), halves)
+        self.assertEqual(holds, [])
+        params = TransitionParams(keeper_hold_min_frames=0)
+        holds = keeper_holds(ev, contain, dead, defs, (105.0, 68.0), halves, params)
+        self.assertEqual(holds, [])
 
 
 class DeadBlindCarryTests(unittest.TestCase):

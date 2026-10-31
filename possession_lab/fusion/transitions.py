@@ -128,6 +128,19 @@ class TransitionParams:
     relay_anchor_window: int = 120  # lookback frames for the possession-dominance comparison
     relay_anchor_max: int = 10  # holder's ball-in-box frames in the window: at most this many ...
     relay_anchor_ratio: int = 4  # ... and this many times fewer than the event team's
+    # -- keeper hold: a player of the team that defends a goal keeping the ball inside his
+    # own penalty area *is* possession from the catch.  The sticky prior reads a hold as one
+    # more loose-ball window and the contact channel needs a fresh takeover, which a held
+    # ball never shows (measured 19 855-19 890: Barcelona's keeper held the ball a few tens
+    # of pixels inside his box while the spell read Athletic).  0 disables the channel.
+    keeper_hold_min_frames: int = 30  # a hold this long is a catch, not a touch
+    keeper_hold_px: float = 48.0  # ball pixel to holder box centre: held, not passing by
+    keeper_hold_speed_px: float = 8.0  # median ball-pixel speed across the hold (px/frame)
+    keeper_hold_depth_m: float = 18.5  # goal line to box edge (16.5 m + homography slack)
+    keeper_hold_half_width_m: float = 21.0  # penalty-area half-width 20.16 m + slack
+    keeper_hold_move_m: float = 8.0  # holder stays this near its hold median (detector id swaps)
+    keeper_hold_opp_frac: float = 0.25  # max share of frames with an opponent box nearer
+    keeper_hold_anchor_contain_max: int = 5  # opponent ball-in-box frames allowed across the hold
 
 
 DEFAULT_TRANSITION_PARAMS = TransitionParams()
@@ -145,7 +158,7 @@ class TransitionEvent:
     support: float  # mean pooled-evidence margin over the current holder
 
     def as_row(self) -> tuple[int, int, int, int, float, float]:
-        kind_code = {"kick": 0, "onset": 1, "contact": 2, "kicker": 3}[self.kind]
+        kind_code = {"kick": 0, "onset": 1, "contact": 2, "kicker": 3, "hold": 4}[self.kind]
         return (self.start, self.frame, kind_code, self.team, self.distance, self.support)
 
 
@@ -160,6 +173,7 @@ class TransitionLayerResult:
     n_gated_out: int
     n_contact: int = 0
     n_kicker: int = 0
+    n_hold: int = 0
 
 
 # --------------------------------------------------------------------------- ball kinematics
@@ -233,6 +247,8 @@ class BoxEvidence:
     ball_yolo: np.ndarray  # (n, 2) float pixel, NaN where absent
     ball_yolo_present: np.ndarray  # (n,) bool
     ball_atd: np.ndarray  # (n, 2) float pixel, NaN where absent
+    pitch: np.ndarray | None = None  # (n, p, 2) float metres, keeper-ness for the hold channel
+    track: np.ndarray | None = None  # (n, p) int detector track ids (identity across occlusion)
 
 
 def _contact_bits(
@@ -728,6 +744,122 @@ def relay_contacts(
     return frozenset(out)
 
 
+@dataclass(frozen=True)
+class KeeperHold:
+    """One keeper-hold run: ball held by a defending-side player inside his own area."""
+
+    start: int  # first hold frame (the catch)
+    frame: int  # last hold frame
+    team: int  # holder's team (H=0 / A=1)
+    length: int  # frames held
+
+
+def keeper_holds(
+    evidence: BoxEvidence,
+    contain: np.ndarray,
+    event_dead: np.ndarray,
+    defenders: np.ndarray,
+    pitch: tuple[float, float],
+    halves: tuple[tuple[int, int], ...],
+    params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
+) -> list[KeeperHold]:
+    """Ball-holds by the side that defends the goal the ball lies at (``keeper_hold_*``).
+
+    ``defenders[h, g]`` (the keeper roster geometry of :mod:`possession_lab.keepers`) says
+    which team defends goal ``g`` in half ``h``.  A hold is a run of frames where the
+    YOLO-first ball pixel sits within ``keeper_hold_px`` of one present player's box, that
+    player is on the defending side and inside its penalty area, and the ball is slow; the
+    run then also passes opponent-nearness, opponent-containment and dead-ball limits.
+    Detector ids swap during occlusion, so positional steadiness (``keeper_hold_move_m``),
+    not track identity, carries the holder.  ``keeper_hold_min_frames <= 0`` or a missing
+    ``evidence.pitch`` disables the channel.
+    """
+    if evidence.pitch is None or defenders is None or params.keeper_hold_min_frames <= 0:
+        return []
+    boxes = np.asarray(evidence.boxes, dtype=np.float64)
+    teams = np.asarray(evidence.team)
+    present = np.asarray(evidence.present, dtype=bool)
+    pitchp = np.asarray(evidence.pitch, dtype=np.float64)
+    n = boxes.shape[0]
+    yolo = np.asarray(evidence.ball_yolo, dtype=np.float64)
+    atd = np.asarray(evidence.ball_atd, dtype=np.float64)
+    y_ok = np.asarray(evidence.ball_yolo_present, dtype=bool) & np.isfinite(yolo).all(axis=1)
+    a_ok = np.isfinite(atd).all(axis=1)
+    ball = np.where(y_ok[:, None], yolo, atd)
+    seen = y_ok | a_ok
+    speed = np.full(n, np.nan)
+    speed[1:] = np.linalg.norm(ball[1:] - ball[:-1], axis=1)
+    length, width = float(pitch[0]), float(pitch[1])
+    half_of = np.full(n, -1, dtype=np.int8)
+    for h, (a, b) in enumerate(halves):
+        half_of[int(a):int(b)] = h
+    cx = (boxes[..., 0] + boxes[..., 2]) / 2.0
+    cy = (boxes[..., 1] + boxes[..., 3]) / 2.0
+    holder = np.full(n, -1, dtype=np.int16)
+    ball_d = np.full(n, np.inf)
+    opp_d = np.full(n, np.inf)  # distance to the nearest box of the other team
+    keeper_ok = np.zeros(n, dtype=bool)
+    for s in range(0, n, CHUNK):
+        e = min(n, s + CHUNK)
+        bx, by = ball[s:e, 0], ball[s:e, 1]
+        with np.errstate(invalid="ignore"):
+            d = np.hypot(cx[s:e] - bx[:, None], cy[s:e] - by[:, None])
+        d = np.where(present[s:e], d, np.inf)
+        p = np.argmin(d, axis=1)
+        dm = np.take_along_axis(d, p[:, None], axis=1)[:, 0]
+        for t in np.flatnonzero(seen[s:e] & (dm <= params.keeper_hold_px)):
+            j = s + int(t)
+            team = int(teams[j, p[t]])
+            if team not in (H, 1):
+                continue
+            px_, py_ = pitchp[j, p[t]]
+            if not np.isfinite([px_, py_]).all():
+                continue
+            side = 0 if px_ < length / 2.0 else 1
+            h_i = int(half_of[j])
+            if h_i < 0 or int(defenders[h_i, side]) != team:
+                continue
+            goal_x = 0.0 if side == 0 else length
+            if abs(px_ - goal_x) > params.keeper_hold_depth_m:
+                continue
+            if abs(py_ - width / 2.0) > params.keeper_hold_half_width_m:
+                continue
+            o_bit = 2 if team == H else 1
+            opp_d[j] = np.min(np.where((teams[j] == o_bit) & present[j], d[t], np.inf))
+            holder[j] = p[t]
+            ball_d[j] = dm[t]
+            keeper_ok[j] = True
+    out: list[KeeperHold] = []
+    contain_arr = np.asarray(contain)
+    dead = np.asarray(event_dead, dtype=np.float64)
+    rs = -1
+    for t in range(n + 1):
+        if t < n and keeper_ok[t]:
+            if rs < 0:
+                rs = t
+            continue
+        if rs >= 0 and t - rs >= params.keeper_hold_min_frames:
+            seg = slice(rs, t)
+            team = int(teams[rs, holder[rs]])
+            vv = speed[seg]
+            vv = vv[np.isfinite(vv)]
+            pos = pitchp[np.arange(rs, t), holder[rs:t]]
+            if (
+                vv.size
+                and float(np.median(vv)) <= params.keeper_hold_speed_px
+                and np.isfinite(pos).all()
+                and float(np.linalg.norm(pos - np.median(pos, axis=0), axis=1).max())
+                <= params.keeper_hold_move_m
+                and float((opp_d[seg] < ball_d[seg]).mean()) <= params.keeper_hold_opp_frac
+                and int(((contain_arr[seg] & (2 if team == H else 1)) > 0).sum())
+                <= params.keeper_hold_anchor_contain_max
+                and float(dead[seg].mean()) <= params.dead_max
+            ):
+                out.append(KeeperHold(start=rs, frame=t - 1, team=team, length=t - rs))
+        rs = -1
+    return out
+
+
 def gate_pixel_events(
     contact: Sequence[tuple],
     kicker: Sequence[tuple],
@@ -738,6 +870,7 @@ def gate_pixel_events(
     kept_kinematic: Sequence[TransitionEvent],
     params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
     relay: frozenset[tuple[int, int]] = frozenset(),
+    holds: Sequence[KeeperHold] = (),
 ) -> tuple[list[TransitionEvent], list[tuple[int, int, int]]]:
     """Admit pixel events into a sequential stream and hand out owned intervals.
 
@@ -831,6 +964,43 @@ def gate_pixel_events(
                             team=team, distance=close_px if not is_contact else 1.0, support=support)
         )
         intervals.append([start, stop, team])
+    # keeper holds own the stretch from the catch to the next fused boundary: the camera
+    # watched the ball sit in the defender's box, so this needs no boundary proximity and
+    # no momentum, but it never cuts into a frame the pixel channel already decided.
+    for hold in sorted(holds, key=lambda h: h.frame):
+        frame, team = int(hold.frame), int(hold.team)
+        if team not in (H, 1) or hold.length < params.keeper_hold_min_frames:
+            continue
+        k = int(np.searchsorted(bnd, frame, side="right"))
+        next_b = int(bnd[k]) if k < len(bnd) else n
+        for a, b, _ in intervals:
+            if a < next_b and hold.start < b:
+                next_b = a  # hand the stretch over at the pixel-owned front edge
+        if next_b <= hold.start:
+            continue  # a contact or kicker already owns the whole catch
+        cur = codes_pooled[max(0, frame - 20):frame]
+        cur = cur[(cur == H) | (cur == 1)]
+        holder = int(np.bincount(cur).argmax()) if cur.size else -1
+        for a, b, t_ in intervals:
+            if a <= frame < b:
+                holder = int(t_)
+        if holder < 0 or holder == team:
+            continue
+        if float(np.mean(event_dead[max(0, frame - 10):frame + 10])) > params.dead_max:
+            continue
+        if any(kev.team == team and abs(kev.frame - frame) < params.nms_window for kev in kept_kinematic):
+            continue  # kinematics already attributes this moment
+        start = int(hold.start)
+        for iv in intervals:
+            if iv[0] < start < iv[1]:
+                start = iv[1]
+        if start >= next_b:
+            continue
+        kept.append(
+            TransitionEvent(start=start, frame=frame, kind="hold", team=team,
+                            distance=1.0, support=1.0)
+        )
+        intervals.append([start, next_b, team])
     return kept, [(a, b, t_) for a, b, t_ in intervals]
 
 
@@ -847,7 +1017,9 @@ def build_pulse(
     for i, ev in enumerate(events):
         nxt = events[i + 1].start if i + 1 < len(events) else min(n_frames, ev.start + params.pulse_max_span)
         span = min(max(params.pulse_min_span, nxt - ev.start), params.pulse_max_span)
-        if ev.kind in ("contact", "kicker"):
+        if ev.kind == "hold":
+            strength = params.contact_pulse
+        elif ev.kind in ("contact", "kicker"):
             strength = (
                 params.contact_pulse_solid
                 if ev.kind == "contact" and ev.support >= params.contact_solid_support
@@ -1059,6 +1231,8 @@ def apply_transition_layer(
     ball_stale: np.ndarray | None = None,
     blind_dead: np.ndarray | None = None,
     ballots: Mapping[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    keeper_defenders: np.ndarray | None = None,
+    keeper_pitch: tuple[float, float] | None = None,
 ) -> TransitionLayerResult:
     """Detect, gate, and decode ball-control transitions on top of the fused poll.
 
@@ -1096,15 +1270,21 @@ def apply_transition_layer(
             else frozenset()
         )
         kicker = detect_kicker_events(box_evidence, touch, speed, params)
+        holds = (
+            keeper_holds(box_evidence, contain, event_dead, keeper_defenders, keeper_pitch,
+                         halves if halves is not None else GRADED_HALVES, params)
+            if keeper_defenders is not None and keeper_pitch is not None
+            else []
+        )
         pixel_kept, intervals = gate_pixel_events(
             contact, kicker, contain, codes_pooled, np.asarray(fused_probability, dtype=np.float64),
-            event_dead, events, params, relay=relay,
+            event_dead, events, params, relay=relay, holds=holds,
         )
         events = tuple(sorted(events + tuple(pixel_kept), key=lambda e: (e.start, e.frame)))
-        dropped += len(contact) + len(kicker) - len(pixel_kept)
-        n_contact, n_kicker = len(contact), len(kicker)
+        dropped += len(contact) + len(kicker) + len(holds) - len(pixel_kept)
+        n_contact, n_kicker, n_hold = len(contact), len(kicker), sum(1 for e in pixel_kept if e.kind == "hold")
     else:
-        n_contact = n_kicker = 0
+        n_contact = n_kicker = n_hold = 0
         intervals: list[tuple[int, int, int]] = []
     pulse, teams, boost, protect = build_pulse(events, codes_pooled.shape[0], params)
     log_em = np.log(np.clip(np.asarray(fused_probability, dtype=np.float64), EPS, 1.0)).copy()
@@ -1132,12 +1312,13 @@ def apply_transition_layer(
         n_gated_out=dropped,
         n_contact=n_contact,
         n_kicker=n_kicker,
+        n_hold=n_hold,
     )
 
 
 def events_to_rows(events: Sequence[TransitionEvent]) -> np.ndarray:
     """Events as an ``(m, 6)`` array: start, frame, kind (0=kick, 1=onset, 2=contact,
-    3=kicker), team, distance, support."""
+    3=kicker, 4=hold), team, distance, support."""
     if not events:
         return np.zeros((0, 6), dtype=np.float64)
     return np.asarray([e.as_row() for e in events], dtype=np.float64)
@@ -1165,5 +1346,7 @@ __all__ = [
     "evidence_probability",
     "gate_events",
     "gate_pixel_events",
+    "keeper_holds",
+    "KeeperHold",
     "pixel_contact",
 ]

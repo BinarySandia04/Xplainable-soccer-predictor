@@ -492,7 +492,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     """Layer event-gated control transitions onto a cached fusion pass, then score it."""
     import numpy as np
 
-    from .config import OUTPUT_DIR
+    from .config import GRADED_HALVES, OUTPUT_DIR
     from .evaluate import full_match_stats, public_metrics
     from .fusion.ballot import VoterRole
     from .fusion.transitions import (
@@ -549,6 +549,8 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                         ball_yolo=yolo_ball,
                         ball_yolo_present=yolo_seen,
                         ball_atd=np.asarray(z["ball_pixel"]),
+                        pitch=vpitch,
+                        track=np.asarray(z["players_track"]) if "players_track" in z else None,
                     )
             if vpitch.shape[0] != n:
                 print(
@@ -594,6 +596,16 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     ):
         relay_ballots = {key: (arrays[f"src_{key}_probability"], arrays[f"src_{key}_weight"]) for key in relay_keys}
     params = replace(DEFAULT_TRANSITION_PARAMS, relay_min_prob=float(args.relay_min_prob))
+    # the keeper-hold channel reads the half-level keeper roster geometry: which team
+    # defends each goal; the hold itself is detected in pixel evidence (see keeper_holds)
+    keeper_defenders = None
+    if int(args.keeper_hold_min_frames) > 0 and box_evidence is not None:
+        from .keepers import derive_keeper_slots
+
+        keeper_defenders = derive_keeper_slots(
+            lab.tracking.players, lab.tracking.teams, tuple(lab.tracking.pitch), GRADED_HALVES
+        ).team
+        params = replace(params, keeper_hold_min_frames=int(args.keeper_hold_min_frames))
     result = apply_transition_layer(
         codes_pooled=arrays["codes"].astype(np.int8),
         fused_probability=arrays["fused_probability"].astype(np.float64),
@@ -605,16 +617,18 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         ball_stale=gate_frames,
         blind_dead=blind_dead,
         ballots=relay_ballots,
+        keeper_defenders=keeper_defenders,
+        keeper_pitch=tuple(lab.tracking.pitch),
         params=params,
     )
     print(
         f"transitions: {result.n_kicks} kicks + {result.n_onsets} onsets detected, "
-        f"{result.n_contact} contacts + {result.n_kicker} win-and-clear kicks from boxes, "
-        f"{result.n_gated_out} gated out -> {len(result.events)} transition events"
+        f"{result.n_contact} contacts + {result.n_kicker} win-and-clear kicks + {result.n_hold} keeper holds "
+        f"from boxes, {result.n_gated_out} gated out -> {len(result.events)} transition events"
     )
     events_path = output_dir / "transition_events.csv"
     rows = events_to_rows(result.events)
-    kind_names = np.array(["kick", "onset", "contact", "kicker"])
+    kind_names = np.array(["kick", "onset", "contact", "kicker", "hold"])
     pd.DataFrame(
         {
             "start_frame": rows[:, 0].astype(int),
@@ -847,6 +861,14 @@ def build_parser() -> argparse.ArgumentParser:
         "ball/control voters sit at or above N for the contacting team, both ball streams pin "
         "the ball to the same single player's box, and the spell's team never shows the ball "
         "in its own boxes across the lookback window (default: 0.8; 0 disables)",
+    )
+    perception.add_argument(
+        "--keeper-hold-min-frames",
+        type=int,
+        default=30,
+        help="transitions: frames of ball held by the defending side inside its own penalty "
+        "area that count as a keeper catch: possession from the catch (a goalkeeper holding "
+        "the ball gives possession to his team). 0 disables (default: 30)",
     )
 
     viewer = parser.add_argument_group("viewer", "local video reviewer options")
