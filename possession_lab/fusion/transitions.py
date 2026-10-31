@@ -250,35 +250,34 @@ def _contact_bits(
 
 
 def pixel_contact(evidence: BoxEvidence) -> tuple[np.ndarray, np.ndarray]:
-    """Per-frame team bit flags (bit 0 = H, bit 1 = A) for both observed ball pixels.
+    """Per-frame team bit flags (bit 0 = H, bit 1 = A) for the observed ball pixel.
 
-    The YOLO detection and the ATD track are evaluated against the boxes independently
-    and OR-ed: either can register contact.  A single detection that disagrees with the
-    track contributes an isolated frame that the window rule filters out, while a genuine
-    ball-in-box (or a track the detector confirms) accumulates.
+    The ball pixel is one YOLO-first stream: the dedicated ball detector when it sees the
+    ball, the ATD projection otherwise.  A general track's ball pixel rides nearby players
+    and invents takeovers that never happened (measured 20 955: the ATD pixel sat 5-7 m
+    off the ball on an Athletic player for two seconds while YOLO held the ball on a
+    Barcelona player in 69 of 71 frames).  One continuous trajectory keeps a genuine
+    ball-in-box accumulating its run, and isolated frames the window rule filters out.
     """
     boxes = np.asarray(evidence.boxes, dtype=np.float64)
     teams = np.asarray(evidence.team)
     present = np.asarray(evidence.present, dtype=bool)
     atd = np.asarray(evidence.ball_atd, dtype=np.float64)
     yolo = np.asarray(evidence.ball_yolo, dtype=np.float64)
+    y_seen = np.asarray(evidence.ball_yolo_present, dtype=bool) & np.isfinite(yolo).all(axis=1)
+    ball = np.where(y_seen[:, None], yolo, atd)
     contain = np.zeros(boxes.shape[0], dtype=np.int8)
     touch = np.zeros(boxes.shape[0], dtype=np.int8)
-    y_seen = np.asarray(evidence.ball_yolo_present, dtype=bool)
     for s in range(0, boxes.shape[0], CHUNK):
         e = min(boxes.shape[0], s + CHUNK)
-        bx = np.where(y_seen[s:e, None], yolo[s:e], np.nan)
-        atd_ok = np.isfinite(atd[s:e])
-        py_atd = np.where(atd_ok[:, 0], atd[s:e, 1], np.nan)
-        py_yolo = np.where(y_seen[s:e] & np.isfinite(yolo[s:e, 1]), yolo[s:e, 1], np.nan)
-        for px, py in ((atd[s:e, 0], py_atd), (bx[:, 0], py_yolo)):
-            pc, pt = _contact_bits(
-                boxes[s:e], teams[s:e], present[s:e],
-                np.nan_to_num(px, nan=-1.0e9)[:, None], np.nan_to_num(py, nan=-1.0e9)[:, None],
-            )
-            keep = np.isfinite(px) & np.isfinite(py)
-            contain[s:e] |= np.where(keep, pc, 0)
-            touch[s:e] |= np.where(keep, pt, 0)
+        b = ball[s:e]
+        pc, pt = _contact_bits(
+            boxes[s:e], teams[s:e], present[s:e],
+            np.nan_to_num(b[:, 0], nan=-1.0e9)[:, None], np.nan_to_num(b[:, 1], nan=-1.0e9)[:, None],
+        )
+        keep = np.isfinite(b).all(axis=1)
+        contain[s:e] = np.where(keep, pc, 0)
+        touch[s:e] = np.where(keep, pt, 0)
     return contain, touch
 
 
@@ -328,15 +327,16 @@ def detect_contact_events(
 
 
 def _box_foot_distance(evidence: BoxEvidence) -> np.ndarray:
-    """Min pixel distance from the ball (ATD track preferred, else YOLO detection — one
-    continuous trajectory for release direction) to each team's box foot-centre.
-    ``(n, 2)`` float array, column 0 = team H, column 1 = team A."""
+    """Min pixel distance from the ball (YOLO detection preferred while it sees the ball,
+    else the ATD track — one continuous trajectory for release direction) to each team's
+    box foot-centre.  ``(n, 2)`` float array, column 0 = team H, column 1 = team A."""
     boxes = np.asarray(evidence.boxes, dtype=np.float64)
     teams = np.asarray(evidence.team)
     present = np.asarray(evidence.present, dtype=bool)
     atd = np.asarray(evidence.ball_atd, dtype=np.float64)
     yolo = np.asarray(evidence.ball_yolo, dtype=np.float64)
-    ball = np.where(np.isfinite(atd), atd, yolo)
+    y_seen = np.asarray(evidence.ball_yolo_present, dtype=bool) & np.isfinite(yolo).all(axis=1)
+    ball = np.where(y_seen[:, None], yolo, atd)
     n = boxes.shape[0]
     out = np.full((n, 2), np.inf)
     for s in range(0, n, CHUNK):
@@ -854,6 +854,91 @@ def ball_stale_mask(ball: np.ndarray, ball_present: np.ndarray, stale_frames: in
     return (idx - last > int(stale_frames)) & (nxt - idx > int(stale_frames))
 
 
+def ball_conflict_mask(
+    atd_ball: np.ndarray,
+    yolo_ball: np.ndarray,
+    min_distance: float = 5.0,
+    window: int = 60,
+    min_conflicts: int = 8,
+    pad: int = 0,
+) -> np.ndarray:
+    """Frames where the ATD ball and the dedicated-YOLO ball insist on different places.
+
+    Both sources track the same ball; more than ``min_distance`` metres apart *for a
+    sustained ``window`` stretch* means one of them is off the ball -- typically the ATD
+    slot drifting onto a nearby player while YOLO keeps the ball (measured 20 955: 5.7-6.8
+    m divergence for two seconds; the consensus ball rode the drift and a kinematic onset
+    handed possession to the player the drift passed -- the dedicated detector kept the
+    ball on Barcelona).  Kinematic events computed on those frames ride the wrong
+    trajectory and must be dropped.  Single-frame YOLO blips (wrong candidate,
+    ``min_conflicts`` guard) never gate.  The mask is grown ``pad`` frames on both sides:
+    the drift ramps in before the divergence crosses the distance threshold and settles
+    back over after.  The divergence alone decides nothing about who holds the ball (runs
+    of 4-25 m happen dozens of times during correctly-decided play) -- it may gate
+    trajectory-derived events only, never the pixel contact channel or the decode.
+    """
+    atd = np.asarray(atd_ball, dtype=np.float64)
+    yolo = np.asarray(yolo_ball, dtype=np.float64)
+    both = np.isfinite(atd).all(axis=1) & np.isfinite(yolo).all(axis=1)
+    if not both.any():
+        return np.zeros(atd.shape[0], dtype=bool)
+    with np.errstate(invalid="ignore"):
+        dist = np.linalg.norm(atd - yolo, axis=1)
+    raw = both & (dist > float(min_distance))
+    if not raw.any():
+        return np.zeros(atd.shape[0], dtype=bool)
+    counts = np.convolve(raw.astype(np.int64), np.ones(int(window), dtype=np.int64), mode="full")
+    counts = counts[int(window) - 1 : int(window) - 1 + raw.size]  # forward-window sums:
+    # a frame is marked while its next ``window`` frames hold >= min_conflicts divergent
+    # ones -- gating starts as the drift ramps in, before the sources finish splitting
+    out = counts >= int(min_conflicts)
+    pad = int(pad)
+    if pad > 0 and out.any():
+        idx = np.flatnonzero(out)
+        for d in range(-pad, pad + 1):
+            if d:
+                out[np.clip(idx + d, 0, out.size - 1)] = True
+    return out
+
+
+def carry_dead_through_blind(
+    codes: np.ndarray,
+    blind: np.ndarray,
+    halves: tuple[tuple[int, int], ...] | None = None,
+) -> np.ndarray:
+    """Carry a dead-ball state through frames where the ball cannot vouch for a restart.
+
+    Inside a deep ATD blind window at low consensus confidence the "restart" the decode
+    produces is the video-carried ball resuming the pre-stoppage trajectory -- not the
+    game (measured 19 394: inside the window the decode restarted Barcelona *while an
+    Athletic player physically held the throw-in ball*).  When the last state seen while
+    the ball was still reliable was *dead*, it holds until the window closes; live states
+    (H/A) keep decoding, because a takeover genuinely happens while the ball is hidden.
+    Applied after the decode so a blind window cannot perturb the rest of the half.
+    """
+    out = np.asarray(codes).copy()
+    mask = np.asarray(blind, dtype=bool)
+    if out.size == 0 or not mask.any():
+        return out
+    if halves is None:
+        halves = GRADED_HALVES
+    for start, stop in halves:
+        start, stop = int(start), int(stop)
+        i, n = start, min(stop, out.size)
+        while i < n:
+            if not mask[i]:
+                i += 1
+                continue
+            state = int(out[i - 1]) if i > 0 else int(out[i])
+            j = i
+            while j < n and mask[j]:
+                if state == D:
+                    out[j] = D
+                j += 1
+            i = j
+    return out
+
+
 def apply_transition_layer(
     *,
     codes_pooled: np.ndarray,
@@ -867,6 +952,7 @@ def apply_transition_layer(
     halves: tuple[tuple[int, int], ...] | None = None,
     box_evidence: BoxEvidence | None = None,
     ball_stale: np.ndarray | None = None,
+    blind_dead: np.ndarray | None = None,
 ) -> TransitionLayerResult:
     """Detect, gate, and decode ball-control transitions on top of the fused poll.
 
@@ -920,6 +1006,10 @@ def apply_transition_layer(
     if intervals:
         log_em -= np.log(np.exp(log_em).sum(axis=1, keepdims=True))
     codes = decode_with_events(log_em, boost, protect, np.asarray(event_dead, dtype=bool), model_params, halves)
+    if blind_dead is not None:
+        # a dead ball that went blind stays dead: the "restart" inside the window is the
+        # carried trajectory, not play (post-decode so a window cannot disturb the half)
+        codes = carry_dead_through_blind(codes, blind_dead, halves)
     return TransitionLayerResult(
         codes=codes,
         events=events,
@@ -946,8 +1036,11 @@ __all__ = [
     "TransitionLayerResult",
     "TransitionParams",
     "apply_transition_layer",
+    "ball_conflict_mask",
     "ball_speed",
+    "ball_stale_mask",
     "build_pulse",
+    "carry_dead_through_blind",
     "control_map",
     "decode_with_events",
     "detect_contact_events",

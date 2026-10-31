@@ -116,6 +116,38 @@ class RescueKeeperTeamsTest(unittest.TestCase):
         self.assertEqual(flips, [])
         self.assertTrue((fixed == -1).all())
 
+    def test_both_keeper_slots_on_one_side_resolves_to_nearest_goal(self):
+        # measured 19 863: during the stoppage the Athletic keeper slot froze away
+        # from goal 1 while gluing onto the holding Barcelona keeper, so both keeper
+        # slots sat on goal 0's side. The box nearest goal 0's goal mouth is the
+        # keeper standing there (Barça), whatever slot was projecting onto it.
+        atd = np.repeat(self.atd, 1, axis=0)
+        atd = self.atd.copy()
+        confusion = slice(100, 110)
+        atd[confusion, 0] = (21.6, 31.7)  # Barça's slot frozen midfield-ish
+        atd[confusion, 1] = (11.3, 29.5)  # Athletic's slot glued to the holding Barça keeper
+        keepers = derive_keeper_slots(atd, self.teams, PITCH, ((0, 300),))
+        self.assertEqual(keepers.slot[0].tolist(), [0, 1])
+        self.assertEqual(keepers.team[0].tolist(), [0, 1])
+        n, p = 120, 2
+        pixel = np.zeros((n, p, 2), dtype=np.float64)
+        pitch_xy = np.zeros((n, p, 2), dtype=np.float64)
+        pixel[:, 0] = (22.0 * 10, 31.9 * 10)  # claims the frozen slot 0 projection
+        pitch_xy[:, 0] = (22.0, 31.9)
+        pixel[:, 1] = (11.3 * 10, 29.5 * 10)  # claims the teleporting slot 1 projection
+        pitch_xy[:, 1] = (11.1, 29.1)
+        present = np.ones((n, p), dtype=bool)
+        teams = np.stack([np.full(n, 0), np.full(n, 1)], axis=1).astype(np.int8)
+        fixed, flips = rescue_keeper_teams(
+            pixel, pitch_xy, present, teams, atd,
+            np.repeat(self.matrix[None], n, axis=0), keepers, ((0, 300),), PITCH,
+        )
+        # the box standing in goal 0's mouth flips to its defender, team 0
+        self.assertTrue((fixed[confusion, 1] == 0).all())
+        self.assertTrue((fixed[:100, 1] == 1).all())  # untouched outside the confusion
+        self.assertEqual(len(flips), 10)
+        self.assertTrue((fixed[:, 0] == 0).all())  # other box keeps its team
+
     def test_frames_outside_halves_are_skipped(self):
         pixel, pitch_xy, present, teams = self._store([1])
         pixel[:, 0] = (1.5 * 10, WIDTH / 2 * 10)

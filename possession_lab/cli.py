@@ -498,6 +498,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     from .fusion.transitions import (
         BoxEvidence,
         apply_transition_layer,
+        ball_conflict_mask,
         ball_stale_mask,
         events_to_rows,
         evidence_probability,
@@ -525,6 +526,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     player_sets: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = [
         (lab.tracking.players, lab.tracking.teams, lab.tracking.player_present)
     ]
+    box_evidence = None
     if not args.no_perception:
         perception_path = Path(args.perception) if args.perception else output_dir / "perception.npz"
         if perception_path.is_file():
@@ -556,23 +558,40 @@ def cmd_transitions(args: argparse.Namespace) -> int:
             player_sets.insert(0, (vpitch, vteam, vpresent))
         else:
             print(f"transitions: no perception cache at {perception_path}; ATD players only")
+    stale_mask = None
+    if int(args.stale_gate_frames) > 0:
+        stale_mask = ball_stale_mask(
+            np.asarray(lab.tracking.ball),
+            np.asarray(lab.tracking.ball_present),
+            int(args.stale_gate_frames),
+        )
+    event_dead = arrays["event_dead"].astype(bool)
+    blind_dead = None
+    if float(args.dead_hold_confidence) > 0 and stale_mask is not None:
+        blind_dead = stale_mask & (
+            arrays["consensus_confidence"].astype(np.float64) < float(args.dead_hold_confidence)
+        )
+    # the conflict mask gates kinematic events only (its divergence says nothing about
+    # who holds the ball: the pixel channel and the decode must ignore it)
+    gate_frames = stale_mask
+    if float(args.conflict_min_meters) > 0 and "src_atd_ball_ball" in arrays and "src_yolo_ball_ball" in arrays:
+        conflict = ball_conflict_mask(
+            arrays["src_atd_ball_ball"].astype(np.float64),
+            arrays["src_yolo_ball_ball"].astype(np.float64),
+            float(args.conflict_min_meters),
+            pad=int(args.conflict_pad_frames),
+        )
+        gate_frames = conflict if gate_frames is None else (gate_frames | conflict)
     result = apply_transition_layer(
         codes_pooled=arrays["codes"].astype(np.int8),
         fused_probability=arrays["fused_probability"].astype(np.float64),
-        event_dead=arrays["event_dead"].astype(bool),
+        event_dead=event_dead,
         consensus_ball=arrays["consensus_ball"].astype(np.float64),
         evidence_prob=evidence_probability(probabilities, weights),
         player_sets=player_sets,
         box_evidence=box_evidence,
-        ball_stale=(
-            ball_stale_mask(
-                np.asarray(lab.tracking.ball),
-                np.asarray(lab.tracking.ball_present),
-                int(args.stale_gate_frames),
-            )
-            if int(args.stale_gate_frames) > 0
-            else None
-        ),
+        ball_stale=gate_frames,
+        blind_dead=blind_dead,
     )
     print(
         f"transitions: {result.n_kicks} kicks + {result.n_onsets} onsets detected, "
@@ -598,7 +617,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         codes=result.codes,
         events=rows,
         consensus_ball=arrays["consensus_ball"],
-        event_dead=arrays["event_dead"],
+        event_dead=event_dead,
         source_fusion=str(fusion_path),
     )
     submission = write_submission(result.codes, output_dir / "transition_predictions.csv")
@@ -780,6 +799,31 @@ def build_parser() -> argparse.ArgumentParser:
         default=125,
         help="transitions: drop kinematic kick/onset events inside ATD ball blind windows "
         "longer than N frames on both sides (default: 125 = 5 s; 0 disables)",
+    )
+    perception.add_argument(
+        "--conflict-min-meters",
+        type=float,
+        default=0.0,
+        help="transitions (optional): drop kinematic kick/onset events while ATD and YOLO "
+        "balls sit more than N metres apart for a sustained second (default: 0, disabled "
+        "-- large divergence is routine here: enabling ~5 fixes drift-pass spells e.g. "
+        "20 955, but also gates legitimate events inside divergent live play e.g. the "
+        "17.3k spell; measured net-negative on the public window)",
+    )
+    perception.add_argument(
+        "--conflict-pad-frames",
+        type=int,
+        default=40,
+        help="transitions: grow the source-conflict event gate N frames on both sides "
+        "(drift ramps in before the divergence crosses the threshold and settles after; "
+        "default: 40)",
+    )
+    perception.add_argument(
+        "--dead-hold-confidence",
+        type=float,
+        default=0.5,
+        help="transitions: freeze a dead-ball state across frames that are deep inside "
+        "an ATD ball blind window AND below consensus confidence N (default: 0.5; 0 disables)",
     )
 
     viewer = parser.add_argument_group("viewer", "local video reviewer options")

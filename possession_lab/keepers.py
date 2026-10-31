@@ -148,7 +148,12 @@ def rescue_keeper_teams(
             if not np.isfinite(foot).all():
                 continue
             side = goal_side(float(foot[0]), length)
-            dist_goal = float(np.hypot(foot[0] - g * length, 0.0))
+            # measure against the goal the box stands nearest, not the goal the
+            # claiming slot nominally guards: under the ATD confusion both keeper
+            # slots can sit on one side, and each slot's own goal is then a lie
+            # (measured 19 863: the Athletic keeper slot glued to the holding
+            # Barcelona keeper lost its claim 94-22 to Barça's frozen slot).
+            dist_goal = float(np.hypot(foot[0] - side * length, 0.0))
             key = side
             if key not in claimed or dist_goal < claimed[key][0]:
                 claimed[key] = (dist_goal, row)

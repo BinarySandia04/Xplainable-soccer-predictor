@@ -11,9 +11,11 @@ from possession_lab.fusion.transitions import (
     BoxEvidence,
     TransitionParams,
     apply_transition_layer,
+    ball_conflict_mask,
     ball_speed,
     ball_stale_mask,
     build_pulse,
+    carry_dead_through_blind,
     control_map,
     decode_with_events,
     detect_contact_events,
@@ -389,7 +391,7 @@ class PixelChannelTests(unittest.TestCase):
             ball_atd=atd,
         )
 
-    def test_pixel_contact_ors_yolo_and_atd_pixels(self):
+    def test_pixel_contact_trusts_yolo_when_it_sees_the_ball(self):
         n = 6
         atd = np.zeros((n, 2))
         atd[:, :] = [15.0, 30.0]  # inside the H box, at its feet line: contain + touch
@@ -401,8 +403,9 @@ class PixelChannelTests(unittest.TestCase):
         ev = self.evidence(n, atd, yolo, yp)
         contain, touch = pixel_contact(ev)
         self.assertEqual(int(contain[0]), 1)  # yolo absent: atd alone -> H
-        self.assertEqual(int(contain[1]), 3)  # both pixels seen: both teams register
+        self.assertEqual(int(contain[1]), 2)  # both seen: yolo first, the atd pixel is noise
         self.assertEqual(int(touch[0]), 1)  # ball on the H player's feet line
+        self.assertEqual(int(touch[1]), 2)  # ... and while yolo sees it, only the A player's
 
     def test_contact_needs_a_fresh_dominant_consecutive_run(self):
         n = 60
@@ -543,6 +546,65 @@ class PixelChannelTests(unittest.TestCase):
         p = TransitionParams()
         self.assertGreater(p.pixel_bound_window, 0)
         self.assertLess(p.pixel_bias, p.pulse_near)
+
+
+class DeadBlindCarryTests(unittest.TestCase):
+    """A dead ball that went blind stays dead; live states keep decoding."""
+
+    def test_dead_holds_through_blind_live_does_not(self):
+        codes = np.array([D] * 10 + [H] * 10 + [A] * 10 + [H] * 10, dtype=np.int8)
+        blind = np.zeros(40, dtype=bool)
+        blind[10:20] = True  # deep blind window, decode restarted H inside it
+        out = carry_dead_through_blind(codes, blind, halves=((0, 40),))
+        self.assertEqual(list(out[10:20]), [D] * 10)  # the D before the window holds
+        self.assertEqual(list(out[20:]), [A] * 10 + [H] * 10)  # decode resumes after
+        codes_live = np.array([H] * 10 + [A] * 10, dtype=np.int8)
+        blind2 = np.zeros(20, dtype=bool)
+        blind2[10:20] = True
+        out_live = carry_dead_through_blind(codes_live, blind2, halves=((0, 20),))
+        self.assertEqual(list(out_live[10:]), [A] * 10)  # a live takeover is not frozen
+
+    def test_carry_stays_inside_graded_halves(self):
+        codes = np.array([D] * 10 + [H] * 10 + [X] * 10, dtype=np.int8)
+        blind = np.zeros(30, dtype=bool)
+        blind[5:25] = True
+        out = carry_dead_through_blind(codes, blind, halves=((0, 20),))
+        self.assertEqual(list(out[5:20]), [D] * 15)
+        self.assertEqual(list(out[20:]), [X] * 10)  # outside the graded half: untouched
+
+
+class ConflictMaskTests(unittest.TestCase):
+    """Sustained ATD-vs-YOLO divergence marks drifting-ball frames (gate knob only)."""
+
+    def test_sustained_divergence_gates_blips_do_not(self):
+        n = 300
+        atd = np.zeros((n, 2))
+        yolo = np.zeros((n, 2))
+        atd[80:110] = [6.0, 0.0]  # 6 m apart for 30 frames
+        atd[150:152] = [7.0, 0.0]  # a two-frame YOLO blip
+        mask = ball_conflict_mask(atd, yolo, min_distance=5.0, window=60, min_conflicts=8)
+        # forward-window rule: marking starts once the next 60 frames accumulate 8
+        # divergent ones (t=28 sees 80..87) and holds while they still see 8 (t=104
+        # sees 104..109 plus the blip -- 8 exactly)
+        self.assertFalse(mask[:28].any())
+        self.assertTrue(mask[28:105].all())
+        self.assertFalse(mask[105:].any())
+
+    def test_pad_grows_both_sides(self):
+        n = 300
+        atd = np.zeros((n, 2))
+        yolo = np.zeros((n, 2))
+        atd[80:110] = [6.0, 0.0]
+        base = ball_conflict_mask(atd, yolo, min_distance=5.0, window=60, min_conflicts=8)
+        padded = ball_conflict_mask(
+            atd, yolo, min_distance=5.0, window=60, min_conflicts=8, pad=15
+        )
+        self.assertTrue(bool(padded[base.argmax() - 1]) and not bool(base[base.argmax() - 1]))
+        idx = np.flatnonzero(padded)
+        first, last = int(idx[0]), int(idx[-1])
+        self.assertEqual(len(idx), last - first + 1)  # one contiguous grown block
+        self.assertEqual(first, int(base.argmax()) - 15)
+        self.assertEqual(last, int(np.flatnonzero(base)[-1]) + 15)
 
 
 if __name__ == "__main__":
