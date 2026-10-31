@@ -146,9 +146,7 @@ What is shown:
   `[11,185, 18,685)`; outside it the GT is shown as `X` / “sin evaluar”), and the UT.
 * **Tracking overlay.** Player slots and the ball are projected onto the video with the frame's
   homography (1920×1080). The ball layers can be toggled independently under **Capas de balón**:
-  **ATD bruto** draws only ATD observations (white solid ring); **Kalman** is a causal
-  constant-velocity filter that rejects isolated jumps and predicts through holes up to 5 s (cyan
-  ring, dashed while predicting); **Combinado** is the production tracker, ATD observations plus
+  **ATD bruto** draws only ATD observations (white solid ring); **Combinado** is the production tracker, ATD observations plus
   damped extrapolation for holes of at most 1.2 s (white ring when observed, dashed amber when
   estimating); **Balón vídeo** is the independent YOLO/white-blob tracker (green, dashed while
   predicting, teal when pinned to ATD); **YOLO balón** shows sports-ball detections after the
@@ -170,8 +168,7 @@ What is shown:
   goal/stoppage event. The header also reports the state of each enabled ball layer. This is
   computed from the same full-match feature arrays the model used, sliced per frame by the local
   server; the browser never receives the 199k-frame tracking table.
-  The Kalman layer is **diagnostic only**: it does not feed `features.py`, the HMM, the event
-  detector, or the submission. The optional video path is separate: `perception.py` runs YOLO and
+  The optional video path is separate: `perception.py` runs YOLO and
   its own pitch-space ball tracker, and `fusion.py` exposes every source ballot and the poll
   decision. It is documented in [PERCEPTION.md](PERCEPTION.md), and it remains opt-in because the
   public-window check has not shown a repeatable metric gain.
@@ -305,11 +302,10 @@ raised spell F1 by ~0.005 but lowered macro F1 by ~0.019 and created a false H s
 Measured alternatives that were rejected: a fully split two-state alive/dead + H/A decode reached
 only 0.547 spell F1 and 0.686 macro F1; decaying the last-ball memory with gap length lowered macro
 F1 to 0.846; a walk/run fraction, a smart-tag team vote, and ball-speed gating of the dead-ball
-evidence each lowered public spell F1 by 0.03–0.07. An offline Kalman/RTS smoother is unnecessary
-for the model: the causal tracker already fills the 0.4–1.2 s holes for goal geometry and the
-production overlay, while the HMM keeps short gaps uniform and long holes are not bridged. The
-causal Kalman filter in `kalman.py` is a **viewer diagnostic** only; it is not blended into the
-HMM or the event detector.
+evidence each lowered public spell F1 by 0.03–0.07. The causal tracker already fills the 0.4–1.2 s
+holes for goal geometry and the production overlay, while the HMM keeps short gaps uniform and long
+holes are not bridged. The old Kalman viewer layer has been removed; it never fed `features.py`, the
+HMM, the event detector, or the submission.
 
 ## Results
 
@@ -416,7 +412,6 @@ possession_lab/
   config.py       match constants, labels, paths, exact parameters
   data.py         ATD / smart-tag / homography / GT loaders
   balltrack.py    causal short-gap ball tracker
-  kalman.py       causal constant-velocity Kalman viewer layer (diagnostic)
   audio.py        ffmpeg audio decode, whistle score, cache
   events.py       goal/stoppage detection and hard D overrides
   features.py     distances, gap, edge, last touch, tags, tracker/whistle/event features

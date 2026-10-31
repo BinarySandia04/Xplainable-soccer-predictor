@@ -44,8 +44,7 @@ nearest-player/team distances and never claims an identity.
 The ball is observed in **113,488 frames (56.94%)**, estimated for short holes in **4,441
 (2.23%)**, and has no estimate in **81,390 (40.83%)**. `balltrack.py` is causal: source `0` is an
 observation, source `1` is an extrapolation capped at 1.2 s, and source `2` is a long gap where
-the production layer draws no ball. The optional diagnostic Kalman layer may still predict for up
-to 5 s and is reported separately. This is why an amber ring can disagree with the video by
+the production layer draws no ball. This is why an amber ring can disagree with the video by
 design, and why the top-view map marks observed and estimated balls differently.
 
 ## Pipeline
@@ -93,30 +92,6 @@ parameter set the HMM's short-gap emission is **uniform** (`est_blend=0.0`); the
 is not blended into the HMM emission. This is deliberate: blending a short extrapolation into the
 emission improved some public frames but created false possession changes in longer gaps, so the
 short-gap prior remains the validated behaviour.
-
-## Diagnostic Kalman layer (`kalman.py`)
-
-The viewer can show a second, independent ball estimate. It exists to make the cost of the
-conservative production tracker visible; it does not change the model, the event layer, or the
-submission.
-
-* State `[x, y, vx, vy]`, constant-velocity transition at 25 fps. Process noise is `1.2 m/s²`
-  (acceleration), measurement noise is `0.6 m`, and speed is capped at 38 m/s.
-* A measurement is accepted only inside a squared Mahalanobis gate of `25`; a single large jump
-  is ignored. Three consecutive rejects, or a hole longer than 1 s, reset the filter to the new
-  observation so it cannot stay locked to a stale track.
-* It predicts through holes up to **5 s** (`source=1`), then reports no estimate (`source=2`).
-  Confidence is `exp(-(gap/1.0)²)` while predicting, and estimates more than 1 m outside the pitch
-  are flagged out of play.
-* It is causal: frame `k` only uses ATD observations at frames `<= k`. It never reads the video,
-  the homography, the HMM, the event detector, or the UT.
-* The production layer remains `balltrack.py` (maximum 1.2 s). `combined` is that tracker; `raw`
-  is ATD observations only; `kalman` is this diagnostic filter.
-
-A pixel-domain tracker (MOSSE, GrayDiff, NanoTrack, or a fusion) is not implemented. The workspace
-has no tracker code or weights and no OpenCV/SciPy/filterpy runtime, and the tactical video would
-need frame-accurate alignment before a pixel track could be compared with the ATD. Adding one is
-future work, not part of this viewer change.
 
 ## Features (`features.py`)
 
@@ -384,17 +359,17 @@ required. `imageio-ffmpeg` is only used by the offline audio extractor, not by t
 * **Per-frame explorer.** `GET /api/frame?frame=N` returns one compact payload built by
   `FrameStore`: pitch size, projected 1920×1080 player pixels (`px`/`py` may be `null`), the
   feature slice (team/ball speed, edge, gap, near player/team, last touch, whistle
-  score/envelope, event masks), active events, and three ball layers. Each layer
-  (`raw`, `kalman`, `combined`) carries `source` (`0` observed, `1` estimated, `2` lost),
+  score/envelope, event masks), active events, and ball layers. Each layer
+  (`raw`, `combined`, plus optional video/YOLO/fusion when loaded) carries `source` (`0` observed, `1` estimated, `2` lost),
   `observed`, metres `x/y`, projected `px/py`, `confidence`, `gap_s`, and `out_of_play`.
   `trails[layer].pitch` and `trails[layer].video` hold a ~1 s trail; the legacy `ball`, `trail`,
   and `trail_pitch` fields remain as aliases for `combined`. The browser never receives the
   199k-frame tracking arrays. If tracking is unavailable the endpoint returns a JSON 404 and the
   viewer still shows the labels and timelines.
 * **Overlay.** Players are projected with the frame's homography. The `Seguimiento` checkbox
-  toggles the whole canvas; the **Capas de balón** checkboxes choose `raw`, `kalman`, and
-  `combined`. Raw observations are solid white, Kalman is cyan (dashed while predicting), and the
-  combined production layer is white when observed or dashed amber when extrapolating; an
+  toggles the whole canvas; the **Capas de balón** checkboxes choose `raw` and `combined`.
+  Raw observations are solid white, and the combined production layer is white when observed or
+  dashed amber when extrapolating; an
   out-of-play point is red. The canvas lives inside a `.video-frame` wrapper that contains the
   video only, so the global `canvas { height: 100% }` rule cannot stretch it over the caption.
   Measured video and overlay rectangles match (`1139.4 × 640.9` CSS px); before the wrapper the
@@ -437,18 +412,15 @@ required. `imageio-ffmpeg` is only used by the offline audio extractor, not by t
 
 The reviewer is covered by `tests/test_viewer.py`: payload semantics, public-only GT behavior,
 UT scoring/persistence/editing, range parsing (`normal`, open, suffix, invalid), HTTP
-`206`/`416`/`HEAD`, API payload, per-frame payload/404, top-view pitch/trail payload, the three
-layer payloads and trails, and unknown-route rejection. `tests/test_kalman.py` covers the
-constant-velocity fit, short-hole prediction, long-hole refusal, outlier rejection, missing
-observations, and gap age.
+`206`/`416`/`HEAD`, API payload, per-frame payload/404, top-view pitch/trail payload, the raw and
+combined layer payloads and trails, and unknown-route rejection.
 
 ## Validation
 
-* Unit tests: **81 stdlib `unittest` tests (+4 subtests)**, all passing — including switch/reason
+* Unit tests: **all stdlib `unittest` tests (+4 subtests)**, all passing — including switch/reason
   rules (`test_explain.py`), stop-signal parameter neutrality and gating (`test_model.py`),
-  tracker/audio/event units (`test_balltrack.py`, `test_audio.py`, `test_events.py`), the Kalman
-  layer (`test_kalman.py`), and annotation/frame-explorer/top-view plumbing
-  (`test_viewer.py`).
+  tracker/audio/event units (`test_balltrack.py`, `test_audio.py`, `test_events.py`), and
+  annotation/frame-explorer/top-view plumbing (`test_viewer.py`).
 * Public metrics for the final parameters: spell F1 **0.6519**, macro F1 **0.9466**, D-F1
   **0.9727**, accuracy 0.9417, kappa 0.9083, alive/dead F1 0.9933, team accuracy (both alive)
   0.9404, 10 predicted spells (17 in GT). The 95% spell-F1 bootstrap is [0.430, 0.817].
@@ -464,9 +436,9 @@ observations, and gap age.
   explorer rendered. After wrapping the video, the measured video and overlay rectangles both
   read `1139.4 × 640.9` CSS px; a frame-12,000 screenshot placed the projected dots on the
   players and the ball ring on the ball. The top-view canvas measured `658 × 424` and was
-  non-blank. At frame 12,851 the three layer payloads separated cleanly: raw had no observation,
-  Kalman estimated at `30.99, 58.09 m`, and combined at `30.98, 55.79 m`, with gap `0.84 s`;
-  cyan (Kalman) and amber (combined) rings were visible. At frame 73,935 all layers were lost
+  non-blank. At frame 12,851 the layer payloads separated cleanly: raw had no observation, and
+  combined estimated at `30.98, 55.79 m`, with gap `0.84 s`; the amber combined ring was visible.
+  At frame 73,935 all layers were lost
   with gap `55.04 s`; at 73,951 all were observed at `-3.05, 25.37 m` and the red out-of-play
   marker was visible in the map padding. The layer checkboxes changed both the map and the
   explorer status. `#trackingStatus` stayed at `35.4` px (two lines), `#pitchStatus` at `17.7`

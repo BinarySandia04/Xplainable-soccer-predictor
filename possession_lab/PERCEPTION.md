@@ -52,8 +52,8 @@ measurements are source `0`, so an anchor snap cannot be mistaken for a YOLO jum
 | `3` | ATD anchor |
 
 The viewer draws the own tracker in green, the temporally gated YOLO ball as an orange square,
-and the fused consensus ball as a magenta diamond.  The raw ATD, diagnostic Kalman, and production
-combined layers remain available unchanged.  The YOLO layer shows only detections that passed the
+and the fused consensus ball as a magenta diamond.  The raw ATD and production combined layers
+remain available unchanged.  The YOLO layer shows only detections that passed the
 physical association; the cache still retains all raw candidates for diagnostics.
 
 ## The poll

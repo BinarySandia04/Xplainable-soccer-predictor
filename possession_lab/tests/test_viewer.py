@@ -237,7 +237,7 @@ class FrameStoreTopViewTest(unittest.TestCase):
 
 
 class FrameStoreLayersTest(unittest.TestCase):
-    def test_payload_separates_raw_kalman_and_combined_layers(self):
+    def test_payload_separates_raw_and_combined_layers(self):
         tracking = SimpleNamespace(
             n_frames=3,
             ball=np.array([[10.0, 20.0], [np.nan, np.nan], [12.0, 22.0]], dtype=np.float32),
@@ -269,13 +269,6 @@ class FrameStoreLayersTest(unittest.TestCase):
             gap_s=np.array([0.0, 0.04, 0.0], dtype=np.float32),
             out_of_play=np.zeros(3, dtype=bool),
         )
-        kalman = SimpleNamespace(
-            source=np.array([0, 1, 0], dtype=np.int8),
-            estimate=np.array([[10.5, 20.5], [11.5, 21.5], [12.5, 22.5]], dtype=np.float32),
-            confidence=np.array([0.9, 0.6, 0.9], dtype=np.float32),
-            gap_s=np.array([0.0, 0.04, 0.0], dtype=np.float32),
-            out_of_play=np.zeros(3, dtype=bool),
-        )
         store = FrameStore(
             tracking,
             homography,
@@ -283,18 +276,16 @@ class FrameStoreLayersTest(unittest.TestCase):
             SimpleNamespace(goals=(), stoppages=()),
             SimpleNamespace(start=0),
             trail_frames=3,
-            kalman=kalman,
         )
         payload = store.frame_payload(1)
 
+        self.assertNotIn("kalman", payload["layers"])
+        self.assertNotIn("kalman", payload["trails"])
         self.assertIsNone(payload["layers"]["raw"]["x"])
         self.assertEqual(payload["layers"]["raw"]["source"], 2)
-        self.assertEqual(payload["layers"]["kalman"]["x"], 11.5)
-        self.assertEqual(payload["layers"]["kalman"]["source"], 1)
         self.assertEqual(payload["layers"]["combined"]["x"], 11.0)
         self.assertEqual(payload["layers"]["combined"]["source"], 1)
         self.assertEqual(payload["trails"]["raw"]["pitch"], [])
-        self.assertEqual(payload["trails"]["kalman"]["pitch"], [[10.5, 20.5, 0], [11.5, 21.5, 1]])
         self.assertEqual(
             payload["trails"]["combined"]["pitch"],
             [[10.0, 20.0, 0], [11.0, 21.0, 1]],
@@ -639,6 +630,7 @@ class ViewerServerTest(unittest.TestCase):
         with urlopen(self.base + "/") as response:
             self.assertEqual(response.status, 200)
             self.assertIn(b"viewer", response.read())
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
         with urlopen(self.base + "/api/viewer-data") as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.read(), self.payload)

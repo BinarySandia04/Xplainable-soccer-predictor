@@ -18,11 +18,9 @@ The suite covers ATD/tag/homography parsing, feature geometry and gap state, bal
 whistle scoring/cache fallbacks, goal/stoppage detection and overrides, HMM emissions and
 Viterbi/posterior consistency, sparse tracking, official metric wiring, stress masks, full-match
 structure, CSV writing, preflight validation, the explanation layer, and the local viewer
-(payload, public-only GT band, per-frame `/api/frame`, top-view pitch/trail payload, the three
-raw/Kalman/combined layer payloads and trails, UT scoring/editing/persistence and boundary moves,
-byte ranges, HTTP 206/416/HEAD, API, and route whitelist). `test_kalman.py` adds five tests for
-the constant-velocity fit, short-hole prediction, long-hole refusal, outlier rejection, missing
-observations, and gap age. `test_aerial.py` adds seven tests for the causal flight detector and
+(payload, public-only GT band, per-frame `/api/frame`, top-view pitch/trail payload, the
+raw/combined layer payloads and trails, UT scoring/editing/persistence and boundary moves,
+byte ranges, HTTP 206/416/HEAD, API, and route whitelist). `test_aerial.py` adds seven tests for the causal flight detector and
 launch-team freeze (speed impulse, height trigger, hold, landing, rekick re-anchor, and
 past-only decisions). `test_voters.py` adds seven contract tests for the voter registry
 (protocol conformance, key/weight coverage, the pinned accumulation order, the role map,
@@ -227,10 +225,8 @@ GET /api/frame?frame=12851 200  6,285 bytes
                             layers, pitch, players, time_s, trail, trail_pitch,
                             trails, video_height, video_width
   pitch / players           105.3 × 68.0 m / 21 slots
-  layers                    raw lost; Kalman estimated 30.99, 58.09 m, gap 0.84 s;
-                            combined estimated 30.98, 55.79 m, gap 0.84 s
-  trails                    raw 0; Kalman 25 projected / 25 pitch-space;
-                            combined 25 projected / 25 pitch-space
+  layers                    raw lost; combined estimated 30.98, 55.79 m, gap 0.84 s
+  trails                    raw 0; combined 25 projected / 25 pitch-space
 GET /video Range: bytes=0-1023
                            206  1,024 bytes
 Content-Range              bytes 0-1023/5222307334
@@ -246,18 +242,17 @@ Browser checks:
 * Overlay: video and overlay rectangles both measured `1139.4 × 640.9` CSS px after moving the
   canvas into the `.video-frame` wrapper. Before the fix the overlay was `1139.4 × 678.5` because
   the global `canvas { height: 100% }` filled the whole video card, including the caption.
-* Frame 12,000: 22 projected players, all three layers observed; a screenshot showed the
+* Frame 12,000: 22 projected players, raw and combined observed; a screenshot showed the
   projected dots on the players and the white ball ring on the ball.
-* Frame 12,851: 21 projected players; raw was lost, Kalman estimated at `30.99, 58.09 m`, and
-  combined estimated at `30.98, 55.79 m`, both with gap `0.84 s (21 f)`. The cyan Kalman ring and
-  the dashed amber combined ring were both visible; their separation was `2.3 m`.
+* Frame 12,851: 21 projected players; raw was lost, and combined estimated at `30.98, 55.79 m`
+  with gap `0.84 s (21 f)`. The dashed amber combined ring was visible.
 * Top-view map: canvas `658 × 424` CSS px, non-blank. At 12,000 status was `frame 12.000 · 22
-  slots · comb. observado · Kalman observado · ATD observado`; at 12,851 it was `frame 12.851 ·
-  21 slots · comb. estimado (0.84 s) · Kalman estimado (0.84 s) · ATD perdido`. The map uses
+  slots · comb. observado · ATD observado`; at 12,851 it was `frame 12.851 ·
+  21 slots · comb. estimado (0.84 s) · ATD perdido`. The map uses
   `pitch`, `players[].x/y`, `layers[layer].x/y`, and `trails[layer].pitch`; it does not read
   video pixels or call the homography.
-* Frame 73,935 (the missed Sancet penalty): all three layers were `source=2` with gap `55.04 s`;
-  the map drew no ball. At 73,951 all three layers were observed at `-3.05, 25.37 m`,
+* Frame 73,935 (the missed Sancet penalty): raw and combined were `source=2` with gap `55.04 s`;
+  the map drew no ball. At 73,951 raw and combined were observed at `-3.05, 25.37 m`,
   `out_of_play=true`; the red ring was visible in the map's left padding, outside the pitch clip.
 * Explorer at 12,851: `Jugador cerca —`, `Dist. a línea —`, `Vel. equipos 3.79 m/s`, last touch
   `Barcelona · 0.84 s`, event `juego abierto` (the stop begins on 12,852).
@@ -268,7 +263,7 @@ Browser checks:
   text in `title`; it no longer pushes the card or page.
 * Playback instrumentation over frames 12,001–12,048 recorded exactly `35` `clearRect` calls on
   `pitchMap` and `35` on `overlay` for 35 drawn frames — one clear per canvas per draw, not the
-  old doubled clear. The layer toggles unchecked/restored raw, Kalman, and combined; each change
+  old doubled clear. The layer toggles unchecked/restored raw and combined; each change
   updated both the map and the explorer status, and “sin capas de balón” appeared when all were
   off. No blank map frame was observed while waiting for a payload.
 * Seeking through the UI's own Go button to frame 46,691 moved video `currentTime` to `1867.66`
