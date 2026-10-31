@@ -994,6 +994,7 @@ class FrameStore:
                         "confidence": _finite(player.get("confidence")),
                         "track": int(player.get("track", -1)),
                         "box": player.get("box"),
+                        "official": bool(player.get("official", False)),
                     }
                 )
 

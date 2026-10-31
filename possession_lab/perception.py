@@ -26,7 +26,7 @@ from typing import Any
 
 import numpy as np
 
-from .config import FPS, PITCH
+from .config import FPS, GRADED_HALVES, PITCH
 
 # COCO class ids used by the stock YOLO weights.
 PERSON_CLASS = 0
@@ -119,6 +119,8 @@ class VideoPerception:
     video_height: int
     pitch: tuple[float, float] = PITCH
     meta: dict[str, Any] = field(default_factory=dict)
+    players_official: np.ndarray | None = None  # (M, K) bool: referee/official, never a player
+    players_class: np.ndarray | None = None  # (M, K) int8: 0 player, 1 goalkeeper, 2 referee
 
     def __len__(self) -> int:
         return int(self.frame_index.size)
@@ -188,13 +190,16 @@ class VideoPerception:
                     "team_confidence": _finite(self.players_team_confidence[index, slot]),
                     "confidence": _finite(self.players_confidence[index, slot]),
                     "track": int(self.players_track[index, slot]),
+                    "official": bool(
+                        self.players_official is not None and self.players_official[index, slot]
+                    ),
                 }
             )
         result["players"] = players
         return result
 
     def to_arrays(self) -> dict[str, np.ndarray]:
-        return {
+        out = {
             "frame_index": np.asarray(self.frame_index, dtype=np.int32),
             "players_box": np.asarray(self.players_box, dtype=np.float32),
             "players_pixel": np.asarray(self.players_pixel, dtype=np.float32),
@@ -213,6 +218,11 @@ class VideoPerception:
             "yolo_ball_confidence": np.asarray(self.yolo_ball_confidence, dtype=np.float32),
             "yolo_ball_present": np.asarray(self.yolo_ball_present, dtype=bool),
         }
+        if self.players_official is not None:
+            out["players_official"] = np.asarray(self.players_official, dtype=bool)
+        if self.players_class is not None:
+            out["players_class"] = np.asarray(self.players_class, dtype=np.int8)
+        return out
 
 
 def _finite(value: Any) -> float | None:
@@ -1121,6 +1131,8 @@ def _empty_perception(
         players_present=np.zeros((samples, MAX_PLAYERS), dtype=bool),
         players_track=np.full((samples, MAX_PLAYERS), -1, dtype=np.int16),
         players_team_confidence=np.zeros((samples, MAX_PLAYERS), dtype=np.float32),
+        players_official=np.zeros((samples, MAX_PLAYERS), dtype=bool),
+        players_class=np.zeros((samples, MAX_PLAYERS), dtype=np.int8),
         ball_pixel=np.full((samples, 2), np.nan, dtype=np.float32),
         ball_pitch=np.full((samples, 2), np.nan, dtype=np.float32),
         ball_confidence=np.zeros(samples, dtype=np.float32),
@@ -1336,6 +1348,18 @@ def perceive_video(
     current = start
     atd_players = getattr(tracking, "players", None) if tracking is not None else None
     atd_teams = getattr(tracking, "teams", None) if tracking is not None else None
+    keepers = None
+    if run_players and dedicated_players and atd_players is not None and atd_teams is not None:
+        # Keeper roster slots (and the goal each defends, per half) settle team colours for
+        # goalkeepers even while the ATD feed swaps or freezes those slots under pressure.
+        from .keepers import derive_keeper_slots, goal_side, half_index
+
+        keepers = derive_keeper_slots(
+            np.asarray(atd_players, dtype=np.float64),
+            np.asarray(atd_teams),
+            PITCH,
+            GRADED_HALVES,
+        )
     atd_ball = getattr(tracking, "ball", None) if tracking is not None else None
     atd_present = getattr(tracking, "ball_present", None) if tracking is not None else None
     last_log = 0
@@ -1352,6 +1376,7 @@ def perceive_video(
             boxes = np.zeros((0, 4), dtype=np.float32)
             confidence = np.zeros(0, dtype=np.float32)
             classes = np.zeros(0, dtype=np.int16)
+            raw_player_classes: np.ndarray | None = None
             if shared_yolo is not None:
                 result = shared_yolo.predict(
                     frame,
@@ -1378,8 +1403,9 @@ def perceive_video(
                     )[0]
                     boxes, confidence, classes = _parse_boxes(result)
                     if dedicated_players and classes.size:
-                        # The dedicated player model's player/goalkeeper/referee classes all become
-                        # COCO's person id, so the tracker, fusion and viewer need no special case.
+                        # The dedicated player model classes (0 player, 1 goalkeeper, 2 referee)
+                        # are kept aside; the tracker, fusion and viewer keep seeing COCO person.
+                        raw_player_classes = classes.copy()
                         classes = np.full(classes.shape, PERSON_CLASS, dtype=np.int16)
                 if ball_yolo is not None:
                     ball_result = ball_yolo.predict(
@@ -1419,17 +1445,45 @@ def perceive_video(
                 person_conf = person_conf[valid_players]
                 player_pixel = player_pixel[valid_players]
                 player_pitch = player_pitch[valid_players]
-                if atd_players is not None and atd_teams is not None and current < len(atd_players):
-                    teams, team_confidence = _team_match(
-                        player_pixel,
+                if raw_player_classes is not None:
+                    # person rows come first, before the ball detections get concatenated in
+                    player_class = raw_player_classes[person_mask[: len(raw_player_classes)]][
+                        valid_players
+                    ]
+                else:
+                    player_class = np.zeros(len(person_boxes), dtype=np.int16)
+                is_referee = player_class == 2
+                is_goalkeeper = player_class == 1
+                teams = np.full(len(person_boxes), -1, dtype=np.int8)
+                team_confidence = np.zeros(len(person_boxes), dtype=np.float32)
+                match_rows = np.flatnonzero(~is_referee)
+                if (
+                    atd_players is not None
+                    and atd_teams is not None
+                    and current < len(atd_players)
+                    and match_rows.size
+                ):
+                    # Officials match no roster slot: keeping them out lets every slot find its player.
+                    sub_teams, sub_confidence = _team_match(
+                        player_pixel[match_rows],
                         np.asarray(atd_players[current], dtype=np.float64),
                         np.asarray(atd_teams),
                         matrix,
                         perception.pitch,
                     )
-                else:
-                    teams = np.full(len(person_boxes), -1, dtype=np.int8)
-                    team_confidence = np.zeros(len(person_boxes), dtype=np.float32)
+                    teams[match_rows] = sub_teams
+                    team_confidence[match_rows] = sub_confidence
+                if keepers is not None:
+                    half = half_index(current, GRADED_HALVES)
+                    if half >= 0:
+                        for keeper_row in np.flatnonzero(is_goalkeeper):
+                            foot = player_pitch[keeper_row]
+                            if np.isfinite(foot).all():
+                                side = goal_side(float(foot[0]), float(perception.pitch[0]))
+                                right = int(keepers.team[half, side])
+                                if right >= 0:
+                                    teams[keeper_row] = right
+                                    team_confidence[keeper_row] = 1.0
                 track_ids = tracker.update(person_boxes, current)
                 order = np.argsort(person_conf)[::-1][:max_players]
                 for slot, source_row in enumerate(order):
@@ -1444,6 +1498,8 @@ def perceive_video(
                     perception.players_present[sample, slot] = True
                     perception.players_track[sample, slot] = track_ids[source_row]
                     perception.players_team_confidence[sample, slot] = team_confidence[source_row]
+                    perception.players_class[sample, slot] = player_class[source_row]
+                    perception.players_official[sample, slot] = bool(is_referee[source_row])
 
             if run_ball:
                 ball_mask = (classes == BALL_CLASS) & (confidence >= ball_conf)
@@ -1532,6 +1588,12 @@ def _slice_perception(perception: VideoPerception, samples: int) -> VideoPercept
         yolo_ball_pitch=perception.yolo_ball_pitch[:samples],
         yolo_ball_confidence=perception.yolo_ball_confidence[:samples],
         yolo_ball_present=perception.yolo_ball_present[:samples],
+        players_official=(
+            None if perception.players_official is None else perception.players_official[:samples]
+        ),
+        players_class=(
+            None if perception.players_class is None else perception.players_class[:samples]
+        ),
         n_frames=perception.n_frames,
         fps=perception.fps,
         step=perception.step,
@@ -1603,6 +1665,8 @@ def merge_perception(
         video_height=players.video_height,
         pitch=players.pitch,
         meta=meta,
+        players_official=players.players_official,
+        players_class=players.players_class,
     )
 
 
@@ -1641,6 +1705,8 @@ def load_perception(path: str | Path) -> VideoPerception | None:
     with np.load(path, allow_pickle=False) as archive:
         meta = json.loads(str(archive["meta"]))
         arrays = {name: archive[name] for name in (*PLAYER_ARRAY_NAMES, *BALL_ARRAY_NAMES, "frame_index")}
+        official = archive["players_official"].astype(bool) if "players_official" in archive.files else None
+        classes = archive["players_class"].astype(np.int8) if "players_class" in archive.files else None
     return VideoPerception(
         frame_index=arrays["frame_index"].astype(np.int32),
         players_box=arrays["players_box"].astype(np.float32),
@@ -1670,6 +1736,8 @@ def load_perception(path: str | Path) -> VideoPerception | None:
         video_height=int(meta["video_height"]),
         pitch=tuple(float(value) for value in meta.get("pitch", PITCH)),
         meta=meta,
+        players_official=official,
+        players_class=classes,
     )
 
 

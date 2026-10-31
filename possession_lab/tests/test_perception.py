@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import unittest
 from pathlib import Path
@@ -19,6 +20,7 @@ from possession_lab.perception import (
     _empty_perception,
     _GreedyTracker,
     _run_ball_track,
+    _slice_perception,
     annotate_ball_candidates,
     load_perception,
     pitch_to_pixel,
@@ -437,6 +439,48 @@ class PerceptionCacheTest(unittest.TestCase):
             self.assertEqual(len(sample["players"]), 1)
             meta = json.loads(Path(str(path) + ".json").read_text(encoding="utf-8"))
             self.assertEqual(meta["samples"], 2)
+
+    def test_official_and_class_flags_round_trip_and_slice(self):
+        perception = _empty_perception(
+            samples=3,
+            n_frames=10,
+            fps=25,
+            step=3,
+            start=0,
+            stop=10,
+            model="players.pt",
+            device="cpu",
+            video_width=1920,
+            video_height=1080,
+        )
+        perception.frame_index[:] = [0, 3, 6]
+        perception.players_present[:] = True
+        perception.players_class[0, 0] = 1  # goalkeeper
+        perception.players_class[0, 1] = 2  # referee
+        perception.players_official[0, 1] = True
+        sample = perception.nearest(0)
+        flags = {player["official"] for player in sample["players"]}
+        self.assertEqual(flags, {False, True})
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "perception.npz"
+            save_perception(path, perception)
+            loaded = load_perception(path)
+            assert loaded is not None
+            np.testing.assert_array_equal(loaded.players_official, perception.players_official)
+            np.testing.assert_array_equal(loaded.players_class, perception.players_class)
+            sliced = _slice_perception(loaded, 2)
+            self.assertEqual(sliced.players_official.shape, (2, sliced.players_official.shape[1]))
+            self.assertTrue(sliced.players_official[0, 1])
+            self.assertFalse(sliced.players_official[1].any())
+            np.testing.assert_array_equal(sliced.players_class[0], perception.players_class[0])
+            # a cache without the optional keys stays retro-compatible
+            bare = dataclasses.replace(loaded, players_official=None, players_class=None)
+            bare_path = Path(temp) / "bare.npz"
+            save_perception(bare_path, bare)
+            loaded_bare = load_perception(bare_path)
+            assert loaded_bare is not None
+            self.assertIsNone(loaded_bare.players_official)
+            self.assertIsNone(loaded_bare.players_class)
 
     def test_missing_cache_returns_none(self):
         with TemporaryDirectory() as temp:
