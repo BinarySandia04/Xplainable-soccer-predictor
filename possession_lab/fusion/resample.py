@@ -56,6 +56,9 @@ def resample_perception(perception: Any | None, n_frames: int) -> dict[str, np.n
     decay = np.zeros(n_frames, dtype=np.float64)
     decay[fresh] = np.exp(-age[fresh].astype(np.float64) / max(2.0, 0.10 * FPS))
     player_present = np.asarray(perception.players_present[index], dtype=bool) & fresh[:, None]
+    if perception.players_official is not None:
+        # Referees are not players: they must never count toward "players near the ball".
+        player_present &= ~np.asarray(perception.players_official[index], dtype=bool)
     player_confidence = np.asarray(perception.players_confidence[index], dtype=np.float32)
     player_confidence = (player_confidence * decay[:, None]).astype(np.float32)
     player_present &= player_confidence > 0.02

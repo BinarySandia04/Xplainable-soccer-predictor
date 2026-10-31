@@ -137,6 +137,7 @@
     scrubbing: false,
     pointerId: null,
     scrubSource: null,
+    scrubWindow: null,
     hoverFrame: null,
     hoverSource: null,
     loadedMetadata: false,
@@ -654,6 +655,7 @@
     if (!state.yoloPlayersEnabled || !Array.isArray(players) || players.length === 0) return;
     ctx.save();
     for (const player of players) {
+      if (player.official) continue; // referees are not players: no ghost dots on the markings
       const px = coordinates === "video" ? player.px : player.x;
       const py = coordinates === "video" ? player.py : player.y;
       if (px === null || px === undefined || py === null || py === undefined) continue;
@@ -1134,6 +1136,12 @@
     const fusion = frameData && frameData.fusion ? frameData.fusion : null;
 
     if (!fusion || !fusion.available) {
+      if (data.fusion_available && state.fusionRendered) {
+        // The payload for this frame is still in flight while playback already moved:
+        // keep the last rendered panel. Blanking it every tick is what made the card
+        // flicker (same anti-flash rule as updatePitchStatus for the pitch map).
+        return;
+      }
       setBadge(ui.fusionBadge, "X");
       ui.fusionName.textContent = data.fusion_available ? "Cargando…" : "Sin cache";
       setBadge(ui.fusedBadge, "X");
@@ -1159,6 +1167,7 @@
       return;
     }
 
+    state.fusionRendered = true;
     const code = LABELS[fusion.code] || "X";
     setBadge(ui.fusionBadge, code);
     ui.fusionName.textContent = NAMES[code] || "—";
@@ -1185,9 +1194,12 @@
     ui.fusionAgreement.textContent = agreementText;
     ui.fusionAgreement.className = agreementClass;
     const sourceCount = Array.isArray(fusion.sources) ? fusion.sources.length : 0;
-    ui.fusionStatus.textContent = `frame ${formatFrame(state.frame)} · ${sourceCount} fuentes · modo ${
-      fusion.combine_mode || "log"
-    }${baseline ? ` · HMM base ${baseline}` : ""}`;
+    setText(
+      ui.fusionStatus,
+      `frame ${formatFrame(state.frame)} · ${sourceCount} fuentes · modo ${
+        fusion.combine_mode || "log"
+      }${baseline ? ` · HMM base ${baseline}` : ""}`,
+    );
 
     const probability = fusion.fused_probability || [0, 0, 0];
     const summary = [
@@ -1749,7 +1761,7 @@
     state.hoverFrame = frame;
     state.hoverSource = source;
     if (frame === null) {
-      ui.hoverInfo.textContent = "—";
+      setText(ui.hoverInfo, "—");
       return;
     }
     const pred = codeAt(state.data.labels, frame);
@@ -1757,7 +1769,7 @@
     const ut = utCodeAt(frame);
     const gtText = gt !== null && gt !== "X" ? ` · GT ${gt}` : "";
     const utText = ut !== "X" ? ` · UT ${ut}` : "";
-    ui.hoverInfo.textContent = `frame ${formatFrame(frame)} · ${formatTime(frame / state.data.fps)} · pred ${pred || "—"}${gtText}${utText}`;
+    setText(ui.hoverInfo, `frame ${formatFrame(frame)} · ${formatTime(frame / state.data.fps)} · pred ${pred || "—"}${gtText}${utText}`);
   }
 
   function eventFrame(event, source) {
@@ -1768,7 +1780,10 @@
     if (source === "overview") {
       return clamp(Math.floor(fraction * state.data.n_frames), 0, state.data.n_frames - 1);
     }
-    const { start, stop } = detailWindow();
+    // During a scrub the window is frozen at pointerdown: the detail window follows
+    // state.frame, so re-deriving it mid-gesture would map pixels against a window
+    // the previous seek already moved (double jumps, self-referential drags).
+    const { start, stop } = state.scrubWindow || detailWindow();
     return clamp(start + Math.floor(fraction * (stop - start)), 0, state.data.n_frames - 1);
   }
 
@@ -1807,6 +1822,7 @@
       }
       state.scrubbing = true;
       state.scrubSource = source;
+      state.scrubWindow = source === "overview" ? null : detailWindow();
       const frame = eventFrame(event, source);
       if (frame !== null) {
         updateHover(frame, source);
@@ -1832,7 +1848,7 @@
           : findDraggableAnchor(event.clientX, event.clientY, source)
             ? "ew-resize"
             : "crosshair";
-        if (markerHit) ui.hoverInfo.textContent = describeMarkerHit(markerHit);
+        if (markerHit) setText(ui.hoverInfo, describeMarkerHit(markerHit));
         else updateHover(frame, source);
         if (source === "overview") drawOverview();
         else drawDetail();
@@ -1843,10 +1859,12 @@
       if (event.pointerId !== state.pointerId) return;
       const drag = state.anchorDrag;
       const wasScrubbing = state.scrubbing;
+      const lastScrub = state.pendingScrubFrame;
       state.anchorDrag = null;
       state.scrubbing = false;
       state.pointerId = null;
       state.scrubSource = null;
+      state.scrubWindow = null;
       if (state.scrubRaf !== null) {
         cancelAnimationFrame(state.scrubRaf);
         state.scrubRaf = null;
@@ -1871,9 +1889,10 @@
         return;
       }
       if (wasScrubbing) {
-        if (event.type === "pointerup") {
-          const frame = eventFrame(event, source);
-          if (frame !== null) seekToFrame(frame, { pause: true, updateHistory: false });
+        if (event.type === "pointerup" && lastScrub !== null) {
+          // Flush the last scrubbed frame: the press already sought, and
+          // re-deriving the frame from pixels here would seek a second time.
+          seekToFrame(lastScrub, { pause: true, updateHistory: false });
         }
         updateURL(state.frame);
       }

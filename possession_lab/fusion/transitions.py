@@ -837,6 +837,23 @@ def decode_with_events(
 
 # --------------------------------------------------------------------------- top level
 
+def ball_stale_mask(ball: np.ndarray, ball_present: np.ndarray, stale_frames: int = 125) -> np.ndarray:
+    """Frames deep inside a long ATD ball blind window (> ``stale_frames`` on both sides).
+
+    During those gaps the consensus ball is video-carried and its speed is a tracker
+    artifact, not the ball: kinematic kick/onset detection there invents transitions.
+    """
+    points = np.asarray(ball, dtype=np.float64)
+    obs = np.asarray(ball_present, dtype=bool) & np.isfinite(points).all(axis=1)
+    n = obs.size
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    idx = np.arange(n)
+    last = np.maximum.accumulate(np.where(obs, idx, -10**7))
+    nxt = np.minimum.accumulate(np.where(obs, idx, 10**7)[::-1])[::-1]
+    return (idx - last > int(stale_frames)) & (nxt - idx > int(stale_frames))
+
+
 def apply_transition_layer(
     *,
     codes_pooled: np.ndarray,
@@ -849,6 +866,7 @@ def apply_transition_layer(
     model_params: ModelParams = DEFAULT_PARAMS,
     halves: tuple[tuple[int, int], ...] | None = None,
     box_evidence: BoxEvidence | None = None,
+    ball_stale: np.ndarray | None = None,
 ) -> TransitionLayerResult:
     """Detect, gate, and decode ball-control transitions on top of the fused poll.
 
@@ -868,6 +886,11 @@ def apply_transition_layer(
     nearest_team = control_map(consensus, sets64)
     kicks = detect_kick_events(consensus, speed, valid, sets64, params)
     onsets = detect_onset_events(consensus, speed, valid, nearest_team, sets64, params)
+    if ball_stale is not None:
+        # inside long ATD blind windows the consensus speed is a video carry, not the ball
+        stale = np.asarray(ball_stale, dtype=bool)
+        kicks = [event for event in kicks if not stale[event[0]]]
+        onsets = [event for event in onsets if not stale[event[0]]]
     events, dropped = gate_events(kicks, onsets, codes_pooled, evidence_prob, event_dead, nearest_team, params)
     if box_evidence is not None:
         contain, touch = pixel_contact(box_evidence)

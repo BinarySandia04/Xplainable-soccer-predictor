@@ -498,6 +498,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     from .fusion.transitions import (
         BoxEvidence,
         apply_transition_layer,
+        ball_stale_mask,
         events_to_rows,
         evidence_probability,
     )
@@ -531,6 +532,9 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                 vpitch = np.asarray(z["players_pitch"])
                 vteam = np.asarray(z["players_team"])
                 vpresent = np.asarray(z["players_present"])
+                if "players_official" in z:
+                    # officials are not players: no teams, no pixel box evidence
+                    vpresent = vpresent & ~np.asarray(z["players_official"], dtype=bool)
                 box_evidence = None
                 if not args.no_box and "players_box" in z:
                     yolo_ball = np.asarray(z["yolo_ball_pixel"])[:, 0, :]
@@ -560,6 +564,15 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         evidence_prob=evidence_probability(probabilities, weights),
         player_sets=player_sets,
         box_evidence=box_evidence,
+        ball_stale=(
+            ball_stale_mask(
+                np.asarray(lab.tracking.ball),
+                np.asarray(lab.tracking.ball_present),
+                int(args.stale_gate_frames),
+            )
+            if int(args.stale_gate_frames) > 0
+            else None
+        ),
     )
     print(
         f"transitions: {result.n_kicks} kicks + {result.n_onsets} onsets detected, "
@@ -623,6 +636,72 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_perception_fix(args: argparse.Namespace) -> int:
+    """Rescue keeper teams and referee flags in a perception cache (no re-inference).
+
+    ATD keeper slots swap/freeze under sustained pressure, which made the nearest-slot
+    team assignment hand one club's keeper to the other club's colour; officials are
+    drawn as player dots.  Writes a fixed copy with corrected ``players_team`` and a
+    ``players_official`` flag; nothing on disk is modified in place.
+    """
+    import json
+
+    import numpy as np
+
+    from .config import GRADED_HALVES, OUTPUT_DIR, PITCH
+    from .keepers import derive_keeper_slots, rescue_keeper_teams, rescue_officials
+    from .pipeline import load_lab
+
+    output_dir = Path(args.output_dir or OUTPUT_DIR)
+    lab = load_lab(args.data_dir)
+    perception_path = Path(args.perception) if args.perception else output_dir / "perception.npz"
+    with np.load(perception_path, allow_pickle=False) as z:
+        arrays = {key: np.asarray(z[key]) for key in z.files}
+    keepers = derive_keeper_slots(lab.tracking.players, lab.tracking.teams, PITCH, GRADED_HALVES)
+    teams, flips = rescue_keeper_teams(
+        arrays["players_pixel"],
+        arrays["players_pitch"],
+        arrays["players_present"],
+        arrays["players_team"],
+        lab.tracking.players,
+        lab.homography.matrices,
+        keepers,
+        GRADED_HALVES,
+        PITCH,
+    )
+    officials = rescue_officials(
+        arrays["players_pixel"],
+        arrays["players_present"],
+        arrays["players_track"],
+        lab.tracking.players,
+        lab.homography.matrices,
+        PITCH,
+    )
+    arrays["players_team"] = teams.astype(np.int8)
+    arrays["players_official"] = officials
+    meta = dict(json.loads(str(arrays["meta"]))) if "meta" in arrays else {}
+    meta["keeper_rescue"] = {
+        "flips": len(flips),
+        "keeper_slots_half_goals": keepers.slot.tolist(),
+        "defending_teams": keepers.team.tolist(),
+        "official_box_frames": int(officials.sum()),
+    }
+    arrays["meta"] = np.asarray(json.dumps(meta))
+    out = Path(args.out) if args.out else perception_path.with_name(perception_path.stem + "_fixed.npz")
+    np.savez_compressed(out, **arrays)
+    print(
+        f"perception-fix: keeper team flips {len(flips)}, official box-frames "
+        f"{int(officials.sum())} -> {out}"
+    )
+    flips_path = out.with_suffix(".flips.csv")
+    if flips:
+        pd.DataFrame(flips, columns=["frame", "row", "old_team", "new_team"]).to_csv(
+            flips_path, index=False
+        )
+        print(f"perception-fix: flip log ({len(flips)} rows) -> {flips_path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m possession_lab",
@@ -643,6 +722,7 @@ def build_parser() -> argparse.ArgumentParser:
             "perceive",
             "fusion",
             "transitions",
+            "perception-fix",
         ],
     )
     parser.add_argument("--data-dir", default=None, help="gated data directory (default: data/)")
@@ -654,6 +734,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     perception = parser.add_argument_group("perception", "YOLO/video perception and multi-source fusion")
     perception.add_argument("--perception", default=None, help="perception cache path (default: outputs/perception.npz)")
+    perception.add_argument("--out", default=None, help="perception-fix: output cache path (default: <perception>_fixed.npz)")
     perception.add_argument("--fusion", default=None, help="fusion cache path (default: outputs/fusion.npz)")
     perception.add_argument("--no-perception", action="store_true", help="ignore any perception cache")
     perception.add_argument("--start", type=int, default=None, help="first video frame for perceive (default: public start)")
@@ -692,6 +773,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-box",
         action="store_true",
         help="transitions: disable the pixel box-contact channel (kinematic events only)",
+    )
+    perception.add_argument(
+        "--stale-gate-frames",
+        type=int,
+        default=125,
+        help="transitions: drop kinematic kick/onset events inside ATD ball blind windows "
+        "longer than N frames on both sides (default: 125 = 5 s; 0 disables)",
     )
 
     viewer = parser.add_argument_group("viewer", "local video reviewer options")
@@ -736,6 +824,7 @@ def main(argv: list[str] | None = None) -> int:
         "perceive": cmd_perceive,
         "fusion": cmd_fusion,
         "transitions": cmd_transitions,
+        "perception-fix": cmd_perception_fix,
     }
     return commands[args.command](args)
 

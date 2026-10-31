@@ -390,6 +390,19 @@ class FrameStoreMultiSourceTest(unittest.TestCase):
                             "confidence": 0.8,
                             "track": 4,
                             "box": [1.0, 2.0, 3.0, 4.0],
+                            "official": False,
+                        },
+                        {
+                            "x": 60.0,
+                            "y": 2.0,
+                            "px": 1200.0,
+                            "py": 900.0,
+                            "team": -1,
+                            "team_confidence": 0.0,
+                            "confidence": 0.6,
+                            "track": 9,
+                            "box": [5.0, 6.0, 7.0, 8.0],
+                            "official": True,
                         }
                     ],
                 }
@@ -450,8 +463,11 @@ class FrameStoreMultiSourceTest(unittest.TestCase):
         self.assertIsNone(payload_far["layers"]["yolo"]["x"])
         self.assertEqual(payload["layers"]["fusion"]["x"], 11.0)
         self.assertEqual(payload["layers"]["fusion"]["source"], 0)
-        self.assertEqual(len(payload["video_players"]), 1)
+        self.assertEqual(len(payload["video_players"]), 2)
         self.assertEqual(payload["video_players"][0]["track"], 4)
+        # officials reach the payload flagged, so the renderer can skip their dots
+        self.assertFalse(payload["video_players"][0]["official"])
+        self.assertTrue(payload["video_players"][1]["official"])
         self.assertEqual(len(payload["trails"]["video"]["pitch"]), 2)
         self.assertEqual(len(payload["trails"]["fusion"]["pitch"]), 2)
         # The yolo layer now draws a persistent trajectory (BotSORT-style) from its accepted track:
@@ -883,6 +899,36 @@ class ViewerAssetTest(unittest.TestCase):
         js = (assets / "viewer.js").read_text(encoding="utf-8")
         self.assertIn('setBadge(ui.fusionBadge, code)', js)
         self.assertIn('setBadge(ui.fusedBadge, code)', js)
+
+    def test_detail_scrub_gesture_uses_frozen_window_and_flush_instead_of_reseek(self):
+        # The detail window is relative to state.frame; re-deriving it on pointerup made a
+        # single click seek twice (and dragged scrubs ratchet).  The gesture must freeze the
+        # window at pointerdown and flush the last scrubbed frame on release.
+        assets = Path(__file__).resolve().parents[1] / "viewer_assets"
+        js = (assets / "viewer.js").read_text(encoding="utf-8")
+        self.assertIn('state.scrubWindow = source === "overview" ? null : detailWindow();', js)
+        self.assertIn("const { start, stop } = state.scrubWindow || detailWindow();", js)
+        self.assertIn("const lastScrub = state.pendingScrubFrame;", js)
+        self.assertIn("if (event.type === \"pointerup\" && lastScrub !== null) {", js)
+        self.assertNotIn("const frame = eventFrame(event, source);\n          if (frame !== null) seekToFrame", js)
+
+    def test_frame_chips_reserve_space_against_reflow_flicker(self):
+        # hoverInfo swapping line counts bounced the detail hint; the fusion chip toggled
+        # between "cargando poll…" and the full text every tick while a fetch was in flight.
+        assets = Path(__file__).resolve().parents[1] / "viewer_assets"
+        css = (assets / "viewer.css").read_text(encoding="utf-8")
+        js = (assets / "viewer.js").read_text(encoding="utf-8")
+        self.assertRegex(css, r"#hoverInfo\s*\{[^}]*text-overflow:\s*ellipsis")
+        self.assertRegex(css, r"#fusionStatus\s*\{[^}]*min-height:\s*2\.7em")
+        self.assertIn("state.fusionRendered", js)
+        self.assertRegex(js, r"if \(data\.fusion_available && state\.fusionRendered\)")
+
+    def test_officials_are_never_drawn_as_player_dots(self):
+        # referee boxes used to render as extra team-coloured dots with no player behind
+        # them; the marker pass must skip anything flagged official.
+        assets = Path(__file__).resolve().parents[1] / "viewer_assets"
+        js = (assets / "viewer.js").read_text(encoding="utf-8")
+        self.assertIn("if (player.official) continue;", js)
 
 
 class BrowserOpenTest(unittest.TestCase):

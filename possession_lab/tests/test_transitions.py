@@ -12,6 +12,7 @@ from possession_lab.fusion.transitions import (
     TransitionParams,
     apply_transition_layer,
     ball_speed,
+    ball_stale_mask,
     build_pulse,
     control_map,
     decode_with_events,
@@ -288,6 +289,84 @@ class ParamsTests(unittest.TestCase):
         self.assertGreater(p.pulse_decay, 0.9)
         self.assertLess(p.pulse_decay, 1.0)
         self.assertLess(X, 4)
+
+
+class BallStaleGateTests(unittest.TestCase):
+    def test_mask_marks_only_the_deep_middle_of_long_gaps(self):
+        present = np.ones(700, dtype=bool)
+        present[100:400] = False  # 300-frame blind window
+        ball = np.zeros((700, 2))
+        mask = ball_stale_mask(ball, present, stale_frames=125)
+        self.assertFalse(mask[0])
+        self.assertFalse(mask[99])
+        self.assertFalse(mask[126])  # still < 125 frames from the last observation
+        self.assertTrue(mask[226])
+        self.assertTrue(mask[274])
+        self.assertFalse(mask[276])  # already < 125 frames from the next observation
+        self.assertFalse(mask[401])
+        # short gaps (110 frames) never qualify: no frame is >100 from both ends
+        short = np.ones(400, dtype=bool)
+        short[150:260] = False
+        self.assertFalse(ball_stale_mask(np.zeros((400, 2)), short, stale_frames=100).any())
+
+    def test_mask_requires_finite_positions_not_just_present(self):
+        present = np.ones(500, dtype=bool)
+        ball = np.zeros((500, 2))
+        ball[100:400] = np.nan
+        present[250] = False  # keep a real observation-free frame at the centre anyway
+        mask = ball_stale_mask(ball, present, stale_frames=10)
+        self.assertFalse(mask[0])
+        self.assertTrue(mask[120])
+
+    def test_apply_transition_layer_drops_kicks_inside_blind_windows(self):
+        kick_at = 80
+        n = N
+        ball = ramp_ball(n=n, kick_at=kick_at)
+        pitch = np.zeros((n, 2, 2))
+        pitch[:kick_at, 0] = [float(ball[kick_at, 0]) + 0.8, 20.0]
+        pitch[kick_at:, 0] = ball[kick_at:] + np.array([0.8, 0.0])
+        pitch[:, 1] = [5.0, 20.0]
+        teams = np.asarray([H, A], dtype=np.int8)
+        sets = [(pitch, teams, np.ones((n, 2), dtype=bool))]
+        codes_pooled = np.full(n, A, dtype=np.int8)
+        fused = np.zeros((n, 3))
+        fused[:, A] = 0.97
+        fused[:, H] = 0.02
+        fused[:, D] = 0.01
+        fused[kick_at - 12 :, H] = 0.60
+        fused[kick_at - 12 :, A] = 0.35
+        fused[kick_at - 12 :, D] = 0.05
+        evidence = np.full((n, 3), 0.0)
+        evidence[:, A] = 0.8
+        evidence[:, H] = 0.2
+        evidence[:, D] = 0.001
+        evidence[kick_at - 12 :, H] = 0.6
+        evidence[kick_at - 12 :, A] = 0.35
+        evidence[kick_at - 12 :, D] = 0.05
+
+        stale = np.zeros(n, dtype=bool)
+        stale[60:100] = True  # the kick sits inside a video-carried blind window
+        result = apply_transition_layer(
+            codes_pooled=codes_pooled,
+            fused_probability=fused,
+            event_dead=np.zeros(n, dtype=bool),
+            consensus_ball=ball,
+            evidence_prob=evidence,
+            player_sets=sets,
+            halves=((0, n),),
+            ball_stale=stale,
+        )
+        self.assertEqual(len(result.events), 0)
+        without = apply_transition_layer(
+            codes_pooled=codes_pooled,
+            fused_probability=fused,
+            event_dead=np.zeros(n, dtype=bool),
+            consensus_ball=ball,
+            evidence_prob=evidence,
+            player_sets=sets,
+            halves=((0, n),),
+        )
+        self.assertGreaterEqual(len(without.events), 1)  # same fixture, gate open
 
 
 class PixelChannelTests(unittest.TestCase):
