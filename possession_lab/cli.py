@@ -496,6 +496,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     from .evaluate import full_match_stats, public_metrics
     from .fusion.ballot import VoterRole
     from .fusion.transitions import (
+        DEFAULT_TRANSITION_PARAMS,
         BoxEvidence,
         apply_transition_layer,
         ball_conflict_mask,
@@ -582,6 +583,17 @@ def cmd_transitions(args: argparse.Namespace) -> int:
             pad=int(args.conflict_pad_frames),
         )
         gate_frames = conflict if gate_frames is None else (gate_frames | conflict)
+    # the cross-stream relay reads the four ball/control voter ballots straight from
+    # the fusion cache; it gates nothing when disabled or when a voter is missing
+    from dataclasses import replace
+
+    relay_keys = ("atd_ball", "video_ball", "yolo_ball", "video_players")
+    relay_ballots = None
+    if float(args.relay_min_prob) > 0 and all(
+        f"src_{key}_probability" in arrays and f"src_{key}_weight" in arrays for key in relay_keys
+    ):
+        relay_ballots = {key: (arrays[f"src_{key}_probability"], arrays[f"src_{key}_weight"]) for key in relay_keys}
+    params = replace(DEFAULT_TRANSITION_PARAMS, relay_min_prob=float(args.relay_min_prob))
     result = apply_transition_layer(
         codes_pooled=arrays["codes"].astype(np.int8),
         fused_probability=arrays["fused_probability"].astype(np.float64),
@@ -592,6 +604,8 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         box_evidence=box_evidence,
         ball_stale=gate_frames,
         blind_dead=blind_dead,
+        ballots=relay_ballots,
+        params=params,
     )
     print(
         f"transitions: {result.n_kicks} kicks + {result.n_onsets} onsets detected, "
@@ -824,6 +838,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="transitions: freeze a dead-ball state across frames that are deep inside "
         "an ATD ball blind window AND below consensus confidence N (default: 0.5; 0 disables)",
+    )
+    perception.add_argument(
+        "--relay-min-prob",
+        type=float,
+        default=0.8,
+        help="transitions: admit a ball-in-box contact inside a settled spell when all four "
+        "ball/control voters sit at or above N for the contacting team, both ball streams pin "
+        "the ball to the same single player's box, and the spell's team never shows the ball "
+        "in its own boxes across the lookback window (default: 0.8; 0 disables)",
     )
 
     viewer = parser.add_argument_group("viewer", "local video reviewer options")

@@ -27,6 +27,7 @@ from possession_lab.fusion.transitions import (
     gate_events,
     gate_pixel_events,
     pixel_contact,
+    relay_contacts,
 )
 
 N = 120
@@ -546,6 +547,86 @@ class PixelChannelTests(unittest.TestCase):
         p = TransitionParams()
         self.assertGreater(p.pixel_bound_window, 0)
         self.assertLess(p.pixel_bias, p.pulse_near)
+
+
+class RelayContactTests(unittest.TestCase):
+    """A camera-attested takeover may relay across a spell the prior never saw break."""
+
+    @staticmethod
+    def world(n: int = 700):
+        codes = np.zeros(n, dtype=np.int8)
+        codes[:600] = A  # a settled spell; the next boundary is 200 frames away
+        codes[600:] = D
+        prob = np.full((n, 3), 0.15)
+        prob[:, A] = 0.7  # the fused anchor stays on A: momentum never catches up
+        dead = np.zeros(n, dtype=bool)
+        boxes = np.zeros((n, 2, 4))
+        boxes[:, 0] = [-2.0, 15.0, 2.0, 25.0]  # H player around the ball pixel
+        boxes[:, 1] = [100.0, 0.0, 104.0, 20.0]  # A player far away
+        atd = np.full((n, 2), [0.0, 20.0])
+        yolo = np.full((n, 2), [0.0, 20.0])  # the two streams agree exactly
+        ev = BoxEvidence(
+            boxes=boxes,
+            team=np.asarray([H, A], dtype=np.int8),
+            present=np.ones((n, 2), dtype=bool),
+            ball_yolo=yolo,
+            ball_yolo_present=np.ones(n, dtype=bool),
+            ball_atd=atd,
+        )
+        contain = np.zeros(n, dtype=np.int8)
+        contain[390:401] = 1
+        contact = [(400, 11.0, H, 1.0)]
+        p_h = np.full((n, 3), 0.05)
+        p_h[:, H] = 0.87
+        w = np.ones(n)
+        ballots = {k: (p_h, w) for k in ("atd_ball", "video_ball", "yolo_ball", "video_players")}
+        return codes, prob, dead, ev, contain, contact, ballots
+
+    def test_relay_admits_a_camera_unanimous_mid_spell_contact(self):
+        codes, prob, dead, ev, contain, contact, ballots = self.world()
+        relay = relay_contacts(contact, contain, ev, codes, ballots)
+        self.assertEqual(relay, {(400, H)})
+        # without the relay set the gate still rejects: settled spells belong to geometry
+        _, intervals = gate_pixel_events(contact, [], contain, codes, prob, dead, ())
+        self.assertEqual(intervals, [])
+        kept, intervals = gate_pixel_events(contact, [], contain, codes, prob, dead, (), relay=relay)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual([(a, b, t) for a, b, t in intervals], [(390, 600, H)])
+
+    def test_relay_requires_every_ballot_voter_on_the_event_team(self):
+        codes, _, _, ev, contain, contact, ballots = self.world()
+        weak = dict(ballots)
+        p_low = np.full((700, 3), 0.25)
+        p_low[:, H] = 0.5  # one voter below the unanimity bar
+        weak["yolo_ball"] = (p_low, np.ones(700))
+        self.assertEqual(relay_contacts(contact, contain, ev, codes, weak), frozenset())
+        other = dict(ballots)
+        p_a = np.full((700, 3), 0.05)
+        p_a[:, A] = 0.9  # unanimous, but for the spell's own team
+        other = {key: (p_a, np.ones(700)) for key in other}
+        self.assertEqual(relay_contacts(contact, contain, ev, codes, other), frozenset())
+
+    def test_relay_requires_the_spell_team_to_never_show_the_ball(self):
+        codes, _, _, ev, contain, contact, ballots = self.world()
+        anchor_seen = contain.copy()
+        anchor_seen[300:401] |= 2  # the anchor team's boxes hold the ball all over the lookback
+        self.assertEqual(relay_contacts(contact, anchor_seen, ev, codes, ballots), frozenset())
+
+    def test_relay_requires_the_two_ball_streams_to_agree_on_one_player(self):
+        codes, _, _, ev, contain, contact, ballots = self.world()
+        yolo = np.full((700, 2), [20.0, 20.0])  # the other stream sees the ball elsewhere
+        ev2 = BoxEvidence(
+            boxes=ev.boxes, team=ev.team, present=ev.present,
+            ball_yolo=yolo, ball_yolo_present=np.ones(700, dtype=bool), ball_atd=ev.ball_atd,
+        )
+        self.assertEqual(relay_contacts(contact, contain, ev2, codes, ballots), frozenset())
+
+    def test_relay_never_overturns_a_dead_ball_and_needs_a_solid_run(self):
+        codes, _, _, ev, contain, contact, ballots = self.world()
+        all_dead = np.full(700, D, dtype=np.int8)
+        self.assertEqual(relay_contacts(contact, contain, ev, all_dead, ballots), frozenset())
+        short = [(400, 4.0, H, 1.0)]  # below the solid-run bar
+        self.assertEqual(relay_contacts(short, contain, ev, codes, ballots), frozenset())
 
 
 class DeadBlindCarryTests(unittest.TestCase):

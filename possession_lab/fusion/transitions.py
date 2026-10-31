@@ -116,6 +116,18 @@ class TransitionParams:
     pixel_commit_prob: float = 0.7  # ... at this probability: then extend the interval to the boundary
     pixel_commit_gap: int = 90  # but only when that boundary is this close: the pitch is just slow, not lost
     pixel_bias: float = 3.2  # sustained logit over an owned interval
+    # -- cross-stream relay: a camera-attested takeover *inside* a settled spell.
+    # the sticky prior is memory, and memory is right until it loses the ball out
+    # of sight: it may only be outvoted mid-spell when every independent
+    # ball/control voter asserts the other team at once, both ball streams pin the
+    # ball to the same single player's box, and the prior team itself never shows
+    # the ball on camera across the lookback window
+    relay_min_prob: float = 0.8  # each of the four ballot voters' probability for the event team
+    relay_sole_frac: float = 0.75  # run frames where both streams' sole container is the same player
+    relay_px_max: float = 8.0  # median ATD-to-YOLO ball distance over the run: one agreeing camera
+    relay_anchor_window: int = 120  # lookback frames for the possession-dominance comparison
+    relay_anchor_max: int = 10  # holder's ball-in-box frames in the window: at most this many ...
+    relay_anchor_ratio: int = 4  # ... and this many times fewer than the event team's
 
 
 DEFAULT_TRANSITION_PARAMS = TransitionParams()
@@ -627,6 +639,95 @@ def gate_events(
     return tuple(kept), dropped
 
 
+RELAY_VOTERS = ("atd_ball", "video_ball", "yolo_ball", "video_players")
+
+
+def relay_contacts(
+    contact: Sequence[tuple],
+    contain: np.ndarray,
+    evidence: BoxEvidence,
+    codes_pooled: np.ndarray,
+    ballots: Mapping[str, tuple[np.ndarray, np.ndarray]],
+    params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
+) -> frozenset[tuple[int, int]]:
+    """Contact events that may relay across a settled spell (``relay_*`` params).
+
+    Returns the ``(frame, team)`` keys of contact candidates that are camera
+    testimony rather than depth noise: every independent ballot voter (ATD ball,
+    video ball, YOLO ball, video players) puts the event team at
+    ``relay_min_prob`` at the run end, both ball streams pin the ball to one and
+    the same single containing player across the run with median distance
+    ``relay_px_max``, and the spell's team has at most ``relay_anchor_max`` of its
+    own ball-in-box frames in the last ``relay_anchor_window`` -- and a
+    ``relay_anchor_ratio``-fold minority of the event team's.  The prior is a
+    lagged copy of its own inputs: it cannot outvote four agreeing sensors plus a
+    camera that repeatedly sees the ball held and never sees *its* team touch it.
+    """
+    if not all(key in ballots for key in RELAY_VOTERS):
+        return frozenset()
+    probs = np.stack([np.asarray(ballots[key][0], dtype=np.float64) for key in RELAY_VOTERS])
+    weights = np.stack(
+        [np.clip(np.asarray(ballots[key][1], dtype=np.float64), 0.0, 1.0) for key in RELAY_VOTERS]
+    )
+    unanim_team = probs.argmax(axis=2)[0]
+    unanim = ((probs.max(axis=2) >= params.relay_min_prob) & (weights > 0)).all(axis=0)
+    unanim &= (probs.argmax(axis=2) == unanim_team[None, :]).all(axis=0)
+
+    boxes = np.asarray(evidence.boxes, dtype=np.float64)
+    present = np.asarray(evidence.present, dtype=bool)
+    atd = np.asarray(evidence.ball_atd, dtype=np.float64)
+    yolo = np.asarray(evidence.ball_yolo, dtype=np.float64)
+    a_ok = np.isfinite(atd).all(axis=1)
+    y_ok = np.asarray(evidence.ball_yolo_present, dtype=bool) & np.isfinite(yolo).all(axis=1)
+    x1, y1, x2, y2 = boxes[..., 0], boxes[..., 1], boxes[..., 2], boxes[..., 3]
+    n = boxes.shape[0]
+    same_player = np.zeros(n, dtype=bool)
+    dist = np.full(n, np.inf)
+    for s in range(0, n, CHUNK):
+        e = min(n, s + CHUNK)
+        dist[s:e] = np.linalg.norm(atd[s:e] - yolo[s:e], axis=1)
+        sole: dict[str, np.ndarray] = {}
+        for name, ball, seen in (("a", atd, a_ok), ("y", yolo, y_ok)):
+            px, py = ball[s:e, 0], ball[s:e, 1]
+            ins = (present[s:e] & seen[s:e, None]
+                   & (px[:, None] >= x1[s:e]) & (px[:, None] <= x2[s:e])
+                   & (py[:, None] >= y1[s:e]) & (py[:, None] <= y2[s:e]))
+            cnt = ins.sum(axis=1)
+            sole[name] = np.where(cnt == 1, ins.argmax(axis=1), -1)
+        same_player[s:e] = (sole["a"] >= 0) & (sole["a"] == sole["y"])
+
+    codes = np.asarray(codes_pooled)
+    contain_arr = np.asarray(contain)
+    bits = {H: 1, 1: 2}
+    out: set[tuple[int, int]] = set()
+    for ev in contact:
+        frame, runlen, team = int(ev[0]), int(ev[1]), int(ev[2])
+        if team not in (H, 1) or runlen < params.pixel_solid_run:
+            continue
+        if not bool(unanim[frame]) or int(unanim_team[frame]) != team:
+            continue
+        rs = frame - runlen + 1
+        if float(same_player[rs:frame + 1].mean()) < params.relay_sole_frac:
+            continue
+        seen = a_ok[rs:frame + 1] & y_ok[rs:frame + 1]
+        if int(seen.sum()) < min(runlen, 5):
+            continue
+        if float(np.median(dist[rs:frame + 1][seen])) > params.relay_px_max:
+            continue
+        cur = codes[max(0, frame - 20):frame]
+        cur = cur[(cur == H) | (cur == 1)]
+        if cur.size == 0:
+            continue  # relays correct possession spells, never a dead ball
+        anchor = int(np.bincount(cur).argmax())
+        window = contain_arr[max(0, frame - params.relay_anchor_window):frame + 1]
+        team_c = int(((window & bits[team]) > 0).sum())
+        anchor_c = int(((window & bits[anchor]) > 0).sum())
+        if anchor_c > params.relay_anchor_max or anchor_c * params.relay_anchor_ratio > team_c:
+            continue
+        out.add((frame, team))
+    return frozenset(out)
+
+
 def gate_pixel_events(
     contact: Sequence[tuple],
     kicker: Sequence[tuple],
@@ -636,6 +737,7 @@ def gate_pixel_events(
     event_dead: np.ndarray,
     kept_kinematic: Sequence[TransitionEvent],
     params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
+    relay: frozenset[tuple[int, int]] = frozenset(),
 ) -> tuple[list[TransitionEvent], list[tuple[int, int, int]]]:
     """Admit pixel events into a sequential stream and hand out owned intervals.
 
@@ -645,9 +747,11 @@ def gate_pixel_events(
     up* — its probability for the event's team reaches ``pixel_momentum_min`` within
     ``pixel_momentum_horizon`` frames — or, for kicks, when the win-and-clear
     fingerprint (``pixel_fingerprint_*``: released slowly from feet the other team was
-    nowhere near) says the ball was won and put in flight in one motion.  A settled
-    spell is left to the pitch geometry: box overlap in depth looks identical to a take
-    and must not puncture the spell.
+    nowhere near) says the ball was won and put in flight in one motion.  Contacts
+    marked by ``relay_contacts`` pass regardless of boundary distance and momentum:
+    four agreeing sensors plus a cross-stream-attested hold that the prior team never
+    shows on camera.  A settled spell is otherwise left to the pitch geometry: box
+    overlap in depth looks identical to a take and must not puncture the spell.
 
     Events are processed in frame order.  A team that already owns the stream cannot
     re-anchor, and admitting the other team's flip ends the previous interval.  Each
@@ -676,7 +780,8 @@ def gate_pixel_events(
         k = int(np.searchsorted(bnd, frame, side="right"))
         prev_b = int(bnd[k - 1]) if k > 0 else -(10**9)
         next_b = int(bnd[k]) if k < len(bnd) else n
-        if min(frame - prev_b, next_b - frame) > params.pixel_bound_window:
+        is_relay = (frame, team) in relay
+        if not is_relay and min(frame - prev_b, next_b - frame) > params.pixel_bound_window:
             continue  # mid-spell: settled possession, boxes confound depth
         hf = min(n - 1, frame + params.pixel_momentum_horizon)
         momentum = float(fused_prob[hf, team]) >= params.pixel_momentum_min
@@ -686,7 +791,7 @@ def gate_pixel_events(
             and dom_px >= params.pixel_fingerprint_dom
             and strength <= params.pixel_fingerprint_release_max
         )
-        if not (momentum or fingerprint):
+        if not (momentum or fingerprint or is_relay):
             continue  # fused evidence never comes around and no winning fingerprint: noise
         cur = codes_pooled[max(0, frame - 20):frame]
         cur = cur[(cur == H) | (cur == 1)]
@@ -953,6 +1058,7 @@ def apply_transition_layer(
     box_evidence: BoxEvidence | None = None,
     ball_stale: np.ndarray | None = None,
     blind_dead: np.ndarray | None = None,
+    ballots: Mapping[str, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> TransitionLayerResult:
     """Detect, gate, and decode ball-control transitions on top of the fused poll.
 
@@ -964,7 +1070,10 @@ def apply_transition_layer(
     takeover (``contact``) and a win-and-clear kick (``kicker``) fire only near a fused
     boundary where the evidence catches up (or carries the winning fingerprint), hold
     their team with a sustained logit until the boundary or a cap, and leave settled
-    spells to the pitch geometry.
+    spells to the pitch geometry.  With ``ballots`` (voter key -> ``(probability,
+    weight)`` for the four ball/control voters) the cross-stream relay
+    (``relay_contacts``) additionally admits a camera-attested takeover inside a
+    settled spell.
     """
     consensus = np.asarray(consensus_ball, dtype=np.float64)
     sets64 = [(np.asarray(p, dtype=np.float64), np.asarray(t), np.asarray(pr, dtype=bool)) for p, t, pr in player_sets]
@@ -981,10 +1090,15 @@ def apply_transition_layer(
     if box_evidence is not None:
         contain, touch = pixel_contact(box_evidence)
         contact = detect_contact_events(contain, touch, speed, event_dead, params)
+        relay = (
+            relay_contacts(contact, contain, box_evidence, codes_pooled, ballots, params)
+            if ballots is not None
+            else frozenset()
+        )
         kicker = detect_kicker_events(box_evidence, touch, speed, params)
         pixel_kept, intervals = gate_pixel_events(
             contact, kicker, contain, codes_pooled, np.asarray(fused_probability, dtype=np.float64),
-            event_dead, events, params,
+            event_dead, events, params, relay=relay,
         )
         events = tuple(sorted(events + tuple(pixel_kept), key=lambda e: (e.start, e.frame)))
         dropped += len(contact) + len(kicker) - len(pixel_kept)
