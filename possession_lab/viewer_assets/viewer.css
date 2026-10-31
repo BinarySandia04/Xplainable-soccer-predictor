@@ -417,10 +417,6 @@ video {
   accent-color: #f4f8fb;
 }
 
-.layer-toggle input[data-layer="kalman"] {
-  accent-color: #9ad0ff;
-}
-
 .layer-toggle input[data-layer="combined"] {
   accent-color: var(--warn);
 }
@@ -451,7 +447,6 @@ video {
 .pitch-dot.dot-H { background: var(--h); }
 .pitch-dot.dot-A { background: var(--a); }
 .pitch-dot.dot-atd { background: #f4f8fb; }
-.pitch-dot.dot-kalman { background: #9ad0ff; }
 .pitch-dot.dot-combined {
   background: #f4f8fb;
   border: 1.5px dashed var(--warn);

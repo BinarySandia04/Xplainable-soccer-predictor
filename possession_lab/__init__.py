@@ -35,7 +35,6 @@ from .events import apply_event_overrides, build_events
 from .explain import build_explanations, explain_prediction
 from .features import Features, extract_features
 from .fusion import FusionResult, build_fusion
-from .kalman import KalmanTrack, kalman_ball_track
 from .model import (
     DEFAULT_PARAMS,
     DecodeResult,
@@ -93,8 +92,6 @@ __all__ = [
     # Tracking
     "BallTrack",
     "track_ball",
-    "KalmanTrack",
-    "kalman_ball_track",
     # Audio
     "WhistleData",
     "score_per_video_frame",

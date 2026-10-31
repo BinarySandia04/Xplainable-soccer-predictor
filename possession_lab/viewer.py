@@ -486,14 +486,12 @@ class FrameStore:
         features: Any,
         *,
         trail_frames: int = 25,
-        kalman: Any | None = None,
         perception: Any | None = None,
         fusion: Any | None = None,
     ) -> None:
         self.tracking = tracking
         self.homography = homography
         self.track = track
-        self.kalman = kalman
         self.events = events
         self.features = features
         self.perception = perception
@@ -827,7 +825,7 @@ class FrameStore:
             observed = available
             outside = self._outside_pitch(x, y) if available else False
         else:
-            track = self.kalman if layer == "kalman" else self.track
+            track = self.track
             if track is None:
                 available = False
                 x = y = float("nan")
@@ -935,7 +933,7 @@ class FrameStore:
                 points.append((k, float(point[0]), float(point[1]), 0))
             return points
 
-        track = self.kalman if layer == "kalman" else self.track
+        track = self.track
         if track is None:
             return []
         points = []
@@ -975,13 +973,13 @@ class FrameStore:
 
         trails = {
             layer: self._trail_payload(frame, layer)
-            for layer in ("raw", "kalman", "combined", "video", "yolo", "fusion")
+            for layer in ("raw", "combined", "video", "yolo", "fusion")
         }
         trail = trails["combined"]["video"]
         trail_pitch = trails["combined"]["pitch"]
         layers = {
             layer: self._layer_payload(frame, layer)
-            for layer in ("raw", "kalman", "combined", "video", "yolo", "fusion")
+            for layer in ("raw", "combined", "video", "yolo", "fusion")
         }
 
         players: list[dict[str, Any]] = []
@@ -1292,7 +1290,7 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
             if entry is None:
                 self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "viewer index not configured")
             else:
-                self._send_bytes(entry[0], entry[1], send_body=send_body)
+                self._send_bytes(entry[0], entry[1], send_body=send_body, cache="no-store")
             return
         if path == "/api/viewer-data":
             self._send_bytes(
@@ -1310,7 +1308,7 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
             return
         entry = self.assets.get(path)
         if entry is not None:
-            self._send_bytes(entry[0], entry[1], send_body=send_body)
+            self._send_bytes(entry[0], entry[1], send_body=send_body, cache="no-store")
             return
         if path == "/favicon.ico":
             self.send_response(HTTPStatus.NO_CONTENT)
@@ -1537,13 +1535,11 @@ def build_frame_store(
     from .events import build_events
     from .features import extract_features
     from .fusion import load_fusion
-    from .kalman import kalman_ball_track
     from .perception import load_perception
     from .pipeline import load_lab
 
     lab = load_lab(data_dir, load_gt=False)
     track = track_ball(lab.tracking)
-    kalman = kalman_ball_track(lab.tracking)
     whistle = None
     if Path(WHISTLE_CACHE).is_file():
         whistle = load_or_extract(video_path, lab.tracking.n_frames)
@@ -1561,7 +1557,6 @@ def build_frame_store(
         track,
         events,
         features,
-        kalman=kalman,
         perception=perception,
         fusion=fusion,
     )

@@ -22,10 +22,9 @@
     1: "Athletic Club",
   };
   const MONO = '"SFMono-Regular", "Cascadia Code", "Roboto Mono", monospace';
-  const BALL_LAYERS = ["raw", "kalman", "yolo", "video", "combined", "fusion"];
+  const BALL_LAYERS = ["raw", "yolo", "video", "combined", "fusion"];
   const LAYER_NAMES = {
     raw: "ATD bruto",
-    kalman: "Kalman",
     combined: "Combinado",
     video: "Balón vídeo",
     yolo: "YOLO balón",
@@ -33,7 +32,6 @@
   };
   const LAYER_SHORT_NAMES = {
     raw: "ATD",
-    kalman: "Kalman",
     combined: "comb.",
     video: "vídeo",
     yolo: "YOLO",
@@ -155,7 +153,7 @@
     switchFilter: "all",
     switchFrames: [],
     overlayEnabled: true,
-    layers: { raw: true, kalman: true, combined: true, video: true, yolo: true, fusion: true },
+    layers: { raw: true, combined: true, video: true, yolo: true, fusion: true },
     yoloPlayersEnabled: true,
     yoloCandidatesEnabled: true,
     frameData: null,
@@ -310,7 +308,7 @@
   function layerSummary(frameData, compact = false, includeGap = true) {
     if (!frameData) return "cargando seguimiento…";
     const parts = [];
-    for (const layer of ["fusion", "combined", "video", "yolo", "kalman", "raw"]) {
+    for (const layer of ["fusion", "combined", "video", "yolo", "raw"]) {
       if (!state.layers[layer]) continue;
       const data = layerData(frameData, layer);
       const source = data ? Number(data.source) : 2;
@@ -327,7 +325,6 @@
 
   function layerColor(layer, source, alpha = 1) {
     if (layer === "raw") return `rgba(244, 248, 251, ${alpha})`;
-    if (layer === "kalman") return `rgba(154, 208, 255, ${alpha})`;
     if (layer === "video") {
       if (source === 1) return `rgba(255, 200, 87, ${alpha})`;
       if (source === 3) return `rgba(85, 209, 135, ${alpha})`;
@@ -517,7 +514,6 @@
       if (points.length < 2) continue;
       ctx.save();
       ctx.lineWidth = layer === "combined" ? 1.8 : 1.3;
-      if (layer === "kalman") ctx.setLineDash([3, 3]);
       for (let index = 1; index < points.length; index++) {
         const previous = points[index - 1];
         const current = points[index];
@@ -590,7 +586,7 @@
       ctx.restore();
       return;
     }
-    const radius = (layer === "kalman" ? 6.2 : layer === "video" ? 7.2 : 8.2) * scale;
+    const radius = (layer === "video" ? 7.2 : 8.2) * scale;
     ctx.beginPath();
     ctx.arc(x, y, radius, 0, Math.PI * 2);
     ctx.lineWidth = layer === "combined" || layer === "video" ? 2 : 1.7;

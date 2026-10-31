@@ -50,7 +50,6 @@ flowchart TD
 
     subgraph Kinematics["2. Kinematics & Audio Perception"]
         CausalBall["Causal Ball Extrapolator<br/>(tau=0.35s decay, <=1.2s max)"]
-        KalmanBall["Causal 2D Kalman Filter<br/>(Constant Velocity, Innovation Gate)"]
         WhistleDet["Spectral Whistle Detector<br/>(2.4-3.8 kHz Band Harmonic Filter)"]
         YOLO["YOLOv8 + White-Blob CV<br/>(Player feet & ball detection)"]
         PhysGate["Physical Continuity Gate<br/>(Kinematic cap <= 40 m/s)"]
@@ -76,7 +75,6 @@ flowchart TD
     end
 
     ATD --> CausalBall
-    ATD --> KalmanBall
     Audio --> WhistleDet
     Video --> YOLO
     H_mat --> YOLO
@@ -111,12 +109,11 @@ flowchart TD
 
 ## 3. Methodological Details
 
-### 3.1 Causal Ball Tracking (`balltrack.py` & `kalman.py`)
+### 3.1 Causal Ball Tracking (`balltrack.py`)
 - **Conservative short-gap bridging:** Purely causal (frame $k$ only accesses frames $\le k$). Extrapolates short ball tracking dropouts using a damped constant-velocity formulation:
   $$v(t) = v_0 \cdot \exp(-0.35 t)$$
   capped strictly at $1.2\text{ s}$ ($30\text{ frames}$).
 - **Admitting long gaps:** Gaps $> 1.2\text{ s}$ are explicitly tagged as `source=2` (unobserved) rather than inventing unphysical ball coordinates across dead-ball phases.
-- **Diagnostic Kalman Layer:** A 2D constant-velocity Kalman filter with innovation gating ($\chi^2$ threshold) tracks state $[x, y, v_x, v_y]^\top$ for up to $5\text{ s}$ for visual inspection without biasing the primary model emissions.
 
 ### 3.2 Feature Engineering (`features.py`)
 Extracts physically grounded football dynamics for every frame:
@@ -175,7 +172,7 @@ The match is modeled as a discrete first-order Markov chain over states $\mathca
 ### 3.9 Interactive Diagnostic Studio (`viewer.py`)
 - Zero-dependency Python HTTP server (`http.server`) serving a synchronized web application (`http://127.0.0.1:8765`).
 - **Synchronized Video & Pitch:** Video playback with homography overlays side-by-side with a top-down pitch canvas rendered directly from pitch-space metres.
-- **Multi-Layer Ball Inspection:** Live toggle between raw ATD, Causal extrapolated, Kalman filtered, YOLO video perception, and Fused consensus.
+- **Multi-Layer Ball Inspection:** Live toggle between raw ATD, causal combined tracker, YOLO video perception, and fused consensus.
 - **Decision Audit Timeline:** Clickable switch markers with reason explanations, confidence metrics, and user-truth annotation tools.
 
 ---
@@ -200,7 +197,6 @@ Xplainable-soccer-predictor/
     ├── config.py                      # Constants, pitch dimensions (105.3x68m), parameters
     ├── data.py                        # Gated data loaders (ATD, XML tags, homography)
     ├── balltrack.py                   # Causal ball extrapolator & out-of-play checks
-    ├── kalman.py                      # Causal 2D constant-velocity Kalman filter
     ├── aerial.py                      # Causal flight detection & launch-team freeze (w_air=0)
     ├── audio.py                       # Tactical audio extraction & whistle detection
     ├── perception.py                  # YOLOv8 CV perception & physical continuity gating
