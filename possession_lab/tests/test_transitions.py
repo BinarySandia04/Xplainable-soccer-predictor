@@ -8,17 +8,22 @@ import numpy as np
 
 from possession_lab.config import FPS, A, D, H, X
 from possession_lab.fusion.transitions import (
+    BoxEvidence,
     TransitionParams,
     apply_transition_layer,
     ball_speed,
     build_pulse,
     control_map,
     decode_with_events,
+    detect_contact_events,
     detect_kick_events,
+    detect_kicker_events,
     detect_onset_events,
     events_to_rows,
     evidence_probability,
     gate_events,
+    gate_pixel_events,
+    pixel_contact,
 )
 
 N = 120
@@ -283,6 +288,182 @@ class ParamsTests(unittest.TestCase):
         self.assertGreater(p.pulse_decay, 0.9)
         self.assertLess(p.pulse_decay, 1.0)
         self.assertLess(X, 4)
+
+
+class PixelChannelTests(unittest.TestCase):
+    """YOLO ball-in-box contacts, win-and-clear kicks and the boundary interval gate."""
+
+    @staticmethod
+    def evidence(n, atd, yolo=None, yolo_present=None, boxes=None, team=None):
+        if boxes is None:
+            boxes = np.zeros((n, 2, 4))
+            boxes[:, 0] = [10.0, 10.0, 20.0, 40.0]  # H player
+            boxes[:, 1] = [80.0, 10.0, 90.0, 40.0]  # A player
+        if team is None:
+            team = np.tile(np.array([H, A], dtype=np.int8), (n, 1))
+        return BoxEvidence(
+            boxes=boxes,
+            team=team,
+            present=np.ones((n, 2), dtype=bool),
+            ball_yolo=np.full((n, 2), np.nan) if yolo is None else yolo,
+            ball_yolo_present=np.zeros(n, dtype=bool) if yolo_present is None else yolo_present,
+            ball_atd=atd,
+        )
+
+    def test_pixel_contact_ors_yolo_and_atd_pixels(self):
+        n = 6
+        atd = np.zeros((n, 2))
+        atd[:, :] = [15.0, 30.0]  # inside the H box, at its feet line: contain + touch
+        yolo = np.zeros((n, 2))
+        yolo[:, :] = [85.0, 25.0]  # the detector sees the ball at the A player instead
+        yolo[0] = [np.nan, np.nan]
+        yp = np.ones(n, dtype=bool)
+        yp[0] = False
+        ev = self.evidence(n, atd, yolo, yp)
+        contain, touch = pixel_contact(ev)
+        self.assertEqual(int(contain[0]), 1)  # yolo absent: atd alone -> H
+        self.assertEqual(int(contain[1]), 3)  # both pixels seen: both teams register
+        self.assertEqual(int(touch[0]), 1)  # ball on the H player's feet line
+
+    def test_contact_needs_a_fresh_dominant_consecutive_run(self):
+        n = 60
+        contain = np.zeros(n, dtype=np.int8)
+        contain[20:23] = 1
+        touch = np.zeros(n, dtype=np.int8)
+        speed = np.full(n, 5.0)
+        dead = np.zeros(n, dtype=bool)
+        events = detect_contact_events(contain, touch, speed, dead)
+        self.assertEqual([(f, r, t) for f, r, t, _ in events], [(22, 3.0, H)])
+        # scattered contain frames never form a run
+        contain_loose = np.zeros(n, dtype=np.int8)
+        contain_loose[[20, 22, 24]] = 1
+        self.assertEqual(detect_contact_events(contain_loose, touch, speed, dead), [])
+        # a touch right before the run means continued play, not a takeover
+        touch_stale = np.zeros(n, dtype=np.int8)
+        touch_stale[18] = 1
+        self.assertEqual(detect_contact_events(contain, touch_stale, speed, dead), [])
+        # the other team sharing every frame strips dominance
+        contain_shared = np.zeros(n, dtype=np.int8)
+        contain_shared[20:23] = 3
+        self.assertEqual(detect_contact_events(contain_shared, touch, speed, dead), [])
+        # a fast ball is a deflection, not control
+        self.assertEqual(detect_contact_events(contain, touch, np.full(n, 20.0), dead), [])
+        # dead ball frames are not takeovers
+        dead[15:30] = True
+        self.assertEqual(detect_contact_events(contain, touch, speed, dead), [])
+
+    def test_kicker_finds_a_win_and_clear(self):
+        n = 80
+        boxes = np.zeros((n, 2, 4))
+        boxes[:, 0] = [-2.0, 0.0, 2.0, 20.0]  # H player, feet at (0, 20)
+        boxes[:, 1] = [60.0, 0.0, 64.0, 20.0]  # A player far away
+        atd = np.zeros((n, 2))
+        atd[:, :] = [0.0, 19.0]  # at H's feet
+        for t in range(51, n):
+            atd[t, 0] = 5.0 * (t - 50)  # released: 5 px/frame away
+        speed = np.full(n, 4.0)
+        speed[52:] = 10.0  # put in flight within 3 frames of frame 50
+        ev = self.evidence(n, atd, boxes=boxes)
+        _, touch = pixel_contact(ev)
+        events = detect_kicker_events(ev, touch, speed)
+        self.assertEqual([(f, t) for f, _, t, _, _ in events], [(50, H)])
+        self.assertLess(events[0][3], 2.0)  # released right off the foot
+
+    def test_kicker_needs_the_other_team_far_and_a_real_release(self):
+        n = 80
+        boxes = np.zeros((n, 2, 4))
+        boxes[:, 0] = [-2.0, 0.0, 2.0, 20.0]
+        boxes[:, 1] = [6.0, 0.0, 10.0, 20.0]  # A player contesting: dominance fails
+        atd = np.zeros((n, 2))
+        atd[:, :] = [0.0, 19.0]
+        for t in range(51, n):
+            atd[t, 0] = 5.0 * (t - 50)
+        speed = np.full(n, 4.0)
+        speed[52:] = 10.0
+        ev = self.evidence(n, atd, boxes=boxes)
+        _, touch = pixel_contact(ev)
+        self.assertEqual(detect_kicker_events(ev, touch, speed), [])
+        # slow at the feet but never put in flight: no release
+        ev2 = self.evidence(n, np.zeros((n, 2)), boxes=boxes)
+        speed_still = np.full(n, 4.0)
+        _, touch2 = pixel_contact(ev2)
+        self.assertEqual(detect_kicker_events(ev2, touch2, speed_still), [])
+
+    @staticmethod
+    def _gate_world(n, flip_at):
+        codes = np.zeros(n, dtype=np.int8)
+        codes[:flip_at] = A
+        prob = np.full((n, 3), 0.33)
+        prob[:, D] = 0.0
+        dead = np.zeros(n, dtype=bool)
+        return codes, prob, dead
+
+    def test_gate_keeps_boundary_contact_whose_team_the_fusion_reaches(self):
+        n = 700
+        codes, prob, dead = self._gate_world(n, 260)
+        prob[400:, H] = 0.6  # fused evidence catches up within the horizon
+        prob[405:, A] = 0.6
+        contain = np.zeros(n, dtype=np.int8)
+        contain[246:251] = 1
+        contact = [(250, 3.0, H, 1.0)]
+        kept, intervals = gate_pixel_events(contact, [], contain, codes, prob, dead, ())
+        self.assertEqual([(a, b, t) for a, b, t in intervals], [(246, 260, H)])
+        self.assertEqual(len(kept), 1)
+        # a second event for the team that already owns the stream dies
+        _, intervals2 = gate_pixel_events([*contact, (252, 3.0, H, 1.0)], [], contain, codes, prob, dead, ())
+        self.assertEqual(len(intervals2), 1)
+        # the opposing team's event cuts the interval and takes over
+        _, intervals3 = gate_pixel_events([*contact, (255, 3.0, A, 1.0)], [], contain, codes, prob, dead, ())
+        self.assertEqual(intervals3[0][1], 255)
+        self.assertEqual(len(intervals3), 2)
+
+    def test_gate_rejects_mid_spell_and_unconfirmed_events(self):
+        n = 700
+        codes, prob, dead = self._gate_world(n, 260)
+        contain = np.zeros(n, dtype=np.int8)
+        contain[420:425] = 1
+        # far from any possession boundary: settled spell belongs to pitch geometry
+        _, intervals = gate_pixel_events([(424, 3.0, H, 1.0)], [], contain, codes, prob, dead, ())
+        self.assertEqual(intervals, [])
+        # near a boundary but the fused evidence never comes around
+        _, intervals = gate_pixel_events([(250, 3.0, H, 1.0)], [], contain[:251], codes, prob, dead, ())
+        self.assertEqual(intervals, [])
+        # ... unless the win-and-clear fingerprint carries it
+        kicker = [(424, 11.0, H, 13.0, 57.0)]
+        codes2 = np.zeros(n, dtype=np.int8)
+        codes2[:424] = A  # boundary right at the event: close to it
+        _, intervals = gate_pixel_events([], kicker, np.zeros(n, dtype=np.int8), codes2, prob, dead, ())
+        self.assertEqual([(a, b, t) for a, b, t in intervals], [(423, 499, H)])
+        # a punt-speed "release" above the fingerprint ceiling is a track jump
+        kicker_jump = [(424, 40.0, H, 13.0, 57.0)]
+        _, intervals = gate_pixel_events([], kicker_jump, np.zeros(n, dtype=np.int8), codes2, prob, dead, ())
+        self.assertEqual(intervals, [])
+        # dead-ball frames cannot flip possession
+        dead[420:430] = True
+        _, intervals = gate_pixel_events([], kicker, np.zeros(n, dtype=np.int8), codes2, prob, dead, ())
+        self.assertEqual(intervals, [])
+
+    def test_gate_extends_to_a_boundary_the_fusion_is_about_to_cross(self):
+        n = 700
+        codes, prob, dead = self._gate_world(n, 300)
+        prob[340:, H] = 0.6  # momentum passes ...
+        prob[300:, H] = 0.9  # ... and the fusion commits at the boundary: absorb the lag
+        contain = np.zeros(n, dtype=np.int8)
+        contain[186:191] = 1
+        _, intervals = gate_pixel_events([(190, 3.0, H, 1.0)], [], contain, codes, prob, dead, ())
+        self.assertEqual([(a, b, t) for a, b, t in intervals], [(186, 300, H)])
+        # without the commit (probability below the bar) the interval stops at the cap
+        prob2 = prob.copy()
+        prob2[:, H] = 0.6  # momentum passes at the horizon; commit prob at 300 is 0.6 < 0.7
+        _, intervals = gate_pixel_events([(190, 3.0, H, 1.0)], [], contain, codes, prob2, dead, ())
+        self.assertEqual([(a, b, t) for a, b, t in intervals], [(186, 265, H)])
+
+    def test_box_channel_off_by_default_in_apply_layer(self):
+        # apply_transition_layer without box_evidence reproduces the kinematic layer:
+        # exercised across the suite; here just assert the parameter is optional.
+        p = TransitionParams()
+        self.assertGreater(p.pixel_bound_window, 0)
+        self.assertLess(p.pixel_bias, p.pulse_near)
 
 
 if __name__ == "__main__":

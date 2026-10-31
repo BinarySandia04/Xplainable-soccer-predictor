@@ -495,7 +495,12 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     from .config import OUTPUT_DIR
     from .evaluate import full_match_stats, public_metrics
     from .fusion.ballot import VoterRole
-    from .fusion.transitions import apply_transition_layer, events_to_rows, evidence_probability
+    from .fusion.transitions import (
+        BoxEvidence,
+        apply_transition_layer,
+        events_to_rows,
+        evidence_probability,
+    )
     from .fusion.voters import ROLE_BY_KEY
     from .pipeline import load_lab, validate_codes, write_submission
 
@@ -526,6 +531,18 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                 vpitch = np.asarray(z["players_pitch"])
                 vteam = np.asarray(z["players_team"])
                 vpresent = np.asarray(z["players_present"])
+                box_evidence = None
+                if not args.no_box and "players_box" in z:
+                    yolo_ball = np.asarray(z["yolo_ball_pixel"])[:, 0, :]
+                    yolo_seen = np.asarray(z["yolo_ball_present"], dtype=bool)[:, 0]
+                    box_evidence = BoxEvidence(
+                        boxes=np.asarray(z["players_box"]),
+                        team=vteam,
+                        present=vpresent,
+                        ball_yolo=yolo_ball,
+                        ball_yolo_present=yolo_seen,
+                        ball_atd=np.asarray(z["ball_pixel"]),
+                    )
             if vpitch.shape[0] != n:
                 print(
                     f"transitions: perception cache covers {vpitch.shape[0]} samples but fusion has "
@@ -542,14 +559,21 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         consensus_ball=arrays["consensus_ball"].astype(np.float64),
         evidence_prob=evidence_probability(probabilities, weights),
         player_sets=player_sets,
+        box_evidence=box_evidence,
+    )
+    print(
+        f"transitions: {result.n_kicks} kicks + {result.n_onsets} onsets detected, "
+        f"{result.n_contact} contacts + {result.n_kicker} win-and-clear kicks from boxes, "
+        f"{result.n_gated_out} gated out -> {len(result.events)} transition events"
     )
     events_path = output_dir / "transition_events.csv"
     rows = events_to_rows(result.events)
+    kind_names = np.array(["kick", "onset", "contact", "kicker"])
     pd.DataFrame(
         {
             "start_frame": rows[:, 0].astype(int),
             "event_frame": rows[:, 1].astype(int),
-            "kind": ["kick" if k == 0 else "onset" for k in rows[:, 2]],
+            "kind": kind_names[rows[:, 2].astype(int)],
             "team": ["H" if t == 0 else "A" for t in rows[:, 3]],
             "distance_m": rows[:, 4],
             "support": rows[:, 5],
@@ -664,6 +688,11 @@ def build_parser() -> argparse.ArgumentParser:
     perception.add_argument("--combine-mode", choices=["log", "linear"], default="log", help="ballot pool (default: log)")
     perception.add_argument("--skip-baseline", action="store_true", help="do not compute the baseline comparison")
     perception.add_argument("--no-audio", action="store_true", help="disable whistle/audio products")
+    perception.add_argument(
+        "--no-box",
+        action="store_true",
+        help="transitions: disable the pixel box-contact channel (kinematic events only)",
+    )
 
     viewer = parser.add_argument_group("viewer", "local video reviewer options")
     viewer.add_argument("--port", type=int, default=8765, help="local HTTP port (default: 8765)")

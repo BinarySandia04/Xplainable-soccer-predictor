@@ -83,6 +83,39 @@ class TransitionParams:
     boost_p_switch: float = 0.03
     boost_pre: int = 2
     boost_post: int = 8
+    # -- pixel box-contact channel (dedicated YOLO ball inside YOLO player boxes)
+    contact_run: int = 3  # consecutive frames with the ball pixel inside a team's box
+    contact_novel: int = 4  # frames before the run during which the team must not have
+    # touched: a fresh takeover, not continued juggling
+    contact_dominance: int = 2  # contain-frame margin over the other team inside the run
+    # (crowds share the image: boxes of far players swallow the ball pixel, but never for
+    # more than a frame or two of a genuine take)
+    contact_speed_max: float = 12.0  # m/s; control means a slow ball, not a deflection
+    kicker_slow_max: float = 7.0  # m/s at the close frame: the ball starts slow ...
+    kicker_leave_speed: float = 9.0  # ... and reaches this within 3 frames: released
+    kicker_release_max: float = 35.0  # above this the track jumped: artifact, not a kick
+    kicker_close_px: float = 20.0  # ball-to-nearest-box-foot distance that counts as feet
+    kicker_dominance_px: float = 25.0  # the other team's nearest foot must be this further
+    kicker_leave_px: float = 12.0  # growth of ball-to-box distance over 3 frames: it left
+    kicker_touch_window: int = 3  # team touch band must fire within [t-2, t+3] frames
+    contact_pulse: float = 3.2  # weaker logit than kinematic pulses: pixel events correct
+    contact_pulse_solid: float = 3.8  # ...the *timing* of the anchor, not fight it for long
+    contact_solid_support: float = 0.6  # support fraction that counts as solid control
+    # -- pixel intervals: pixel evidence only corrects timing near possession boundaries;
+    # settled spells belong to the pitch geometry (box overlap in depth looks identical)
+    pixel_bound_window: int = 130  # fire only this close to a fused-code boundary
+    pixel_momentum_horizon: int = 150  # frames in which fused evidence must catch up ...
+    pixel_momentum_min: float = 0.5  # ... to this probability for the event's team
+    pixel_fingerprint_close: float = 16.0  # win-and-clear kicks pass without catch-up:
+    pixel_fingerprint_dom: float = 40.0  # released from feet nobody else was near ...
+    pixel_fingerprint_release_max: float = 15.0  # ... a short clearance, not a punt
+    pixel_cap: int = 75  # owned interval: end at fused boundary or this cap ...
+    pixel_cap_solid: int = 250  # ... whichever first; solid contacts may run longer
+    pixel_solid_run: int = 5  # contact run length that counts as solid
+    pixel_commit_frames: int = 40  # fused code must stay this team for this many frames ...
+    pixel_commit_prob: float = 0.7  # ... at this probability: then extend the interval to the boundary
+    pixel_commit_gap: int = 90  # but only when that boundary is this close: the pitch is just slow, not lost
+    pixel_bias: float = 3.2  # sustained logit over an owned interval
 
 
 DEFAULT_TRANSITION_PARAMS = TransitionParams()
@@ -100,7 +133,8 @@ class TransitionEvent:
     support: float  # mean pooled-evidence margin over the current holder
 
     def as_row(self) -> tuple[int, int, int, int, float, float]:
-        return (self.start, self.frame, 0 if self.kind == "kick" else 1, self.team, self.distance, self.support)
+        kind_code = {"kick": 0, "onset": 1, "contact": 2, "kicker": 3}[self.kind]
+        return (self.start, self.frame, kind_code, self.team, self.distance, self.support)
 
 
 @dataclass(frozen=True)
@@ -112,6 +146,8 @@ class TransitionLayerResult:
     n_kicks: int
     n_onsets: int
     n_gated_out: int
+    n_contact: int = 0
+    n_kicker: int = 0
 
 
 # --------------------------------------------------------------------------- ball kinematics
@@ -165,6 +201,202 @@ def control_map(
         ok = valid[s:e] & np.isfinite(b).all(axis=1)
         nearest[s:e] = np.where(ok & (best_d <= control_radius), best_t, -1).astype(np.int8)
     return nearest
+
+
+# --------------------------------------------------------------------------- pixel contact evidence
+
+@dataclass(frozen=True)
+class BoxEvidence:
+    """Dedicated-YOLO pixel evidence: player boxes and the observed ball pixel.
+
+    All arrays cover the same frame range as the fusion cache.  ``ball_yolo`` is the
+    highest-confidence ball detection (may be NaN when the model saw no ball),
+    ``ball_atd`` the tracked pitch-projection pixel; the contact channel trusts the YOLO
+    detection first and falls back to the ATD pixel.
+    """
+
+    boxes: np.ndarray  # (n, p, 4) float, xyxy in image pixels
+    team: np.ndarray  # (n, p) int, H=0 / A=1 (other ids are ignored)
+    present: np.ndarray  # (n, p) bool
+    ball_yolo: np.ndarray  # (n, 2) float pixel, NaN where absent
+    ball_yolo_present: np.ndarray  # (n,) bool
+    ball_atd: np.ndarray  # (n, 2) float pixel, NaN where absent
+
+
+def _contact_bits(
+    boxes: np.ndarray,
+    teams: np.ndarray,
+    present: np.ndarray,
+    px: np.ndarray,
+    py: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bit flags (1 = H, 2 = A) for one ball pixel: strict box ``contain`` and leg-band
+    ``touch`` — the box's horizontal span widened to ``0.8`` of its width, from the top of
+    the shins (``0.5`` of box height above the feet line) to ``0.4`` below the feet line,
+    where a ball at a player's feet or just in front of them sits at the same ground line."""
+    x1, y1, x2, y2 = boxes[..., 0], boxes[..., 1], boxes[..., 2], boxes[..., 3]
+    w = np.maximum(x2 - x1, 1.0)
+    h = np.maximum(y2 - y1, 1.0)
+    ok = present & ((teams == H) | (teams == 1))
+    inside = ok & (px >= x1) & (px <= x2) & (py >= y1) & (py <= y2)
+    band = ok & (np.abs(px - (x1 + x2) / 2) <= 0.8 * w) & (py >= y2 - 0.5 * h) & (py <= y2 + 0.4 * h)
+    contain = np.zeros(px.shape[:-1], dtype=np.int8)
+    touch = np.zeros(px.shape[:-1], dtype=np.int8)
+    for team, bit in ((H, 1), (1, 2)):
+        sel = teams == team
+        contain |= np.where((inside & sel).any(axis=-1), bit, 0).astype(np.int8)
+        touch |= np.where((band & sel).any(axis=-1), bit, 0).astype(np.int8)
+    return contain, touch
+
+
+def pixel_contact(evidence: BoxEvidence) -> tuple[np.ndarray, np.ndarray]:
+    """Per-frame team bit flags (bit 0 = H, bit 1 = A) for both observed ball pixels.
+
+    The YOLO detection and the ATD track are evaluated against the boxes independently
+    and OR-ed: either can register contact.  A single detection that disagrees with the
+    track contributes an isolated frame that the window rule filters out, while a genuine
+    ball-in-box (or a track the detector confirms) accumulates.
+    """
+    boxes = np.asarray(evidence.boxes, dtype=np.float64)
+    teams = np.asarray(evidence.team)
+    present = np.asarray(evidence.present, dtype=bool)
+    atd = np.asarray(evidence.ball_atd, dtype=np.float64)
+    yolo = np.asarray(evidence.ball_yolo, dtype=np.float64)
+    contain = np.zeros(boxes.shape[0], dtype=np.int8)
+    touch = np.zeros(boxes.shape[0], dtype=np.int8)
+    y_seen = np.asarray(evidence.ball_yolo_present, dtype=bool)
+    for s in range(0, boxes.shape[0], CHUNK):
+        e = min(boxes.shape[0], s + CHUNK)
+        bx = np.where(y_seen[s:e, None], yolo[s:e], np.nan)
+        atd_ok = np.isfinite(atd[s:e])
+        py_atd = np.where(atd_ok[:, 0], atd[s:e, 1], np.nan)
+        py_yolo = np.where(y_seen[s:e] & np.isfinite(yolo[s:e, 1]), yolo[s:e, 1], np.nan)
+        for px, py in ((atd[s:e, 0], py_atd), (bx[:, 0], py_yolo)):
+            pc, pt = _contact_bits(
+                boxes[s:e], teams[s:e], present[s:e],
+                np.nan_to_num(px, nan=-1.0e9)[:, None], np.nan_to_num(py, nan=-1.0e9)[:, None],
+            )
+            keep = np.isfinite(px) & np.isfinite(py)
+            contain[s:e] |= np.where(keep, pc, 0)
+            touch[s:e] |= np.where(keep, pt, 0)
+    return contain, touch
+
+
+def detect_contact_events(
+    contain: np.ndarray,
+    touch: np.ndarray,
+    speed: np.ndarray,
+    event_dead: np.ndarray,
+    params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
+) -> list[tuple[int, float, int, float]]:
+    """Fresh pixel-control takeovers: ``(run_end_frame, run_length, team, 1.0)``.
+
+    A team claims control when the ball pixel sits *consecutively* inside its boxes for
+    ``contact_run`` frames (the run ends: it held the ball that long and then played it),
+    it dominates the run (the other team contains the ball in at least
+    ``contact_dominance`` frames fewer — in a crowd the ball pixel sits in far players'
+    boxes too, but not persistently for the wrong side), it had *no* touch in the
+    ``contact_novel`` frames before the run (a fresh takeover, not continued juggling),
+    the ball is slow, and play is live.
+    """
+    n = contain.shape[0]
+    own_bits = {1: (np.asarray(contain) & 1) > 0, 2: (np.asarray(contain) & 2) > 0}
+    touch_bits = {1: (np.asarray(touch) & 1) > 0, 2: (np.asarray(touch) & 2) > 0}
+    events: list[tuple[int, float, int, float]] = []
+    idx = np.arange(n)
+    for team, bit in ((H, 1), (1, 2)):
+        own = own_bits[bit]
+        last_off = np.maximum.accumulate(np.where(own, -1, idx))
+        run = np.where(own, idx - last_off, 0).astype(np.int32)
+        oth = own_bits[3 - bit].astype(np.int32)
+        own_t = touch_bits[bit].astype(np.int32)
+        cs = np.concatenate(([0], np.cumsum(oth)))
+        ts = np.concatenate(([0], np.cumsum(own_t)))
+        cand = np.flatnonzero((run >= params.contact_run) & (np.r_[own[1:], False] == 0))
+        cand = cand[np.isfinite(speed[cand]) & (speed[cand] <= params.contact_speed_max)]
+        for t in cand:
+            t = int(t)
+            rs = t - int(run[t]) + 1
+            if int(run[t]) - int(cs[t + 1] - cs[rs]) < params.contact_dominance:
+                continue
+            if int(ts[rs] - ts[max(0, rs - params.contact_novel)]) > 0:
+                continue
+            if float(np.mean(np.asarray(event_dead)[max(0, t - 10):t + 10])) > params.dead_max:
+                continue
+            events.append((t, float(run[t]), team, 1.0))
+    return _suppress(events, params.nms_window)
+
+
+def _box_foot_distance(evidence: BoxEvidence) -> np.ndarray:
+    """Min pixel distance from the ball (ATD track preferred, else YOLO detection — one
+    continuous trajectory for release direction) to each team's box foot-centre.
+    ``(n, 2)`` float array, column 0 = team H, column 1 = team A."""
+    boxes = np.asarray(evidence.boxes, dtype=np.float64)
+    teams = np.asarray(evidence.team)
+    present = np.asarray(evidence.present, dtype=bool)
+    atd = np.asarray(evidence.ball_atd, dtype=np.float64)
+    yolo = np.asarray(evidence.ball_yolo, dtype=np.float64)
+    ball = np.where(np.isfinite(atd), atd, yolo)
+    n = boxes.shape[0]
+    out = np.full((n, 2), np.inf)
+    for s in range(0, n, CHUNK):
+        e = min(n, s + CHUNK)
+        b = boxes[s:e]
+        cx = (b[..., 0] + b[..., 2]) / 2
+        cy = b[..., 3]
+        ok = present[s:e] & np.isin(teams[s:e], (H, 1))
+        d = np.linalg.norm(ball[s:e, None, :] - np.stack([cx, cy], axis=-1), axis=2)
+        for col, team in ((0, H), (1, 1)):
+            dm = np.where(ok & (teams[s:e] == team), d, np.inf)
+            out[s:e, col] = dm.min(axis=1)
+    return out
+
+
+def detect_kicker_events(
+    evidence: BoxEvidence,
+    touch: np.ndarray,
+    speed: np.ndarray,
+    params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
+) -> list[tuple[int, float, int, float, float]]:
+    """Win-and-clear kicks: ``(frame, release_speed, team, close_px, dominance_px)``.
+
+    A pixel-only kick signature the receiver-based :func:`detect_kick_events` misses:
+    the ball is slow at one team's feet (nearest box foot within ``kicker_close_px``,
+    ``speed <= kicker_slow_max``), that team clearly owns the ball there (the other
+    team's nearest foot is ``kicker_dominance_px`` further away), the team's touch band
+    fires within ``[-2, kicker_touch_window]`` frames of the release, and the ball is
+    then put in flight (reaches ``kicker_leave_speed`` within 3 frames while the
+    distance to that team's boxes grows by ``kicker_leave_px``).  Attribution goes to
+    the side that released the ball even when the homography track shows no player near
+    it — the winner touches the ball before any receiver enters the pitch attribution
+    radius.
+    """
+    dist = _box_foot_distance(evidence)
+    n = speed.shape[0]
+    events: list[tuple[int, float, int, float, float]] = []
+    tail_max = np.full(n, np.nan)
+    for o in (1, 2, 3):
+        s = np.full(n, np.nan)
+        s[:-o] = speed[o:]
+        tail_max = np.fmax(tail_max, s)
+    slow = np.isfinite(speed) & (speed <= params.kicker_slow_max)
+    release = np.isfinite(tail_max) & (tail_max >= params.kicker_leave_speed)
+    touch_arr = np.asarray(touch)
+    for team, col, bit in ((H, 0, 1), (1, 1, 2)):
+        d = dist[:, col]
+        close = d <= params.kicker_close_px
+        dominate = dist[:, 1 - col] >= d + params.kicker_dominance_px
+        leaving = np.full(n, -np.inf)
+        with np.errstate(invalid="ignore"):
+            leaving[:-3] = d[3:] - d[:-3]
+        cs = np.concatenate(([0], np.cumsum(((touch_arr & bit) > 0).astype(np.int32))))
+        hi = np.minimum(np.arange(n) + params.kicker_touch_window + 1, n)
+        lo = np.maximum(np.arange(n) - 2, 0)
+        coupled = (cs[hi] - cs[lo]) > 0
+        cand = np.flatnonzero(slow & close & dominate & release & (leaving >= params.kicker_leave_px) & coupled)
+        for t in cand:
+            events.append((int(t), float(tail_max[t]), team, float(d[t]), float(dist[t, 1 - col] - d[t])))
+    return _suppress(events, params.nms_window)
 
 
 # --------------------------------------------------------------------------- event detection
@@ -222,12 +454,12 @@ def _players_near(
     return out
 
 
-def _suppress(events: list[tuple[int, float, int, float]], window: int) -> list[tuple[int, float, int, float]]:
+def _suppress(events: list[tuple], window: int) -> list[tuple]:
     """Greedy non-maximum suppression by descending strength, per team.
 
     A stronger event only suppresses events attributed to the *same* team within
     ``window`` frames: two teams kicking within the window is a duel, and both touches
-    are real.  Input tuples are ``(frame, strength, team, distance)``.
+    are real.  Input tuples start ``(frame, strength, team, ...)``.
     """
     events = sorted(events, key=lambda e: -e[1])
     kept: list[tuple[int, float, int, float]] = []
@@ -395,6 +627,108 @@ def gate_events(
     return tuple(kept), dropped
 
 
+def gate_pixel_events(
+    contact: Sequence[tuple],
+    kicker: Sequence[tuple],
+    contain: np.ndarray,
+    codes_pooled: np.ndarray,
+    fused_prob: np.ndarray,
+    event_dead: np.ndarray,
+    kept_kinematic: Sequence[TransitionEvent],
+    params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
+) -> tuple[list[TransitionEvent], list[tuple[int, int, int]]]:
+    """Admit pixel events into a sequential stream and hand out owned intervals.
+
+    Pixel evidence decides a possession only where the camera actually sees what the
+    pitch geometry cannot: *near a possession boundary* (within ``pixel_bound_window``
+    frames of a change in the fused codes) and only when the fused evidence *catches
+    up* — its probability for the event's team reaches ``pixel_momentum_min`` within
+    ``pixel_momentum_horizon`` frames — or, for kicks, when the win-and-clear
+    fingerprint (``pixel_fingerprint_*``: released slowly from feet the other team was
+    nowhere near) says the ball was won and put in flight in one motion.  A settled
+    spell is left to the pitch geometry: box overlap in depth looks identical to a take
+    and must not puncture the spell.
+
+    Events are processed in frame order.  A team that already owns the stream cannot
+    re-anchor, and admitting the other team's flip ends the previous interval.  Each
+    kept event owns ``[start, stop)``: the contact extend-back (or one frame before a
+    kick) up to the next fused-code boundary, a stronger later pixel event, or the
+    length cap (``pixel_cap_solid`` for solid contacts, else ``pixel_cap``), whichever
+    comes first.  Returns ``(kept events, owned intervals)``.
+    """
+    n = codes_pooled.shape[0]
+    bnd = np.flatnonzero(np.r_[True, codes_pooled[1:] != codes_pooled[:-1]])
+    contact_keys = {(int(e[0]), int(e[2])) for e in contact}
+    kicker_map = {(int(e[0]), int(e[2])): e for e in kicker}
+    intervals: list[list[int]] = []
+    kept: list[TransitionEvent] = []
+    for ev in sorted([tuple(e) for e in list(contact) + list(kicker)], key=lambda e: (int(e[0]), int(e[2]))):
+        frame, strength, team = int(ev[0]), float(ev[1]), int(ev[2])
+        is_contact = (frame, team) in contact_keys
+        close_px = dom_px = 0.0
+        if not is_contact:
+            release = strength
+            if release > params.kicker_release_max:
+                continue  # a track jump, not a kick
+            close_px, dom_px = float(kicker_map[(frame, team)][3]), float(kicker_map[(frame, team)][4])
+        if team not in (H, 1):
+            continue
+        k = int(np.searchsorted(bnd, frame, side="right"))
+        prev_b = int(bnd[k - 1]) if k > 0 else -(10**9)
+        next_b = int(bnd[k]) if k < len(bnd) else n
+        if min(frame - prev_b, next_b - frame) > params.pixel_bound_window:
+            continue  # mid-spell: settled possession, boxes confound depth
+        hf = min(n - 1, frame + params.pixel_momentum_horizon)
+        momentum = float(fused_prob[hf, team]) >= params.pixel_momentum_min
+        fingerprint = (
+            not is_contact
+            and close_px <= params.pixel_fingerprint_close
+            and dom_px >= params.pixel_fingerprint_dom
+            and strength <= params.pixel_fingerprint_release_max
+        )
+        if not (momentum or fingerprint):
+            continue  # fused evidence never comes around and no winning fingerprint: noise
+        cur = codes_pooled[max(0, frame - 20):frame]
+        cur = cur[(cur == H) | (cur == 1)]
+        holder = int(np.bincount(cur).argmax()) if cur.size else -1
+        for a, b, t_ in intervals:
+            if a <= frame < b:
+                holder = int(t_)
+        if holder < 0 or holder == team:
+            continue
+        if float(np.mean(event_dead[max(0, frame - 10):frame + 10])) > params.dead_max:
+            continue
+        if any(kev.team == team and abs(kev.frame - frame) < params.nms_window for kev in kept_kinematic):
+            continue  # kinematics already attributes this moment
+        team_bit = 1 if team == H else 2
+        start = frame
+        if is_contact:
+            k2 = frame - 1
+            while k2 >= max(0, frame - params.extend_back) and int(contain[k2]) & team_bit:
+                start = k2
+                k2 -= 1
+            cap = params.pixel_cap_solid if strength >= params.pixel_solid_run else params.pixel_cap
+            support = min(1.0, strength / 8.0)
+        else:
+            start = max(0, frame - 1)
+            cap = params.pixel_cap
+            support = min(1.0, strength / 12.0)
+        stop = min(frame + cap, next_b)
+        if next_b - stop <= params.pixel_commit_gap:
+            tail = codes_pooled[next_b:next_b + params.pixel_commit_frames]
+            if tail.size and np.all(tail == team) and float(fused_prob[min(n - 1, next_b), team]) >= params.pixel_commit_prob:
+                stop = next_b  # fused evidence is about to commit to this team: absorb the lag
+        for iv in intervals:
+            if iv[0] < frame < iv[1]:
+                iv[1] = frame
+        kept.append(
+            TransitionEvent(start=start, frame=frame, kind="contact" if is_contact else "kicker",
+                            team=team, distance=close_px if not is_contact else 1.0, support=support)
+        )
+        intervals.append([start, stop, team])
+    return kept, [(a, b, t_) for a, b, t_ in intervals]
+
+
 def build_pulse(
     events: Sequence[TransitionEvent],
     n_frames: int,
@@ -408,8 +742,15 @@ def build_pulse(
     for i, ev in enumerate(events):
         nxt = events[i + 1].start if i + 1 < len(events) else min(n_frames, ev.start + params.pulse_max_span)
         span = min(max(params.pulse_min_span, nxt - ev.start), params.pulse_max_span)
-        base = params.pulse_near if ev.distance <= params.pulse_close else params.pulse_far
-        strength = base * min(params.pulse_cap, 0.9 + ev.support * params.pulse_support_gain)
+        if ev.kind in ("contact", "kicker"):
+            strength = (
+                params.contact_pulse_solid
+                if ev.kind == "contact" and ev.support >= params.contact_solid_support
+                else params.contact_pulse
+            )
+        else:
+            base = params.pulse_near if ev.distance <= params.pulse_close else params.pulse_far
+            strength = base * min(params.pulse_cap, 0.9 + ev.support * params.pulse_support_gain)
         for k in range(span):
             frame = ev.start + k
             if frame >= n_frames:
@@ -507,11 +848,19 @@ def apply_transition_layer(
     params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
     model_params: ModelParams = DEFAULT_PARAMS,
     halves: tuple[tuple[int, int], ...] | None = None,
+    box_evidence: BoxEvidence | None = None,
 ) -> TransitionLayerResult:
     """Detect, gate, and decode ball-control transitions on top of the fused poll.
 
     ``player_sets`` are ``(pitch (n, p, 2), teams, present (n, p))`` tuples covering the
-    same frame range as ``codes_pooled`` (video tracking, ATD tracking, ...).
+    same frame range as ``codes_pooled`` (video tracking, ATD tracking, ...).  With
+    ``box_evidence`` the dedicated-YOLO pixel channel joins in: a fresh ball-in-box
+    takeover (``contact``) and a win-and-clear kick that leaves the winner (``kicker``)
+    are gated against the current holder and the fused evidence: a fresh ball-in-box
+    takeover (``contact``) and a win-and-clear kick (``kicker``) fire only near a fused
+    boundary where the evidence catches up (or carries the winning fingerprint), hold
+    their team with a sustained logit until the boundary or a cap, and leave settled
+    spells to the pitch geometry.
     """
     consensus = np.asarray(consensus_ball, dtype=np.float64)
     sets64 = [(np.asarray(p, dtype=np.float64), np.asarray(t), np.asarray(pr, dtype=bool)) for p, t, pr in player_sets]
@@ -520,20 +869,48 @@ def apply_transition_layer(
     kicks = detect_kick_events(consensus, speed, valid, sets64, params)
     onsets = detect_onset_events(consensus, speed, valid, nearest_team, sets64, params)
     events, dropped = gate_events(kicks, onsets, codes_pooled, evidence_prob, event_dead, nearest_team, params)
+    if box_evidence is not None:
+        contain, touch = pixel_contact(box_evidence)
+        contact = detect_contact_events(contain, touch, speed, event_dead, params)
+        kicker = detect_kicker_events(box_evidence, touch, speed, params)
+        pixel_kept, intervals = gate_pixel_events(
+            contact, kicker, contain, codes_pooled, np.asarray(fused_probability, dtype=np.float64),
+            event_dead, events, params,
+        )
+        events = tuple(sorted(events + tuple(pixel_kept), key=lambda e: (e.start, e.frame)))
+        dropped += len(contact) + len(kicker) - len(pixel_kept)
+        n_contact, n_kicker = len(contact), len(kicker)
+    else:
+        n_contact = n_kicker = 0
+        intervals: list[tuple[int, int, int]] = []
     pulse, teams, boost, protect = build_pulse(events, codes_pooled.shape[0], params)
     log_em = np.log(np.clip(np.asarray(fused_probability, dtype=np.float64), EPS, 1.0)).copy()
     for team in (H, 1):
         mask = teams == team
         log_em[mask, team] += pulse[mask]
     log_em -= np.log(np.exp(log_em).sum(axis=1, keepdims=True))
+    for a, b, team in intervals:
+        log_em[a:b, team] += params.pixel_bias
+        protect[a:b] = True
+        boost[max(0, a - 10):min(log_em.shape[0], a + 10)] = True
+        boost[max(0, b - 10):min(log_em.shape[0], b + 10)] = True
+    if intervals:
+        log_em -= np.log(np.exp(log_em).sum(axis=1, keepdims=True))
     codes = decode_with_events(log_em, boost, protect, np.asarray(event_dead, dtype=bool), model_params, halves)
     return TransitionLayerResult(
-        codes=codes, events=events, n_kicks=len(kicks), n_onsets=len(onsets), n_gated_out=dropped
+        codes=codes,
+        events=events,
+        n_kicks=len(kicks),
+        n_onsets=len(onsets),
+        n_gated_out=dropped,
+        n_contact=n_contact,
+        n_kicker=n_kicker,
     )
 
 
 def events_to_rows(events: Sequence[TransitionEvent]) -> np.ndarray:
-    """Events as an ``(m, 6)`` array: start, frame, kind (0=kick, 1=onset), team, distance, support."""
+    """Events as an ``(m, 6)`` array: start, frame, kind (0=kick, 1=onset, 2=contact,
+    3=kicker), team, distance, support."""
     if not events:
         return np.zeros((0, 6), dtype=np.float64)
     return np.asarray([e.as_row() for e in events], dtype=np.float64)
@@ -541,6 +918,7 @@ def events_to_rows(events: Sequence[TransitionEvent]) -> np.ndarray:
 
 __all__ = [
     "DEFAULT_TRANSITION_PARAMS",
+    "BoxEvidence",
     "TransitionEvent",
     "TransitionLayerResult",
     "TransitionParams",
@@ -549,9 +927,13 @@ __all__ = [
     "build_pulse",
     "control_map",
     "decode_with_events",
+    "detect_contact_events",
     "detect_kick_events",
+    "detect_kicker_events",
     "detect_onset_events",
     "events_to_rows",
     "evidence_probability",
     "gate_events",
+    "gate_pixel_events",
+    "pixel_contact",
 ]
