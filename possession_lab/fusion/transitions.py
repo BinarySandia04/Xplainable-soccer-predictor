@@ -62,6 +62,13 @@ class TransitionParams:
     onset_max_dist: float = 2.0
     onset_steal_frames: int = 5  # opponent nearest >= this many of the previous 15 frames
     onset_tail_frames: int = 8  # team nearest >= this many of the next 10 frames
+    # a ball stopped dead on an opponent's foot outranks the pooled evidence lag: with the
+    # chase and tail checks above behind it, the distance threshold alone decides
+    onset_touch_dist: float = 0.5  # m: the ball killed within arm's reach of the taker
+    onset_touch_min_loss: float = 7.0  # m/s of speed the ball must have shed to count
+    # a witnessed takeover survives *decoded* deadness: a keeper gathering a save looks
+    # dead to the motion features while play is alive; only the stoppage tag ends the spell
+    onset_touch_hold_frames: int = 150  # cap on the hold-through (0 disables it)
     # -- shared
     nms_window: int = 12
     support_min: float = 0.10  # mean pooled-evidence margin for the attributed team
@@ -101,8 +108,13 @@ class TransitionParams:
     contact_pulse: float = 3.2  # weaker logit than kinematic pulses: pixel events correct
     contact_pulse_solid: float = 3.8  # ...the *timing* of the anchor, not fight it for long
     contact_solid_support: float = 0.6  # support fraction that counts as solid control
+    # -- box lock: a solid ball-inside-box run may take over a settled spell when the
+    # camera never shows the ball in the current holder's box at all during that window
+    box_lock_min_run: int = 5  # contact run length that counts as a lock
+    box_lock_clear_frames: int = 40  # holder must not contain the ball in this window
     # -- pixel intervals: pixel evidence only corrects timing near possession boundaries;
     # settled spells belong to the pitch geometry (box overlap in depth looks identical)
+    # except through the box-lock override above.
     pixel_bound_window: int = 130  # fire only this close to a fused-code boundary
     pixel_momentum_horizon: int = 150  # frames in which fused evidence must catch up ...
     pixel_momentum_min: float = 0.5  # ... to this probability for the event's team
@@ -177,6 +189,9 @@ class TransitionEvent:
     team: int  # attributed team (H=0 / A=1)
     distance: float  # metres from ball to the attributing player
     support: float  # mean pooled-evidence margin over the current holder
+    # witnessed takeover: survives decoded deadness (``onset_touch_hold_frames``) — the
+    # spell ends only at a supported stoppage
+    hold_through: bool = False
 
     def as_row(self) -> tuple[int, int, int, int, float, float]:
         kind_code = {"kick": 0, "onset": 1, "contact": 2, "kicker": 3, "hold": 4}[self.kind]
@@ -638,7 +653,7 @@ def gate_events(
         prev = prev[(prev == H) | (prev == 1)]
         return int(np.bincount(prev).argmax()) if prev.size else -1
 
-    def gate(frame: int, team: int, dist: float, kind: str, support_window: range) -> TransitionEvent | None:
+    def gate(frame: int, team: int, dist: float, kind: str, support_window: range, loss: float = 0.0) -> TransitionEvent | None:
         cur = holder(frame)
         if team not in (H, 1) or cur < 0 or team == cur:
             return None
@@ -646,7 +661,10 @@ def gate_events(
             return None
         idx = np.arange(max(0, support_window.start), min(n, support_window.stop))
         sup = float(np.mean(evidence_prob[idx, team] - evidence_prob[idx, cur])) if idx.size else 0.0
-        if sup < params.support_min:
+        # a ball killed onto an opponent's foot is a save or a tackle, not a lagging pool:
+        # a stop at half a metre with the chase and tail checks behind it outranks support
+        touch = kind == "onset" and dist <= params.onset_touch_dist and loss >= params.onset_touch_min_loss
+        if sup < params.support_min and not touch:
             return None
         if kind == "kick":
             w = nearest_team[max(0, frame - params.control_window):frame]
@@ -659,7 +677,10 @@ def gate_events(
         while k >= max(0, frame - params.extend_back) and nearest_team[k] == team:
             start = k
             k -= 1
-        return TransitionEvent(start=start, frame=frame, kind=kind, team=team, distance=dist, support=sup)
+        return TransitionEvent(
+            start=start, frame=frame, kind=kind, team=team, distance=dist, support=sup,
+            hold_through=touch and sup < params.support_min,
+        )
 
     for frame, _gain, team, dist in kicks:
         ev = gate(int(frame), int(team), float(dist), "kick", range(int(frame), int(frame) + 50))
@@ -667,8 +688,8 @@ def gate_events(
             dropped += 1
         else:
             kept.append(ev)
-    for frame, _loss, team, dist in onsets:
-        ev = gate(int(frame), int(team), float(dist), "onset", range(int(frame) - 10, int(frame) + 40))
+    for frame, loss, team, dist in onsets:
+        ev = gate(int(frame), int(team), float(dist), "onset", range(int(frame) - 10, int(frame) + 40), float(loss))
         if ev is None:
             dropped += 1
         else:
@@ -677,7 +698,7 @@ def gate_events(
     return tuple(kept), dropped
 
 
-RELAY_VOTERS = ("atd_ball", "video_ball", "yolo_ball", "video_players")
+RELAY_VOTERS = ("atd_ball", "yolo_ball", "video_players")
 
 
 def relay_contacts(
@@ -1023,25 +1044,37 @@ def gate_pixel_events(
         prev_b = int(bnd[k - 1]) if k > 0 else -(10**9)
         next_b = int(bnd[k]) if k < len(bnd) else n
         is_relay = (frame, team) in relay
-        if not is_relay and min(frame - prev_b, next_b - frame) > params.pixel_bound_window:
-            continue  # mid-spell: settled possession, boxes confound depth
-        hf = min(n - 1, frame + params.pixel_momentum_horizon)
-        momentum = float(fused_prob[hf, team]) >= params.pixel_momentum_min
-        fingerprint = (
-            not is_contact
-            and close_px <= params.pixel_fingerprint_close
-            and dom_px >= params.pixel_fingerprint_dom
-            and strength <= params.pixel_fingerprint_release_max
-            and (not params.pixel_fingerprint_needs_atd or bool(atd_seen[frame]))
-        )
-        if not (momentum or fingerprint or is_relay):
-            continue  # fused evidence never comes around and no winning fingerprint: noise
         cur = codes_pooled[max(0, frame - 20):frame]
         cur = cur[(cur == H) | (cur == 1)]
         holder = int(np.bincount(cur).argmax()) if cur.size else -1
         for a, b, t_ in intervals:
             if a <= frame < b:
                 holder = int(t_)
+        if is_relay:
+            pass  # cross-stream attested: boundary and momentum do not apply
+        elif min(frame - prev_b, next_b - frame) > params.pixel_bound_window:
+            holder_bit = 1 if holder == H else 2
+            lo = max(0, frame - params.box_lock_clear_frames)
+            if not (
+                holder in (H, 1)
+                and holder != team
+                and is_contact
+                and strength >= params.box_lock_min_run
+                and not (np.asarray(contain)[lo:frame] & holder_bit).any()
+            ):
+                continue  # mid-spell: settled possession, boxes confound depth
+        else:
+            hf = min(n - 1, frame + params.pixel_momentum_horizon)
+            momentum = float(fused_prob[hf, team]) >= params.pixel_momentum_min
+            fingerprint = (
+                not is_contact
+                and close_px <= params.pixel_fingerprint_close
+                and dom_px >= params.pixel_fingerprint_dom
+                and strength <= params.pixel_fingerprint_release_max
+                and (not params.pixel_fingerprint_needs_atd or bool(atd_seen[frame]))
+            )
+            if not (momentum or fingerprint):
+                continue  # fused evidence never comes around and no winning fingerprint: noise
         if holder < 0 or holder == team:
             continue
         if float(np.mean(event_dead[max(0, frame - 10):frame + 10])) > params.dead_max:
@@ -1371,6 +1404,54 @@ def dead_needs_support(
     return out
 
 
+def hold_touch_through(
+    codes: np.ndarray,
+    events: Sequence[TransitionEvent],
+    event_dead: np.ndarray,
+    dead_support: np.ndarray,
+    params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
+) -> np.ndarray:
+    """A witnessed takeover survives *decoded* deadness until a supported stoppage.
+
+    A keeper gathering a save kills the ball's speed for a long stretch: the motion
+    features read that as a dead ball while the game is still playing (measured 17 273:
+    the save, ~70 frames of crawl, the stoppage tag only at 17 377).  Where a
+    ``hold_through`` event (an onset that passed the gate on the ball-killed-at-the-
+    taker's-foot evidence alone) owns the spell, hand unsupported ``D`` back to the
+    event team until the first stoppage ``dead_support`` frame, capped at
+    ``onset_touch_hold_frames``.  A tagged stoppage, another event, or the ball living
+    with the other team all end the hold first.
+    """
+    out = np.asarray(codes).copy()
+    n = out.size
+    if n == 0 or params.onset_touch_hold_frames <= 0:
+        return out
+    tagged = np.asarray(event_dead, dtype=bool)
+    supported = np.asarray(dead_support, dtype=bool)
+    if supported.size != n or tagged.size != n:
+        return out
+    holders = [e for e in events if e.hold_through]
+    if not holders:
+        return out
+    starts = sorted(e.start for e in events)
+    for event in holders:
+        start = max(0, min(int(event.start), int(event.frame)))
+        end = min(n, int(event.frame) + int(params.onset_touch_hold_frames))
+        after = np.flatnonzero(supported[int(event.frame) + 1:end])
+        if after.size:
+            end = int(event.frame) + int(after[0]) + 1
+        end = min(end, min((s for s in starts if s > event.start), default=end))
+        for t in range(start, end):
+            if tagged[t]:
+                break  # the tag is the authority: play is stopped from here
+            current = out[t]
+            if current in (H, 1) and current != event.team:
+                break  # the other team owns the live ball already
+            if current == D:
+                out[t] = event.team
+    return out
+
+
 def apply_transition_layer(
     *,
     codes_pooled: np.ndarray,
@@ -1466,6 +1547,13 @@ def apply_transition_layer(
         # a dead ball that went blind stays dead: the "restart" inside the window is the
         # carried trajectory, not play (post-decode so a window cannot disturb the half)
         codes = carry_dead_through_blind(codes, blind_dead, halves)
+    if params.onset_touch_hold_frames > 0:
+        # a witnessed takeover survives decoded deadness until the stoppage tag supports it
+        codes = hold_touch_through(
+            codes, events, np.asarray(event_dead, dtype=bool),
+            np.asarray(dead_support if dead_support is not None else event_dead, dtype=bool),
+            params,
+        )
     from ..pipeline import fill_match_breaks
 
     codes = fill_match_breaks(codes, halves if halves is not None else GRADED_HALVES)
@@ -1512,6 +1600,7 @@ __all__ = [
     "evidence_probability",
     "gate_events",
     "gate_pixel_events",
+    "hold_touch_through",
     "keeper_holds",
     "KeeperHold",
     "pixel_contact",

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 import numpy as np
 
 from possession_lab.config import FPS, A, D, H, X
 from possession_lab.fusion.transitions import (
+    DEFAULT_TRANSITION_PARAMS,
     BoxEvidence,
+    TransitionEvent,
     TransitionParams,
     apply_transition_layer,
     ball_conflict_mask,
@@ -27,6 +30,7 @@ from possession_lab.fusion.transitions import (
     evidence_probability,
     gate_events,
     gate_pixel_events,
+    hold_touch_through,
     keeper_holds,
     pixel_contact,
     relay_contacts,
@@ -190,6 +194,119 @@ class GatingTests(unittest.TestCase):
         dead[frame - 5 : frame + 5] = True
         events, _ = gate_events([(frame, 11.0, H, 0.8)], [], codes, prob, dead, self.nearest_with_h_control(frame))
         self.assertEqual(events, ())
+
+
+class OnsetTouchBypassTests(unittest.TestCase):
+    """A ball killed on the taker's foot is a save or a tackle, not a lagging pool."""
+
+    def base_arrays(self):
+        codes = np.full(N, A, dtype=np.int8)
+        prob = np.zeros((N, 3))
+        prob[:, A] = 0.9
+        prob[:, H] = 0.1
+        dead = np.zeros(N, dtype=bool)
+        return codes, prob, dead
+
+    def nearest_with_h_control(self, frame: int, span: int = 12):
+        nearest = np.full(N, A, dtype=np.int8)
+        nearest[frame - span : frame] = H
+        return nearest
+
+    def test_touch_onset_survives_weak_pool_and_is_flagged(self):
+        codes, prob, dead = self.base_arrays()
+        events, _ = gate_events([], [(80, 12.0, H, 0.4)], codes, prob, dead, np.full(N, A, dtype=np.int8))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "onset")
+        self.assertTrue(events[0].hold_through)  # the gate leaned on the touch alone
+
+    def test_far_or_gentle_onset_still_needs_support(self):
+        codes, prob, dead = self.base_arrays()
+        nearest = np.full(N, A, dtype=np.int8)
+        far, _ = gate_events([], [(80, 12.0, H, 1.2)], codes, prob, dead, nearest)
+        self.assertEqual(far, ())  # 1.2 m is not a kill at the foot
+        gentle, _ = gate_events([], [(80, 5.0, H, 0.4)], codes, prob, dead, nearest)
+        self.assertEqual(gentle, ())  # the ball was barely moving already
+
+    def test_kick_gets_no_touch_bypass(self):
+        codes, prob, dead = self.base_arrays()
+        events, _ = gate_events([(80, 11.0, H, 0.4)], [], codes, prob, dead, self.nearest_with_h_control(80))
+        self.assertEqual(events, ())  # kicks need real support, however close the ball lands
+
+    def test_supported_onset_is_not_flagged(self):
+        codes, prob, dead = self.base_arrays()
+        prob[70:120] = [0.6, 0.4, 0.0]  # the onset support window is [frame-10, frame+40)
+        events, _ = gate_events([], [(80, 12.0, H, 0.4)], codes, prob, dead, np.full(N, A, dtype=np.int8))
+        self.assertEqual(len(events), 1)
+        self.assertFalse(events[0].hold_through)  # the pool agreed; nothing special to carry
+
+
+class HoldTouchThroughTests(unittest.TestCase):
+    """A witnessed takeover survives *decoded* deadness until a supported stoppage."""
+
+    def setUp(self):
+        self.n = 300
+        self.codes = np.zeros(self.n, dtype=np.int8)
+        self.codes[150:250] = D
+        self.event = TransitionEvent(
+            start=170, frame=175, kind="onset", team=H, distance=0.4, support=0.02, hold_through=True
+        )
+
+    def runs(self, codes):
+        out, s = [], 0
+        for i in range(1, len(codes)):
+            if codes[i] != codes[s]:
+                out.append((s, i, int(codes[s])))
+                s = i
+        out.append((s, len(codes), int(codes[s])))
+        return out
+
+    def test_fills_unsupported_dead_to_the_first_supported_stoppage(self):
+        support = np.zeros(self.n, dtype=bool)
+        support[220:250] = True
+        out = hold_touch_through(self.codes, [self.event], np.zeros(self.n, bool), support)
+        self.assertEqual(self.runs(out), [(0, 150, H), (150, 170, D), (170, 220, H), (220, 250, D), (250, 300, H)])
+
+    def test_tagged_dead_ends_the_hold(self):
+        tagged = np.zeros(self.n, dtype=bool)
+        tagged[200:250] = True
+        out = hold_touch_through(self.codes, [self.event], tagged, tagged)
+        self.assertTrue((out[170:200] == H).all())
+        self.assertTrue((out[200:250] == D).all())  # the tag is the authority
+
+    def test_other_team_live_possession_ends_the_hold(self):
+        codes = self.codes.copy()
+        codes[190:220] = A
+        support = np.zeros(self.n, dtype=bool)
+        support[220:250] = True
+        out = hold_touch_through(codes, [self.event], np.zeros(self.n, bool), support)
+        self.assertTrue((out[170:190] == H).all())
+        self.assertTrue((out[190:220] == A).all())  # the other team's live ball is untouched
+        self.assertTrue((out[220:250] == D).all())
+
+    def test_flags_and_cap_bound_the_hold(self):
+        params = DEFAULT_TRANSITION_PARAMS
+        off = params.onset_touch_hold_frames
+        support = np.zeros(self.n, dtype=bool)
+        support[220:250] = True
+        plain = hold_touch_through(self.codes, [replace(self.event, hold_through=False)], np.zeros(self.n, bool), support)
+        self.assertEqual(self.runs(plain), [(0, 150, H), (150, 250, D), (250, 300, H)])
+        capped = hold_touch_through(
+            self.codes, [replace(self.event, start=30, frame=35)], np.zeros(self.n, bool), support
+        )
+        self.assertTrue((capped[150 : 35 + off] == H).all())
+        self.assertTrue((capped[35 + off : 250] == D).all())
+        disabled = hold_touch_through(
+            self.codes, [self.event], np.zeros(self.n, bool), support, replace(params, onset_touch_hold_frames=0)
+        )
+        self.assertEqual(self.runs(disabled), [(0, 150, H), (150, 250, D), (250, 300, H)])
+
+    def test_next_event_start_cuts_the_hold(self):
+        later = TransitionEvent(start=200, frame=205, kind="kick", team=A, distance=1.0, support=0.2)
+        support = np.zeros(self.n, dtype=bool)
+        support[220:250] = True
+        out = hold_touch_through(self.codes, [self.event, later], np.zeros(self.n, bool), support)
+        self.assertTrue((out[170:200] == H).all())
+        self.assertTrue((out[200:220] == D).all())  # the next event owns the boundary, not the hold
 
 
 class PulseAndDecodeTests(unittest.TestCase):
@@ -635,19 +752,32 @@ class RelayContactTests(unittest.TestCase):
         p_h = np.full((n, 3), 0.05)
         p_h[:, H] = 0.87
         w = np.ones(n)
-        ballots = {k: (p_h, w) for k in ("atd_ball", "video_ball", "yolo_ball", "video_players")}
+        ballots = {k: (p_h, w) for k in ("atd_ball", "yolo_ball", "video_players")}
         return codes, prob, dead, ev, contain, contact, ballots
 
     def test_relay_admits_a_camera_unanimous_mid_spell_contact(self):
         codes, prob, dead, ev, contain, contact, ballots = self.world()
         relay = relay_contacts(contact, contain, ev, codes, ballots)
         self.assertEqual(relay, {(400, H)})
-        # without the relay set the gate still rejects: settled spells belong to geometry
+        # box lock: a solid in-box run the holder never shows is accepted even without relay
         _, intervals = gate_pixel_events(contact, [], contain, codes, prob, dead, ())
-        self.assertEqual(intervals, [])
+        self.assertEqual([(a, b, t) for a, b, t in intervals], [(390, 600, H)])
         kept, intervals = gate_pixel_events(contact, [], contain, codes, prob, dead, (), relay=relay)
         self.assertEqual(len(kept), 1)
         self.assertEqual([(a, b, t) for a, b, t in intervals], [(390, 600, H)])
+
+    def test_box_lock_needs_a_solid_run(self):
+        codes, prob, dead, _ev, contain, _contact, _ballots = self.world()
+        weak_contact = [(400, 4.0, H, 1.0)]  # below box_lock_min_run
+        _, intervals = gate_pixel_events(weak_contact, [], contain, codes, prob, dead, ())
+        self.assertEqual(intervals, [])
+
+    def test_box_lock_needs_a_holder_that_never_shows_the_ball(self):
+        codes, prob, dead, _ev, contain, contact, _ballots = self.world()
+        holder_contain = contain.copy()
+        holder_contain[380] = 2  # the ball sits inside the holder's (A) box before the take
+        _, intervals = gate_pixel_events(contact, [], holder_contain, codes, prob, dead, ())
+        self.assertEqual(intervals, [])
 
     def test_relay_requires_every_ballot_voter_on_the_event_team(self):
         codes, _, _, ev, contain, contact, ballots = self.world()

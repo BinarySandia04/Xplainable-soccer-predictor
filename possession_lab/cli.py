@@ -541,8 +541,20 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                     vpresent = vpresent & ~np.asarray(z["players_official"], dtype=bool)
                 box_evidence = None
                 if not args.no_box and "players_box" in z:
-                    yolo_ball = np.asarray(z["yolo_ball_pixel"])[:, 0, :]
-                    yolo_seen = np.asarray(z["yolo_ball_present"], dtype=bool)[:, 0]
+                    yolo_all = np.asarray(z["yolo_ball_pixel"])
+                    yolo_present_all = np.asarray(z["yolo_ball_present"], dtype=bool)
+                    yolo_conf_all = np.asarray(z["yolo_ball_confidence"], dtype=np.float64)
+                    # per frame, the best candidate under the physical speed gate, not
+                    # blindly candidate 0: a weak top read must not blind the contact channel
+                    safe = np.where(
+                        yolo_present_all & np.isfinite(yolo_all).all(axis=2),
+                        yolo_conf_all,
+                        -np.inf,
+                    )
+                    best = np.argmax(safe, axis=1)
+                    rows = np.arange(safe.shape[0])
+                    yolo_ball = yolo_all[rows, best]
+                    yolo_seen = np.isfinite(yolo_ball).all(axis=1)
                     box_evidence = BoxEvidence(
                         boxes=np.asarray(z["players_box"]),
                         team=vteam,
@@ -591,7 +603,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     # the fusion cache; it gates nothing when disabled or when a voter is missing
     from dataclasses import replace
 
-    relay_keys = ("atd_ball", "video_ball", "yolo_ball", "video_players")
+    relay_keys = ("atd_ball", "yolo_ball", "video_players")
     relay_ballots = None
     if float(args.relay_min_prob) > 0 and all(
         f"src_{key}_probability" in arrays and f"src_{key}_weight" in arrays for key in relay_keys
