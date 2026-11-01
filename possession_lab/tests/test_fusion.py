@@ -181,6 +181,23 @@ class FusionBuildTest(unittest.TestCase):
         with TemporaryDirectory() as temp:
             self.assertIsNone(load_fusion(Path(temp) / "absent.npz"))
 
+    def test_halftime_between_active_halves_is_dead(self):
+        tracking, tags, features, baseline = self._build()
+        from possession_lab.pipeline import active_halves
+
+        windows = active_halves(tags, ((0, 30), (35, 80)))
+        result = build_fusion(
+            tracking,
+            tags,
+            features=features,
+            baseline_codes=baseline,
+            halves=windows,
+        )
+        # the warm-up gap is neither a possession nor an abstention to forward-fill
+        np.testing.assert_array_equal(result.codes[30:35], np.full(5, D, dtype=np.int8))
+        self.assertFalse((result.codes[30:35] == H).any())
+        self.assertFalse((result.codes[30:35] == A).any())
+
 
 class VideoGapDeadTest(unittest.TestCase):
     """A blind window with the ball out on both sides is a retrieval gap, not live play."""

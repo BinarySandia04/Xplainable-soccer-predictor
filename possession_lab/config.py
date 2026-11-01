@@ -27,7 +27,7 @@ FPS = 25
 N_FRAMES = 199_319
 PITCH = (105.3, 68.0)  # metres, corrected tracking pitch used by games.py
 PUBLIC_START, PUBLIC_STOP = 11_185, 18_685  # half-open
-GRADED_HALVES = ((11_185, 90_652), (110_808, 190_198))  # half-open
+GRADED_HALVES = ((11_185, 90_652), (110_808, 190_198))  # recording windows; active halves start at the Kick Off tag
 CONTEXT = 500
 
 ROOT = Path(__file__).resolve().parents[1]

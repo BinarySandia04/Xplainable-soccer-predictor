@@ -505,11 +505,12 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         evidence_probability,
     )
     from .fusion.voters import ROLE_BY_KEY
-    from .pipeline import load_lab, validate_codes, write_submission
+    from .pipeline import active_halves, load_lab, validate_codes, write_submission
 
     output_dir = Path(args.output_dir or OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
     lab = load_lab(args.data_dir)
+    halves = active_halves(lab.tags)
     fusion_path = Path(args.fusion) if args.fusion else output_dir / "fusion.npz"
     with np.load(fusion_path, allow_pickle=False) as z:
         arrays = {key: np.asarray(z[key]) for key in z.files}
@@ -625,6 +626,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
             & np.isfinite(np.asarray(lab.tracking.ball, dtype=np.float64)).all(axis=1)
         ),
         dead_support=event_dead | np.asarray(lab.tags.setpiece, dtype=bool),
+        halves=halves,
         params=params,
     )
     print(

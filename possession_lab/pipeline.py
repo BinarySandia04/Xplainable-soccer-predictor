@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ import pandas as pd
 from .config import (
     CODE_TO_LABEL,
     CONTEXT,
+    FPS,
     GRADED_HALVES,
     N_FRAMES,
     PITCH,
@@ -101,11 +103,59 @@ def prepare_event_products(
     return track, whistle, events
 
 
+def active_halves(
+    tags: TagTable,
+    halves: tuple[tuple[int, int], ...] = GRADED_HALVES,
+) -> tuple[tuple[int, int], ...]:
+    """Trim each recorded half to the ``Kick Off (Start)`` smart tag.
+
+    ``GRADED_HALVES`` is the recording window, not necessarily the kickoff.  In BAR-ATH the
+    second half opens at 110 808 but the organisation's XML puts ``SET PIECES · Kick Off
+    (Start)`` at 113 660: the 1 900 frames in between are the warm-up, and the old window
+    invented possessions there.  Pair each half with the closest start tag and use its start as
+    the first live frame.  No tag (tests, another fixture) leaves the window untouched.
+    """
+    windows = tuple((int(a), int(b)) for a, b in halves)
+    kickoffs = sorted(
+        int(event.start_frame)
+        for event in tags.events
+        if event.code == "SET PIECES" and "Kick Off (Start)" in event.type
+    )
+    if not kickoffs:
+        return windows
+    trimmed: list[tuple[int, int]] = []
+    for start, stop in windows:
+        candidates = [k for k in kickoffs if start - 10 * FPS <= k < stop]
+        if candidates:
+            kick = min(candidates, key=lambda k: abs(k - start))
+            start = max(start, kick)
+        trimmed.append((start, stop))
+    return tuple(trimmed)
+
+
+def fill_match_breaks(
+    codes: np.ndarray,
+    halves: tuple[tuple[int, int], ...] = GRADED_HALVES,
+) -> np.ndarray:
+    """Write ``D`` into the gap between consecutive halves (halftime, warm-up).
+
+    Leaving the gap as ``X`` lets spellF1 forward-fill the last first-half possession across the
+    interval, and leaving it to the decoder invents warm-up possessions.  The match is not being
+    played there, so the truthful and safe state is a hard ``D``.
+    """
+    out = np.asarray(codes).copy()
+    ordered = sorted((int(a), int(b)) for a, b in halves)
+    for (_, stop), (next_start, _) in itertools.pairwise(ordered):
+        if stop < next_start:
+            out[stop:next_start] = D
+    return out
+
+
 def predict_full(
     tracking: TrackingData,
     tags: TagTable,
     params: ModelParams = DEFAULT_PARAMS,
-    halves: tuple[tuple[int, int], ...] = GRADED_HALVES,
+    halves: tuple[tuple[int, int], ...] | None = None,
     context: int = CONTEXT,
     *,
     use_events: bool = True,
@@ -114,14 +164,17 @@ def predict_full(
     whistle: Any | None = None,
     events: Any | None = None,
 ) -> np.ndarray:
-    """Decode each graded half with a context pad and leave everything else as X.
+    """Decode each active half with a context pad; leave the rest as X and breaks as D.
 
-    Confirmed goals and stoppages are applied as a hard ``D`` override *after* the Viterbi merge.
-    They are high-precision intervals: a whistle confirmed by sustained low player motion, a ball
-    visibly beyond the line, or a goal whose trajectory reaches the goal mouth.  Ordinary
-    possession is still decoded by the HMM.
+    Active halves start at the organisation's ``Kick Off (Start)`` tag, so a warm-up before the
+    second-half kickoff never becomes a possession.  Confirmed goals and stoppages are applied as
+    a hard ``D`` override *after* the Viterbi merge.  They are high-precision intervals: a whistle
+    confirmed by sustained low player motion, a ball visibly beyond the line, or a goal whose
+    trajectory reaches the goal mouth.  Ordinary possession is still decoded by the HMM.
     """
     n = tracking.n_frames
+    if halves is None:
+        halves = active_halves(tags)
     if use_events and events is None:
         track, whistle, events = prepare_event_products(
             tracking, tags, track=track, whistle=whistle, use_audio=use_audio
@@ -151,7 +204,7 @@ def predict_full(
         for start, stop in halves:
             graded[int(start) : int(stop)] = True
         prediction[np.asarray(events.dead_mask, dtype=bool) & graded] = D
-    return prediction
+    return fill_match_breaks(prediction, halves)
 
 
 def decode_public(

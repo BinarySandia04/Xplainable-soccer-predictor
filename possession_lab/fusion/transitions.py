@@ -1466,6 +1466,9 @@ def apply_transition_layer(
         # a dead ball that went blind stays dead: the "restart" inside the window is the
         # carried trajectory, not play (post-decode so a window cannot disturb the half)
         codes = carry_dead_through_blind(codes, blind_dead, halves)
+    from ..pipeline import fill_match_breaks
+
+    codes = fill_match_breaks(codes, halves if halves is not None else GRADED_HALVES)
     return TransitionLayerResult(
         codes=codes,
         events=events,

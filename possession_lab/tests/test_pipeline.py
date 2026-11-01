@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from possession_lab.config import A, H, X
-from possession_lab.data import TagTable, TrackingData
-from possession_lab.pipeline import predict_full, validate_codes, write_submission
+from possession_lab.config import A, D, H, X
+from possession_lab.data import TagEvent, TagTable, TrackingData
+from possession_lab.pipeline import (
+    active_halves,
+    fill_match_breaks,
+    predict_full,
+    validate_codes,
+    write_submission,
+)
 
 
 def make_tracking() -> TrackingData:
@@ -49,7 +56,8 @@ class PipelineTest(unittest.TestCase):
         np.testing.assert_array_equal(pred[:10], np.full(10, H, dtype=np.int8))
         self.assertIn(int(pred[20]), (H, A))
         np.testing.assert_array_equal(pred[21:], np.full(9, A, dtype=np.int8))
-        np.testing.assert_array_equal(pred[10:20], np.full(10, X, dtype=np.int8))
+        # the gap between two halves is halftime: dead, not an abstention to forward-fill
+        np.testing.assert_array_equal(pred[10:20], np.full(10, D, dtype=np.int8))
 
     def test_submission_writer_and_preflight_validator(self):
         pred = np.full(30, X, dtype=np.int8)
@@ -67,6 +75,44 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(report["counts"]["H"], 10)
         self.assertEqual(report["counts"]["A"], 10)
         self.assertEqual(report["counts"]["X"], 10)
+
+
+def make_kickoff_tags(n: int, starts: tuple[int, ...]) -> TagTable:
+    base = TagTable.empty(n)
+    events = tuple(
+        TagEvent(
+            start_frame=int(start),
+            stop_frame=int(start) + 126,
+            code="SET PIECES",
+            team=-1,
+            type="Kick Off (Start)",
+        )
+        for start in starts
+    )
+    return replace(base, events=events)
+
+
+class ActiveHalfTest(unittest.TestCase):
+    """The recording window is not the kickoff: a warm-up must not become possession."""
+
+    def test_each_half_starts_at_its_kickoff_tag(self):
+        tags = make_kickoff_tags(500, (90, 350))
+        halves = ((100, 200), (300, 400))
+        self.assertEqual(active_halves(tags, halves), ((100, 200), (350, 400)))
+
+    def test_without_kickoff_tags_the_window_is_untouched(self):
+        tags = TagTable.empty(500)
+        halves = ((100, 200), (300, 400))
+        self.assertEqual(active_halves(tags, halves), halves)
+
+    def test_halftime_gap_is_dead_not_an_abstention(self):
+        codes = np.full(500, X, dtype=np.int8)
+        codes[100:200] = H
+        codes[300:400] = A
+        out = fill_match_breaks(codes, ((100, 200), (300, 400)))
+        np.testing.assert_array_equal(out[200:300], np.full(100, D, dtype=np.int8))
+        self.assertEqual(int(out[0]), X)
+        self.assertEqual(int(out[450]), X)
 
 
 if __name__ == "__main__":

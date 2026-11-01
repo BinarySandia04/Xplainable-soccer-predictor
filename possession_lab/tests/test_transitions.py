@@ -285,6 +285,28 @@ class EndToEndTests(unittest.TestCase):
         expected = (PRIOR_WEIGHT * PRIOR + np.array([0.8, 0.1, 0.1])) / (PRIOR_WEIGHT + 1.0)
         np.testing.assert_allclose(out, np.tile(expected, (10, 1)), rtol=1e-9)
 
+    def test_gap_between_halves_is_dead_not_forward_filled(self):
+        n = N
+        ball = np.tile(np.array([20.0, 20.0]), (n, 1))
+        pitch = np.zeros((n, 1, 2))
+        pitch[:, 0] = ball
+        sets = [player_set(pitch, [H])]
+        codes = np.full(n, H, dtype=np.int8)
+        fused = np.zeros((n, 3))
+        fused[:, H] = 0.9
+        fused[:, A] = 0.05
+        fused[:, D] = 0.05
+        result = apply_transition_layer(
+            codes_pooled=codes,
+            fused_probability=fused,
+            event_dead=np.zeros(n, dtype=bool),
+            consensus_ball=ball,
+            evidence_prob=fused,
+            player_sets=sets,
+            halves=((0, 60), (80, n)),
+        )
+        np.testing.assert_array_equal(result.codes[60:80], np.full(20, D, dtype=np.int8))
+
 
 class ParamsTests(unittest.TestCase):
     def test_defaults_are_physical(self):
