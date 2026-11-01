@@ -17,6 +17,7 @@ from possession_lab.fusion.transitions import (
     build_pulse,
     carry_dead_through_blind,
     control_map,
+    dead_needs_support,
     decode_with_events,
     detect_contact_events,
     detect_kick_events,
@@ -527,6 +528,38 @@ class PixelChannelTests(unittest.TestCase):
         _, intervals = gate_pixel_events([], kicker, np.zeros(n, dtype=np.int8), codes2, prob, dead, ())
         self.assertEqual(intervals, [])
 
+    def test_a_fingerprint_needs_the_pitch_stream_to_have_seen_the_ball(self):
+        # feet evidence in a window the ATD ball is blind in has no ball position to check the
+        # release against, and the poll there is carried by its own prior: no takeover
+        n = 700
+        _codes, prob, dead = self._gate_world(n, 260)
+        codes2 = np.zeros(n, dtype=np.int8)
+        codes2[:424] = A
+        kicker = [(424, 11.0, H, 13.0, 57.0)]
+        blind = np.ones(n, dtype=bool)
+        blind[380:520] = False
+        contain = np.zeros(n, dtype=np.int8)
+        _kept, intervals = gate_pixel_events(
+            [], kicker, contain, codes2, prob, dead, (), atd_ball=blind
+        )
+        self.assertEqual(intervals, [])
+        _kept, intervals = gate_pixel_events(
+            [], kicker, contain, codes2, prob, dead, (), atd_ball=np.ones(n, dtype=bool)
+        )
+        self.assertEqual([(a, b, t) for a, b, t in intervals], [(423, 499, H)])
+        # the requirement is a parameter, and momentum still carries a kick in a blind window
+        params = TransitionParams(pixel_fingerprint_needs_atd=False)
+        _kept, intervals = gate_pixel_events(
+            [], kicker, contain, codes2, prob, dead, (), params, atd_ball=blind
+        )
+        self.assertEqual([(a, b, t) for a, b, t in intervals], [(423, 499, H)])
+        prob_momentum = prob.copy()
+        prob_momentum[440:, H] = 0.8
+        _kept, intervals = gate_pixel_events(
+            [], kicker, contain, codes2, prob_momentum, dead, (), atd_ball=blind
+        )
+        self.assertTrue(intervals, "a blind kick the evidence agrees with still counts")
+
     def test_gate_extends_to_a_boundary_the_fusion_is_about_to_cross(self):
         n = 700
         codes, prob, dead = self._gate_world(n, 300)
@@ -679,6 +712,20 @@ class KeeperHoldTests(unittest.TestCase):
         self.assertEqual([e.kind for e in kept], ["hold"])
         # owned from the catch to the next fused code boundary, never into the dead ball
         self.assertEqual([(a, b, t) for a, b, t in intervals], [(40, 100, H)])
+
+    def test_a_hold_never_outruns_the_camera_that_watched_it(self):
+        # the fused poll going blind is not the keeper holding the ball for another 300 frames: the
+        # owned interval stops at the release cap, not wherever the poll happened to wake up
+        codes, prob, dead, ev, contain, defs, halves = self.world(n=400)
+        codes[100:380] = A
+        holds = keeper_holds(ev, contain, dead, defs, (105.0, 68.0), halves)
+        self.assertEqual(len(holds), 1)
+        _kept, intervals = gate_pixel_events([], [], contain, codes, prob, dead, (), holds=holds)
+        self.assertEqual([(a, b, t) for a, b, t in intervals], [(40, 79 + 150, H)])
+        # the cap is a parameter: off, the interval runs to the fused boundary again
+        params = TransitionParams(keeper_hold_release_frames=0)
+        _kept, intervals = gate_pixel_events([], [], contain, codes, prob, dead, (), params, holds=holds)
+        self.assertEqual([(a, b, t) for a, b, t in intervals], [(40, 380, H)])
 
     def test_a_fast_ball_past_the_area_is_not_a_hold(self):
         _codes, _prob, dead, ev, contain, defs, halves = self.world(speed_px=12.0)
@@ -840,6 +887,54 @@ class DeadBlindCarryTests(unittest.TestCase):
         out = carry_dead_through_blind(codes, blind, halves=((0, 20),))
         self.assertEqual(list(out[5:20]), [D] * 15)
         self.assertEqual(list(out[20:]), [X] * 10)  # outside the graded half: untouched
+
+
+class DeadNeedsSupportTests(unittest.TestCase):
+    """Inside a ball-blind window a dead state has to come from an event, not from the gap."""
+
+    def world(self, n: int = 400):
+        codes = np.zeros(n, dtype=np.int8)
+        codes[:100] = H
+        codes[100:250] = D  # the decode went dead inside a ball gap
+        blind = np.zeros(n, dtype=bool)
+        blind[120:250] = True
+        return codes, blind
+
+    def test_an_unsupported_blind_dead_ball_goes_back_to_the_live_team(self):
+        codes, blind = self.world()
+        support = np.zeros(codes.size, dtype=bool)
+        out = dead_needs_support(codes, blind, support, halves=((0, codes.size),))
+        self.assertEqual(list(out[100:120]), [D] * 20)  # the ball was still visible: untouched
+        self.assertEqual(list(out[120:250]), [H] * 130)  # the gap alone never stops a match
+
+    def test_a_supported_blind_dead_ball_stands(self):
+        codes, blind = self.world()
+        support = np.zeros(codes.size, dtype=bool)
+        support[150:250] = True  # a confirmed stoppage / SET PIECES tag from frame 150
+        out = dead_needs_support(codes, blind, support, halves=((0, codes.size),))
+        self.assertEqual(list(out[120:150]), [H] * 30)
+        self.assertEqual(list(out[150:250]), [D] * 100)
+
+    def test_live_states_are_not_touched(self):
+        codes, blind = self.world()
+        codes[100:250] = A
+        out = dead_needs_support(codes, blind, np.zeros(codes.size, dtype=bool), halves=((0, codes.size),))
+        np.testing.assert_array_equal(out, codes)
+
+    def test_a_half_with_no_live_team_is_left_alone(self):
+        codes = np.full(60, D, dtype=np.int8)
+        blind = np.ones(60, dtype=bool)
+        out = dead_needs_support(codes, blind, np.zeros(60, dtype=bool), halves=((0, 60),))
+        np.testing.assert_array_equal(out, codes)  # nothing to hand the frames back to
+
+    def test_support_never_leaks_across_a_half_boundary(self):
+        codes = np.zeros(200, dtype=np.int8)
+        codes[:100] = H
+        codes[100:] = D
+        blind = np.ones(200, dtype=bool)
+        out = dead_needs_support(codes, blind, np.zeros(200, dtype=bool), halves=((0, 100), (100, 200)))
+        self.assertEqual(list(out[:100]), [H] * 100)
+        self.assertEqual(list(out[100:]), [D] * 100)  # the second half never held a live team
 
 
 class ConflictMaskTests(unittest.TestCase):

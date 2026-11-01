@@ -620,6 +620,11 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         ballots=relay_ballots,
         keeper_defenders=keeper_defenders,
         keeper_pitch=tuple(lab.tracking.pitch),
+        atd_ball_present=(
+            np.asarray(lab.tracking.ball_present, dtype=bool)
+            & np.isfinite(np.asarray(lab.tracking.ball, dtype=np.float64)).all(axis=1)
+        ),
+        dead_support=event_dead | np.asarray(lab.tags.setpiece, dtype=bool),
         params=params,
     )
     print(
