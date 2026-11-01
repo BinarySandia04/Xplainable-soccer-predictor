@@ -104,6 +104,45 @@ class SwitchReasonsTest(unittest.TestCase):
         self.assertEqual(restart["evidence"]["frame"], 145)
         self.assertLess(restart["evidence"]["speed_from"], 1.5)
 
+    def test_a_ball_gap_is_context_and_never_the_summary(self):
+        # a hole in the tracking data is not an event in the match: it may annotate a switch that
+        # other evidence carries, but it never stands on its own and never leads
+        features = make_features()
+        features.edge[:] = 20.0
+        features.parked_edge[:] = False
+        features.out_of_play[:] = False
+        features.team_speed[:] = 2.0
+        features.ball_speed[:] = 3.0
+        features.present[:] = False
+        records = self.records(features)
+        kinds = [r["kind"] for r in records[0]["reasons"]]
+        self.assertNotIn("ball_missing", kinds)
+        self.assertEqual(kinds[0], "prior")
+
+    def test_a_ball_gap_follows_the_evidence_it_was_parked_behind(self):
+        features = make_features()
+        features.parked_edge[100:120] = True
+        features.present[100:140] = False
+        records = self.records(features)
+        kinds = [r["kind"] for r in records[0]["reasons"]]
+        self.assertEqual(kinds[-1], "ball_missing")
+        self.assertNotEqual(kinds[0], "ball_missing")
+
+    def test_a_stopped_field_explains_a_dead_ball(self):
+        # the pitch at a walk with no ball in play: that is what makes the state dead, and it is
+        # what the viewer has to be able to check against the video
+        features = make_features()
+        features.team_speed[:] = 0.8
+        features.present[:] = False
+        features.ball_speed[:] = np.nan
+        features.near_distance[:] = np.nan
+        features.edge[:] = np.nan
+        features.last_edge[:] = np.nan
+        records = self.records(features)
+        kinds = [r["kind"] for r in records[0]["reasons"]]
+        self.assertEqual(kinds[0], "stopped_field")
+        self.assertEqual(kinds[-1], "ball_missing")
+
     def test_silent_switch_falls_back_to_the_prior(self):
         features = make_features()
         features.team_speed[:] = 2.0
