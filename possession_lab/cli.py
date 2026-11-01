@@ -503,6 +503,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         ball_stale_mask,
         events_to_rows,
         evidence_probability,
+        raw_evidence_pool,
     )
     from .fusion.voters import ROLE_BY_KEY
     from .pipeline import active_halves, load_lab, validate_codes, write_submission
@@ -640,15 +641,17 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         dead_support=event_dead | np.asarray(lab.tags.setpiece, dtype=bool),
         halves=halves,
         params=params,
+        evidence_pool=raw_evidence_pool(probabilities, weights),
     )
     print(
         f"transitions: {result.n_kicks} kicks + {result.n_onsets} onsets detected, "
         f"{result.n_contact} contacts + {result.n_kicker} win-and-clear kicks + {result.n_hold} keeper holds "
-        f"from boxes, {result.n_gated_out} gated out -> {len(result.events)} transition events"
+        f"+ {result.n_area} area catches from boxes, {result.n_control} spell expiries, "
+        f"{result.n_gated_out} gated out -> {len(result.events)} transition events"
     )
     events_path = output_dir / "transition_events.csv"
     rows = events_to_rows(result.events)
-    kind_names = np.array(["kick", "onset", "contact", "kicker", "hold"])
+    kind_names = np.array(["kick", "onset", "contact", "kicker", "hold", "control", "area"])
     pd.DataFrame(
         {
             "start_frame": rows[:, 0].astype(int),

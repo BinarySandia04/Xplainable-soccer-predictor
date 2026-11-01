@@ -28,11 +28,14 @@ from possession_lab.fusion.transitions import (
     detect_onset_events,
     events_to_rows,
     evidence_probability,
+    expire_owned_spells,
     gate_events,
     gate_pixel_events,
     hold_touch_through,
+    keeper_area_catches,
     keeper_holds,
     pixel_contact,
+    raw_evidence_pool,
     relay_contacts,
 )
 
@@ -1121,6 +1124,182 @@ class ConflictMaskTests(unittest.TestCase):
         self.assertEqual(len(idx), last - first + 1)  # one contiguous grown block
         self.assertEqual(first, int(base.argmax()) - 15)
         self.assertEqual(last, int(np.flatnonzero(base)[-1]) + 15)
+
+
+class KeeperAreaCatchTests(unittest.TestCase):
+    """The pitch-side twin of the keeper hold where the pixel channel goes blind at the goal.
+
+    Measured 132 355: the ball decelerated 13.1 -> 1.1 m/s at x = 9.4 m (the Athletic
+    keeper's six-yard box, second half) and left again at 18.9 m/s; the boxes near the
+    goal compress in depth, the pixel channel saw nothing, and the fused prior kept
+    claiming H through the catch and the punt.
+    """
+
+    def catch_world(self, n=240, opp_far=True, stop_x=9.6, dead=None):
+        ramp = np.array([0.36, 0.24, 0.12, 0.06])  # 12 -> 0 m/s over frames 94..97
+        off = np.zeros(n)
+        for t in range(n):
+            if t < 94:
+                off[t] = 0.48 * (94 - max(t, 60)) + ramp.sum()
+            elif t < 98:
+                off[t] = ramp[t - 94 :].sum()
+        punt = np.maximum(0.0, np.arange(n) - 105) * 0.72  # the punt away, 18 m/s
+        x = stop_x + off + punt
+        ball = np.stack([x, np.full(n, 34.0)], axis=1)
+        pitch = np.zeros((n, 2, 2))
+        pitch[:, 0] = [9.0, 34.4]  # the keeper of the side that defends goal 0
+        pitch[:, 1] = [45.0, 34.0] if opp_far else [10.8, 33.0]
+        teams = np.asarray([1, H], dtype=np.int8)
+        sets = [(pitch, teams, np.ones((n, 2), dtype=bool))]
+        defenders = np.array([[1, H]], dtype=np.int8)  # this half: A defends goal 0
+        ev_dead = np.zeros(n, dtype=bool)
+        if dead is not None:
+            ev_dead[92:102] = dead
+        return ball, sets, defenders, ev_dead
+
+    def test_catch_in_own_area_is_won_by_the_defending_side(self):
+        ball, sets, defenders, ev_dead = self.catch_world()
+        from possession_lab.fusion.transitions import ball_speed
+
+        speed, valid = ball_speed(ball)
+        catches = keeper_area_catches(
+            ball, speed, valid, ev_dead, sets, defenders, (105.0, 68.0), ((0, 240),)
+        )
+        self.assertEqual(len(catches), 1)
+        start, frame, team = catches[0]
+        self.assertEqual(team, 1)
+        self.assertTrue(96 <= frame <= 100)
+        self.assertTrue(60 <= start < 96)  # the pass-in kick, not the standstill
+
+    def test_contested_catch_is_not_given(self):
+        ball, sets, defenders, ev_dead = self.catch_world(opp_far=False)
+        from possession_lab.fusion.transitions import ball_speed
+
+        speed, valid = ball_speed(ball)
+        self.assertEqual(
+            keeper_area_catches(ball, speed, valid, ev_dead, sets, defenders, (105.0, 68.0), ((0, 240),)),
+            [],
+        )
+
+    def test_midfield_stopper_is_not_an_area_catch(self):
+        ball, sets, defenders, ev_dead = self.catch_world(stop_x=60.0)
+        ball[:, 0] = np.where(np.arange(len(ball)) < 99, 60.0, ball[:, 0])
+        from possession_lab.fusion.transitions import ball_speed
+
+        speed, valid = ball_speed(ball)
+        self.assertEqual(
+            keeper_area_catches(ball, speed, valid, ev_dead, sets, defenders, (105.0, 68.0), ((0, 240),)),
+            [],
+        )
+
+    def test_dead_catch_is_not_given(self):
+        ball, sets, defenders, ev_dead = self.catch_world(dead=True)
+        from possession_lab.fusion.transitions import ball_speed
+
+        speed, valid = ball_speed(ball)
+        self.assertEqual(
+            keeper_area_catches(ball, speed, valid, ev_dead, sets, defenders, (105.0, 68.0), ((0, 240),)),
+            [],
+        )
+
+    def test_neutral_pool_is_not_a_keeper_catch(self):
+        """Measured 11 598: ball dead at the goal mouth with the voter pool flat (0.07) —
+        a conceded goal, not a keeper gathering his side's ball.  The raw-pool margin
+        must back the catcher or the channel stays quiet."""
+        ball, sets, defenders, ev_dead = self.catch_world()
+        from possession_lab.fusion.transitions import ball_speed
+
+        speed, valid = ball_speed(ball)
+        flat = np.full((len(ball), 3), 1.0 / 3.0)
+        self.assertEqual(
+            keeper_area_catches(ball, speed, valid, ev_dead, sets, defenders, (105.0, 68.0),
+                                ((0, 240),), evidence_pool=flat),
+            [],
+        )
+        backing = np.tile([0.20, 0.70, 0.10], (len(ball), 1))
+        self.assertEqual(
+            len(keeper_area_catches(ball, speed, valid, ev_dead, sets, defenders, (105.0, 68.0),
+                                    ((0, 240),), evidence_pool=backing)),
+            1,
+        )
+
+
+class ExpireOwnedSpellsTests(unittest.TestCase):
+    """A pixel-owned interval cannot outlive the camera's own evidence."""
+
+    def world(self, n=300, prob_a=0.05, prob_h=0.90, speed_val=4.0):
+        pool = np.full((n, 3), 1.0 / 3.0)
+        pool[100:150] = [prob_h, prob_a, 1.0 - prob_h - prob_a]
+        dead = np.zeros(n, dtype=bool)
+        speed = np.full(n, speed_val)
+        return pool, dead, speed
+
+    def test_sustained_contrary_pool_cuts_the_interval(self):
+        pool, dead, speed = self.world()
+        intervals = [[60, 200, 1]]  # an A contact owns the stretch
+        events, ivs = expire_owned_spells(intervals, pool, dead, speed)
+        self.assertEqual(len(events), 1)
+        self.assertEqual((events[0].kind, events[0].team, events[0].start), ("control", H, 100))
+        self.assertIn((60, 100, 1), ivs)
+
+    def test_short_burst_does_not_expire_the_interval(self):
+        pool, dead, speed = self.world()
+        pool[100:130] = 1.0 / 3.0  # only 20 contrary frames
+        events, ivs = expire_owned_spells([[60, 200, 1]], pool, dead, speed)
+        self.assertEqual(events, [])
+        self.assertEqual(list(ivs), [(60, 200, 1)])
+
+    def test_weak_contrary_pool_does_not_expire_the_interval(self):
+        pool, dead, speed = self.world(prob_a=0.25, prob_h=0.71)
+        events, _ = expire_owned_spells([[60, 200, 1]], pool, dead, speed)
+        self.assertEqual(events, [])
+
+    def test_ball_in_flight_does_not_expire_the_interval(self):
+        pool, dead, speed = self.world(speed_val=14.0)
+        events, _ = expire_owned_spells([[60, 200, 1]], pool, dead, speed)
+        self.assertEqual(events, [])
+
+    def test_keeper_hold_is_never_expired(self):
+        pool, dead, speed = self.world()
+        events, ivs = expire_owned_spells([[60, 200, 1]], pool, dead, speed, protected=frozenset({(60, 1)}))
+        self.assertEqual(events, [])
+        self.assertEqual(list(ivs), [(60, 200, 1)])
+
+    def test_run_must_lie_fully_inside_the_owned_interval(self):
+        pool, dead, speed = self.world()
+        pool[150:170] = [0.90, 0.05, 0.05]  # the contrary run runs past the interval end
+        events, ivs = expire_owned_spells([[60, 160, 1]], pool, dead, speed)
+        self.assertEqual(events, [])
+        self.assertEqual(list(ivs), [(60, 160, 1)])
+
+
+class ControlRowTests(unittest.TestCase):
+    def test_control_and_area_kind_rows_round_trip(self):
+        rows = events_to_rows(
+            [
+                TransitionEvent(start=10, frame=12, kind="control", team=H, distance=1.0, support=0.8),
+                TransitionEvent(start=20, frame=24, kind="area", team=1, distance=1.0, support=1.0),
+            ]
+        )
+        self.assertEqual(rows[0, 2], 5)
+        self.assertEqual(rows[1, 2], 6)
+
+
+class RawPoolTests(unittest.TestCase):
+    def test_single_voter_pool_is_exact_and_unprior(self):
+        prob = {"x": np.tile([0.9, 0.05, 0.05], (4, 1))}
+        weight = {"x": np.ones(4)}
+        np.testing.assert_allclose(raw_evidence_pool(prob, weight), np.tile([0.9, 0.05, 0.05], (4, 1)))
+
+    def test_zero_weight_frames_fall_back_to_uniform(self):
+        prob = {"x": np.tile([0.9, 0.05, 0.05], (4, 1))}
+        weight = {"x": np.zeros(4)}
+        np.testing.assert_allclose(raw_evidence_pool(prob, weight), np.full((4, 3), 1.0 / 3.0))
+
+    def test_raw_pool_beats_the_flat_prior_dilution(self):
+        prob = {"x": np.tile([0.9, 0.05, 0.05], (4, 1))}
+        weight = {"x": np.ones(4)}
+        self.assertGreater(raw_evidence_pool(prob, weight)[:, 0].min(), evidence_probability(prob, weight)[:, 0].min())
 
 
 if __name__ == "__main__":
