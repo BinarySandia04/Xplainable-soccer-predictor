@@ -13,6 +13,7 @@ from possession_lab.data import TagEvent, TagTable, TrackingData
 from possession_lab.events import (
     EventData,
     StopEvent,
+    _extend_through_lost_view,
     _merge_stop_events,
     _restart_kick,
     _run_end_containing,
@@ -325,6 +326,44 @@ class RestartKickTest(unittest.TestCase):
     def test_to_dict_carries_the_restart_frame(self):
         event = StopEvent(start=10, end=50, trigger="whistle", confidence=0.8, restart=32)
         self.assertEqual(event.to_dict()["restart"], 32)
+
+
+class LostViewStoppageTests(unittest.TestCase):
+    """A confirmed stoppage stays dead while the broadcast has lost the wide view."""
+
+    def test_stoppage_extends_through_a_lost_wide_view(self):
+        n = 1000
+        counts = np.full(n, 22)
+        counts[240:600] = 4  # close-ups: the feed no longer shows the live field
+        events = [StopEvent(start=100, end=200, trigger="whistle_in_run", confidence=0.8)]
+        out = _extend_through_lost_view(events, counts, n)
+        self.assertEqual(out[0].end, 600)
+
+    def test_no_extension_while_the_wide_view_holds(self):
+        n = 1000
+        counts = np.full(n, 22)
+        events = [StopEvent(start=100, end=200, trigger="whistle_in_run", confidence=0.8)]
+        out = _extend_through_lost_view(events, counts, n)
+        self.assertEqual(out[0].end, 200)
+
+    def test_extension_is_capped_at_the_next_stoppage(self):
+        n = 1000
+        counts = np.full(n, 22)
+        counts[240:900] = 3
+        events = [
+            StopEvent(start=100, end=200, trigger="whistle_in_run", confidence=0.8),
+            StopEvent(start=400, end=500, trigger="out", confidence=0.9),
+        ]
+        out = _extend_through_lost_view(events, counts, n)
+        self.assertEqual(out[0].end, 400)
+
+    def test_restart_before_the_view_is_lost_blocks_the_extension(self):
+        n = 1000
+        counts = np.full(n, 22)
+        counts[240:600] = 4
+        events = [StopEvent(start=100, end=200, trigger="whistle_in_run", confidence=0.8, restart=210)]
+        out = _extend_through_lost_view(events, counts, n)
+        self.assertEqual(out[0].end, 200)
 
 
 if __name__ == "__main__":

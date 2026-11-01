@@ -89,6 +89,8 @@ STOP_CONTROL_R = 3.0            # if a player is this close to a visible ball, a
 STOP_RESTART_SPEED = 7.0        # a kicked restart ends a dead-ball interval
 STOP_RESTART_CONTROL_R = 3.0
 STOP_RESTART_FRAMES = 2
+STOP_MIN_TRACKED_PLAYERS = 10   # fewer tracked players means the view is a cut/replay, not live play
+STOP_VISIBILITY_GAP_S = 5.0     # a stopped game can lose the wide view this soon after the restart
 STOP_LIVE_TAG_CODES = (
     "PROGRESSION",
     "ATTACKING TRANSITION",

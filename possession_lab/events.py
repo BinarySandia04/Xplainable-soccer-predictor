@@ -29,16 +29,19 @@ from .config import (
     GOAL_MAX_DEFICIT,
     GOAL_MIN_SPEED,
     GOAL_Y_MARGIN,
+    GRADED_HALVES,
     STOP_CONTROL_R,
     STOP_IN_RUN_ACTIVE_FRAMES,
     STOP_IN_RUN_BALL_SPEED,
     STOP_IN_RUN_WHISTLE_S,
     STOP_LIVE_TAG_CODES,
     STOP_MIN_LOW_S,
+    STOP_MIN_TRACKED_PLAYERS,
     STOP_RESTART_CONTROL_R,
     STOP_RESTART_FRAMES,
     STOP_RESTART_SPEED,
     STOP_TEAM_SPEED,
+    STOP_VISIBILITY_GAP_S,
     STOP_WHISTLE_LOOKBACK_S,
 )
 from .data import TagTable, TrackingData
@@ -282,6 +285,45 @@ def _kickoffs(tags: TagTable) -> list[Any]:
         for event in tags.events
         if event.code == "SET PIECES" and "Kick Off (After Goal)" in event.type
     ]
+
+
+def _extend_through_lost_view(
+    events: list[StopEvent],
+    player_count: np.ndarray,
+    n: int,
+) -> list[StopEvent]:
+    """Keep a confirmed stoppage open while the broadcast has lost the live wide view.
+
+    After some stoppages the feed cuts to close-ups and replays: fewer than
+    ``STOP_MIN_TRACKED_PLAYERS`` players are tracked for a sustained stretch.  The game is
+    still dead and no possession can be attested until the wide view returns, so a stoppage
+    whose end is followed almost immediately by such a stretch extends to the recovery, the
+    next graded-half bound, or the next stoppage, whichever comes first.
+    """
+    min_len = int(round(STOP_VISIBILITY_GAP_S * FPS))
+    if min_len <= 0 or player_count.size == 0:
+        return events
+    lost = np.asarray(player_count, dtype=np.float64) < STOP_MIN_TRACKED_PLAYERS
+    half_bounds = sorted(
+        {int(bound) for half in GRADED_HALVES for bound in half}
+    )
+    extended: list[StopEvent] = []
+    for index, event in enumerate(events):
+        extended.append(event)
+        for run_start, run_stop in _runs(lost, min_len=min_len):
+            if not event.end - 2 * FPS <= run_start <= event.end + min_len:
+                continue
+            if event.restart is not None and event.restart < run_start:
+                break  # play demonstrably restarted before the view was lost
+            ends = [run_stop]
+            ends.extend(bound for bound in half_bounds if bound > event.end)
+            nxt = [other.start for other in events[index + 1 :] if other.start > event.end]
+            ends.append(min(nxt) if nxt else n)
+            new_end = max(event.end, min(ends))
+            if new_end > event.end:
+                extended[-1] = replace(event, end=int(new_end))
+            break
+    return extended
 
 
 def _restart_after(kickoffs: list[Any], frame: int) -> int | None:
@@ -769,6 +811,9 @@ def detect_stoppages(
             event = replace(event, restart=kick)
         if event.end > event.start:
             trimmed.append(event)
+    trimmed = _extend_through_lost_view(
+        trimmed, np.asarray(tracking.player_present, dtype=bool).sum(axis=1), n
+    )
     return tuple(trimmed)
 
 
