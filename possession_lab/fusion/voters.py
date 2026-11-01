@@ -12,11 +12,9 @@ The sources are (module docstring of the poll, kept here where the registry live
 ``atd_shape``
     ATD team shape around the last known ball during a tracking gap.
 ``video_players``
-    YOLO person detections projected to the pitch, with team labels.
-``video_ball``
-    The own video ball tracker.  It is a gap-filling source: while ATD is present it is
-    anchored to ATD, and while ATD is missing it uses YOLO ball detections plus a
-    white-blob fallback.
+    YOLO person detections projected to the pitch, with team labels.  Read against the
+    ATD ball when ATD has it and against the best YOLO ball candidate otherwise: ATD and
+    YOLO support each other and the own video ball tracker is not part of the poll.
 ``yolo_ball``
     YOLO sports-ball detections, associated in time under a physical speed gate.
 ``hmm_atd``
@@ -46,7 +44,6 @@ SOURCE_LABELS = {
     "atd_ball": "ATD balón",
     "atd_shape": "ATD forma",
     "video_players": "Jugadores YOLO",
-    "video_ball": "Balón vídeo",
     "yolo_ball": "YOLO balón",
     "hmm_atd": "HMM ATD",
     "tags": "Smart tags",
@@ -63,8 +60,9 @@ DEFAULT_WEIGHTS = {
     "atd_ball": 0.02,
     "atd_shape": 0.01,
     "video_players": 0.10,
-    "video_ball": 0.14,
-    "yolo_ball": 0.04,
+    # YOLO is an accurate independent ball source: it carries the ballot outright while ATD
+    # is missing and corroborates it while ATD is present.
+    "yolo_ball": 0.10,
     "hmm_atd": 1.00,
     "tags": 0.01,
     "audio": 0.02,
@@ -307,12 +305,28 @@ class AtdShapeVoter:
         )
 
 
+def top_yolo_candidate(ctx: VotingContext) -> tuple[np.ndarray, np.ndarray]:
+    """Best YOLO ball candidate per frame (already gated in time by the resampler)."""
+    n = ctx.n_frames
+    present = np.asarray(ctx.video["yolo_ball_present"], dtype=bool)
+    confidence = np.asarray(ctx.video["yolo_ball_confidence"], dtype=np.float64)
+    points = np.asarray(ctx.video["yolo_ball"], dtype=np.float64)
+    safe = np.where(present & np.isfinite(points).all(axis=2), confidence, -np.inf)
+    best = np.argmax(safe, axis=1)
+    has = np.isfinite(safe[np.arange(n), best]) & (safe[np.arange(n), best] > 0)
+    ball = np.full((n, 2), np.nan, dtype=np.float64)
+    ball_conf = np.zeros(n, dtype=np.float64)
+    ball[has] = points[np.arange(n)[has], best[has]]
+    ball_conf[has] = confidence[np.arange(n)[has], best[has]]
+    return ball, ball_conf
+
+
 class VideoPlayersVoter:
     """Ballot from YOLO player positions, read against the best available ball.
 
     Owning the ball selection is deliberate: this source measures *who is around the
-    ball*, so it decides for itself which ball to use — the own video measurement when
-    confident, otherwise ATD, and nothing when both are absent.
+    ball*, so it decides for itself which ball to use — the ATD ball when ATD has it,
+    the best YOLO candidate while ATD is missing, and nothing when both are absent.
     """
 
     key = "video_players"
@@ -320,14 +334,16 @@ class VideoPlayersVoter:
     role = VoterRole.EVIDENCE
 
     def _best_available_ball(self, ctx: VotingContext) -> tuple[np.ndarray, np.ndarray]:
-        ball = np.asarray(ctx.video["ball_pitch"], dtype=np.float64).copy()
-        confidence = np.asarray(ctx.video["ball_confidence"], dtype=np.float64).copy()
-        use_video = (ctx.video["ball_source"] == 0) & (confidence >= 0.22)
-        use_atd = ctx.atd.present & ~use_video
-        ball[use_atd] = ctx.atd.ball[use_atd]
-        confidence[use_atd] = 1.0
-        valid = np.isfinite(ball).all(axis=1)
-        confidence[~valid] = 0.0
+        atd_ball = np.asarray(ctx.atd.ball, dtype=np.float64)
+        usable_atd = ctx.atd.present & np.isfinite(atd_ball).all(axis=1)
+        ball = np.full((ctx.n_frames, 2), np.nan, dtype=np.float64)
+        confidence = np.zeros(ctx.n_frames, dtype=np.float64)
+        ball[usable_atd] = atd_ball[usable_atd]
+        confidence[usable_atd] = 1.0
+        yolo, yolo_conf = top_yolo_candidate(ctx)
+        use_yolo = ~usable_atd & np.isfinite(yolo).all(axis=1)
+        ball[use_yolo] = yolo[use_yolo]
+        confidence[use_yolo] = yolo_conf[use_yolo]
         return ball, confidence
 
     def cast(self, ctx: VotingContext) -> SourceVote:
@@ -348,53 +364,6 @@ class VideoPlayersVoter:
         )
 
 
-class VideoBallVoter:
-    """The own video ball tracker, anchored to ATD whenever ATD has the ball."""
-
-    key = "video_ball"
-    label = SOURCE_LABELS[key]
-    role = VoterRole.EVIDENCE
-
-    def cast(self, ctx: VotingContext) -> SourceVote:
-        ball = ctx.video["ball_pitch"]
-        confidence = ctx.video["ball_confidence"].astype(np.float64)
-        source = ctx.video["ball_source"]
-        # The source is authoritative only in ATD gaps.  While ATD is present, a video
-        # measurement is a useful cross-check but not a second independent ballot.
-        weight_scale = np.where(ctx.atd.present, 0.08, 1.0)
-        status = np.where(source == 2, 2, np.where(source == 1, 1, 0)).astype(np.int8)
-        geometry = geometry_ballot(
-            key=self.key,
-            label=self.label,
-            role=self.role,
-            ball=ball,
-            ball_confidence=confidence,
-            players=ctx.atd.players,
-            teams=np.tile(ctx.atd.teams, (ctx.n_frames, 1)),
-            present=np.isfinite(ctx.atd.players).all(axis=2),
-            base_weight=ctx.weights[self.key],
-            ball_status=status,
-            sigma=3.8,
-            dead_r=7.5,
-        )
-        vote = _downweight_ballot(geometry, weight_scale, status)
-        return SourceVote(
-            key=vote.key,
-            label=vote.label,
-            role=vote.role,
-            probability=vote.probability,
-            weight=vote.weight,
-            active=vote.active,
-            status=vote.status,
-            ball=vote.ball,
-            details={
-                **vote.details,
-                "source": source.astype(np.int8),
-                "age": ctx.video["age"].astype(np.int32),
-            },
-        )
-
-
 class YoloBallVoter:
     """Raw YOLO ball candidates, already associated under the physical speed gate."""
 
@@ -403,20 +372,7 @@ class YoloBallVoter:
     role = VoterRole.EVIDENCE
 
     def _best_candidate(self, ctx: VotingContext) -> tuple[np.ndarray, np.ndarray]:
-        n = ctx.n_frames
-        present = np.asarray(ctx.video["yolo_ball_present"], dtype=bool)
-        confidence = np.asarray(ctx.video["yolo_ball_confidence"], dtype=np.float64)
-        points = np.asarray(ctx.video["yolo_ball"], dtype=np.float64)
-        # The resampler has already associated candidates under the physical speed gate, so
-        # choosing the best remaining candidate cannot teleport to a far false positive.
-        safe = np.where(present & np.isfinite(points).all(axis=2), confidence, -np.inf)
-        best = np.argmax(safe, axis=1)
-        has = np.isfinite(safe[np.arange(n), best]) & (safe[np.arange(n), best] > 0)
-        ball = np.full((n, 2), np.nan, dtype=np.float64)
-        ball_conf = np.zeros(n, dtype=np.float64)
-        ball[has] = points[np.arange(n)[has], best[has]]
-        ball_conf[has] = confidence[np.arange(n)[has], best[has]]
-        return ball, ball_conf
+        return top_yolo_candidate(ctx)
 
     def cast(self, ctx: VotingContext) -> SourceVote:
         ball, ball_conf = self._best_candidate(ctx)
@@ -629,7 +585,6 @@ VOTERS: tuple[Voter, ...] = (
     AtdBallVoter(),
     AtdShapeVoter(),
     VideoPlayersVoter(),
-    VideoBallVoter(),
     YoloBallVoter(),
     HmmVoter(),
     TagsVoter(),

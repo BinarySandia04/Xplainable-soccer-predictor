@@ -23,7 +23,8 @@ from ..model import (
 )
 from .ballot import FusionResult
 from .geometry import EPS, PRIOR, PRIOR_WEIGHT
-from .pool import blend_ball_positions, pool_ballots
+from .kalman import consensus_from_context
+from .pool import pool_ballots
 from .resample import resample_perception
 from .voters import DEFAULT_WEIGHTS, VOTERS, AtdInputs, VotingContext
 
@@ -142,18 +143,7 @@ def build_fusion(
     fused = pool_ballots(list(sources.values()), mode=combine_mode)
     fused[event_dead] = np.array([0.0, 0.0, 1.0])
 
-    consensus, consensus_conf = blend_ball_positions(
-        [
-            (ctx.atd.ball, ctx.atd.present.astype(np.float64), 1.0),
-            (
-                np.asarray(ctx.video["ball_pitch"], dtype=np.float64),
-                np.asarray(ctx.video["ball_confidence"], dtype=np.float64),
-                0.8,
-            ),
-            (sources["yolo_ball"].ball, sources["yolo_ball"].weight, 1.0),
-        ],
-        n_frames,
-    )
+    consensus, consensus_conf = consensus_from_context(ctx)
 
     # Decode the fused emissions with the same three-state transition prior as the baseline.
     log_emission = np.log(np.clip(fused, EPS, 1.0))

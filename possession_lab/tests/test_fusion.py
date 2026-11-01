@@ -75,7 +75,6 @@ class FusionBuildTest(unittest.TestCase):
                 "atd_ball",
                 "atd_shape",
                 "video_players",
-                "video_ball",
                 "yolo_ball",
                 "hmm_atd",
                 "tags",
@@ -89,7 +88,7 @@ class FusionBuildTest(unittest.TestCase):
         self.assertEqual(roles["hmm_atd"], "prior")
         self.assertEqual(roles["events"], "override")
         self.assertEqual(roles["atd_ball"], "redundant")
-        self.assertEqual(roles["video_ball"], "evidence")
+        self.assertEqual(roles["yolo_ball"], "evidence")
         self.assertIn("HMM ATD", {source["label"] for source in sample["sources"]})
 
     def test_confirmed_event_is_a_hard_dead_override(self):
@@ -238,16 +237,15 @@ class VideoGapDeadTest(unittest.TestCase):
 
 
 class SourceReasonTest(unittest.TestCase):
-    def test_video_ball_reason_names_the_tracker_origin(self):
+    def test_yolo_ball_reason_names_the_distancs(self):
         details = {
             "d_home": np.array([2.5]),
             "d_away": np.array([3.5]),
             "count": np.array([18], dtype=np.int16),
-            "source": np.array([3], dtype=np.int8),
         }
-        reason = ballot_reason("video_ball", 0, details, active=True)
-        self.assertIn("anclado a ATD", reason)
+        reason = ballot_reason("yolo_ball", 0, details, active=True)
         self.assertIn("Barça 2.5 m", reason)
+        self.assertIn("Athletic 3.5 m", reason)
         self.assertIn("18 jugadores", reason)
 
 

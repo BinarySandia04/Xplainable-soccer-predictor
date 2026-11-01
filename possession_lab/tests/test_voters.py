@@ -52,7 +52,6 @@ class VoterRegistryTest(unittest.TestCase):
                 "atd_ball",
                 "atd_shape",
                 "video_players",
-                "video_ball",
                 "yolo_ball",
                 "hmm_atd",
                 "tags",
@@ -65,7 +64,7 @@ class VoterRegistryTest(unittest.TestCase):
         self.assertEqual(role_for_key("hmm_atd"), VoterRole.PRIOR)
         self.assertEqual(role_for_key("events"), VoterRole.OVERRIDE)
         self.assertEqual(role_for_key("atd_ball"), VoterRole.REDUNDANT)
-        self.assertEqual(role_for_key("video_ball"), VoterRole.EVIDENCE)
+        self.assertEqual(role_for_key("yolo_ball"), VoterRole.EVIDENCE)
         self.assertEqual(role_for_key("who-dis-this"), VoterRole.EVIDENCE)
 
 

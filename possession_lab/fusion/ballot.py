@@ -185,20 +185,11 @@ def ballot_reason(key: str, frame: int, details: dict[str, np.ndarray], active: 
         return "gol / detención confirmada" if int(kind) else "sin evento"
     if not active:
         return "sin evidencia utilizable"
-    if key in {"atd_ball", "video_players", "video_ball", "yolo_ball"}:
+    if key in {"atd_ball", "video_players", "yolo_ball"}:
         d_home = details.get("d_home", np.full(1, np.nan))[frame]
         d_away = details.get("d_away", np.full(1, np.nan))[frame]
         count = int(details.get("count", np.zeros(1))[frame])
         pieces = []
-        if key == "video_ball":
-            source = int(details.get("source", np.zeros(1, dtype=np.int8))[frame])
-            origin = {
-                0: "detección de vídeo",
-                1: "predicción en hueco",
-                2: "perdido",
-                3: "anclado a ATD",
-            }.get(source, "vídeo")
-            pieces.append(origin)
         if np.isfinite(d_home):
             pieces.append(f"Barça {float(d_home):.1f} m")
         if np.isfinite(d_away):
