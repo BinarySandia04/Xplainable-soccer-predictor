@@ -166,6 +166,58 @@ class StoppageTest(unittest.TestCase):
         self.assertTrue(any(s.trigger == "out" for s in stops))
         self.assertTrue(any(s.start <= 100 < s.end for s in stops))
 
+    def test_a_whistle_inside_a_resting_stretch_is_a_stoppage(self):
+        # the referee blows while the field is already standing still: the lookback above cannot
+        # see it, and a minute of walking with the ball unaccounted for read as live play
+        n = 600
+        x = np.full(n, 50.0, dtype=np.float32)
+        y = np.full(n, 34.0, dtype=np.float32)
+        tracking = make_tracking(n, (x, y), present=np.ones(n, dtype=bool))
+        tracking.speeds[:150] = 3.0  # live play until 150, then everybody walks
+        tracking.ball_present[200:] = False  # and the ball stops being seen
+        tracking.ball[200:] = np.nan
+        features = extract_features(tracking, TagTable.empty(n))
+        whistle = SimpleNamespace(events=({"frame": 300, "stop": 310, "peak": 9.0},))
+        stops = detect_stoppages(
+            tracking, TagTable.empty(n), features=features, whistle=whistle
+        )
+        self.assertEqual([s.trigger for s in stops], ["whistle_in_run"])
+        self.assertLessEqual(stops[0].start, 210)
+        self.assertGreater(stops[0].end, 300)
+
+    def test_a_resting_field_with_a_live_ball_is_not_a_stoppage(self):
+        # a team also walks with the ball at its feet, and a blast in the background of a passage
+        # of play does not stop it
+        n = 600
+        x = np.full(n, 50.0, dtype=np.float32)
+        y = np.full(n, 34.0, dtype=np.float32)
+        tracking = make_tracking(n, (x, y))
+        tracking.speeds[:150] = 3.0
+        features = extract_features(tracking, TagTable.empty(n))
+        features.ball_speed[150:400] = 5.0  # the ball is being played through the walking stretch
+        whistle = SimpleNamespace(events=({"frame": 300, "stop": 310, "peak": 9.0},))
+        stops = detect_stoppages(
+            tracking, TagTable.empty(n), features=features, whistle=whistle
+        )
+        self.assertEqual([s.trigger for s in stops], [])
+
+    def test_a_blast_just_before_the_rest_confirms_the_stoppage(self):
+        # players rest *after* the whistle: anchoring the lookback on the peak alone drops a foul
+        # whose blast ends a few frames before the field comes to a walk
+        n = 600
+        x = np.full(n, 50.0, dtype=np.float32)
+        y = np.full(n, 34.0, dtype=np.float32)
+        tracking = make_tracking(n, (x, y))
+        tracking.speeds[:200] = 3.0
+        tracking.ball_present[210:] = False
+        tracking.ball[210:] = np.nan
+        features = extract_features(tracking, TagTable.empty(n))
+        whistle = SimpleNamespace(events=({"frame": 194, "stop": 200, "peak": 7.0},))
+        stops = detect_stoppages(
+            tracking, TagTable.empty(n), features=features, whistle=whistle
+        )
+        self.assertIn("whistle", [s.trigger for s in stops])
+
     def test_event_masks_and_overrides_work_for_full_and_local_arrays(self):
         n = 80
         dead = np.zeros(n, dtype=bool)

@@ -30,6 +30,9 @@ from .config import (
     GOAL_MIN_SPEED,
     GOAL_Y_MARGIN,
     STOP_CONTROL_R,
+    STOP_IN_RUN_ACTIVE_FRAMES,
+    STOP_IN_RUN_BALL_SPEED,
+    STOP_IN_RUN_WHISTLE_S,
     STOP_LIVE_TAG_CODES,
     STOP_MIN_LOW_S,
     STOP_RESTART_CONTROL_R,
@@ -557,10 +560,16 @@ def detect_stoppages(
     whistle_events = tuple(getattr(whistle, "events", ()) or ()) if whistle is not None else ()
     lookback = int(round(STOP_WHISTLE_LOOKBACK_S * FPS))
     for low_start, low_stop in _runs(low, min_len=int(round(STOP_MIN_LOW_S * FPS))):
+        # A blast is a span, and players rest *after* it: anchor the lookback on the frame the
+        # whistle stopped.  Anchoring on the peak alone drops the foul the referee blows just
+        # before the field comes to a walk (measured 86 577: peak 6.9, blast 86 576-86 584, the
+        # low-motion run opens at 86 645 -- six frames outside a peak-anchored lookback, so a
+        # minute-long stoppage with three more whistles in it read as live play).
         near_whistles = [
             event
             for event in whistle_events
-            if low_start - lookback <= int(event.get("frame", -10**9)) <= low_start + 2
+            if int(event.get("stop", event.get("frame", -10**9))) >= low_start - lookback
+            and int(event.get("frame", -10**9)) <= low_start + 2
         ]
         if not near_whistles:
             continue
@@ -588,6 +597,68 @@ def detect_stoppages(
             0.85,
             whistle_frame=wf,
             whistle_peak=float(candidate.get("peak", 0.0)),
+            low_start=int(low_start),
+            low_stop=int(low_stop),
+        )
+        if stop is not None:
+            candidates.append(stop)
+
+    # 1b) A whistle that lands *inside* a long resting stretch.  The lookback above only sees a
+    # whistle that precedes the players coming to rest, but a referee blows while the field is
+    # already standing still, and the squad stops for the foul, not for the ball.  Measured
+    # 86 645-88 199 (57:05-59:48): the whole pitch walks for a minute, the ball is unaccounted
+    # for, and the whistle bed fires at 86 960, 87 018, 87 318, 87 432 and 87 736 -- a stopped
+    # game the decoder read as live Athletic possession.
+    in_run_min = int(round(STOP_IN_RUN_WHISTLE_S * FPS))
+    in_run_check = max(1, int(STOP_IN_RUN_ACTIVE_FRAMES))
+    # The field walking is only half of it: a team also walks with a live ball at its feet, and a
+    # blast in the background of a passage of play does not stop it.  The opening second of the run
+    # has to show the ball *out of play* -- untracked, or tracked but neither moving nor at anyone's
+    # feet.  Measured 17 323-17 858: four whistles inside a resting minute, and the ball is in play
+    # at 4-5 m and 3-5 m/s the whole opening second (the game goes on for 53 more frames, and forcing
+    # dead there splits a live Barcelona spell the ground truth counts as one segment).
+    ball_in_play = (
+        present
+        & (gap <= 5)
+        & ((ball_speed >= STOP_IN_RUN_BALL_SPEED) | (near_distance <= STOP_CONTROL_R))
+    )
+    for low_start, low_stop in _runs(low, min_len=in_run_min):
+        if ball_in_play[low_start:min(n, low_start + in_run_check)].any():
+            continue
+        inside = [
+            event
+            for event in whistle_events
+            if low_start <= int(event.get("frame", -10**9)) <= low_stop
+        ]
+        if not inside:
+            continue
+        if any(c.start - 5 <= low_start < c.end for c in candidates):
+            continue  # trigger 1) already owns this run
+        # strongest blast first, and the first one no player is answering with the ball at their
+        # feet: a referee's whistle next to a controlled visible ball is play going on
+        ordered = sorted(inside, key=lambda e: -float(e.get("peak", 0.0)))
+        chosen = None
+        for event in ordered:
+            wf = int(event.get("frame", low_start))
+            controlled = (
+                present[wf]
+                and np.isfinite(near_distance[wf])
+                and near_distance[wf] <= STOP_CONTROL_R
+                and not out_of_play[wf]
+                and gap[wf] <= 5
+            )
+            if not controlled:
+                chosen = (wf, float(event.get("peak", 0.0)))
+                break
+        if chosen is None:
+            continue
+        wf, peak = chosen
+        stop = finish(
+            low_start,
+            "whistle_in_run",
+            0.8,
+            whistle_frame=wf,
+            whistle_peak=peak,
             low_start=int(low_start),
             low_stop=int(low_stop),
         )
