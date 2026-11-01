@@ -7,10 +7,10 @@ ordered reasons a human can check against the video:
 
 * ``out_of_bounds`` - the ball's coordinates left the pitch (signed distance to the line);
 * ``parked``        - the ball sat near a boundary at walking pace before the switch;
-* ``parked``        - the ball sat near a boundary at walking pace before the switch;
 * ``restart``       - the ball accelerated from standing to a kick-off/throw within the window;
 * ``teams_slow``    - the player group's median speed collapsed relative to the live-play median;
-* ``ball_missing``  - the tracker lost the ball for a meaningful stretch;
+* ``ball_missing``  - context only: the tracker lost the ball for a stretch.  A hole in the data
+  is not an event in the match, so it is never the leading reason and it never stands alone;
 * ``tag``           - a smart-tag interval (typically ``SET PIECES``) covers or nearly covers f;
 * ``geometry``      - who was nearest the ball when the new state was entered;
 * ``prior``         - fallback: no strong local signature, the transition prior carried the state.
@@ -28,7 +28,19 @@ from typing import Any
 
 import numpy as np
 
-from .config import CODE_TO_LABEL, CONTEXT, FPS, GRADED_HALVES, A, D, H, X
+from .config import (
+    CODE_TO_LABEL,
+    CONTEXT,
+    FPS,
+    GRADED_HALVES,
+    STOP_CONTROL_R,
+    STOP_IN_RUN_BALL_SPEED,
+    STOP_TEAM_SPEED,
+    A,
+    D,
+    H,
+    X,
+)
 from .data import TagTable, TrackingData
 from .features import Features, extract_features
 from .model import DEFAULT_PARAMS, ModelParams, emission_log_probs
@@ -182,6 +194,46 @@ def _rule_teams_slow(features: Features, frame: int, live_median: float) -> dict
     )
 
 
+def _rule_stopped_field(features: Features, frame: int) -> dict | None:
+    """The field itself is at a walk and the ball is not in play: the game is stopped.
+
+    :func:`_rule_teams_slow` measures the window *against the match median*, so it goes silent
+    exactly when the window is the stoppage - which is the case for a dead state the stop-event
+    override wrote.  This rule measures the stretch instead of comparing it: the whole pitch
+    walking for seconds, with a ball nobody is playing (untracked, or standing, or nobody within
+    a metre and a half of it).
+    """
+    half = int(1.0 * FPS)
+    ahead = int(6.0 * FPS)
+    lo = max(0, frame - half)
+    hi = min(features.team_speed.size, frame + ahead)
+    speed = features.team_speed[lo:hi]
+    if speed.size < FPS:
+        return None
+    walking = speed[np.isfinite(speed)] < STOP_TEAM_SPEED
+    run = _longest_run(walking) if walking.size else 0
+    if run < 4 * FPS:
+        return None
+    live = (
+        features.present[lo:hi]
+        & (features.gap[lo:hi] <= 5)
+        & ((features.ball_speed[lo:hi] >= STOP_IN_RUN_BALL_SPEED)
+           | (features.near_distance[lo:hi] <= STOP_CONTROL_R))
+    )
+    idle = 1.0 - float(live.mean())
+    if idle < 0.75:
+        return None
+    median = float(np.median(features.team_speed[lo:hi][np.isfinite(features.team_speed[lo:hi])]))
+    return _reason(
+        "stopped_field",
+        f"Balón parado: el grupo lleva {run / FPS:.0f} s a {median:.1f} m/s y el balón no está "
+        f"en juego en el {idle * 100:.0f} % del tramo.",
+        walking_seconds=run / FPS,
+        team_speed_mps=median,
+        idle_fraction=idle,
+    )
+
+
 def _rule_ball_missing(features: Features, frame: int) -> dict | None:
     lo = max(0, frame - int(1.0 * FPS))
     hi = min(features.present.size, frame + int(2.5 * FPS))
@@ -270,15 +322,20 @@ def build_switch_records(
             continue
         lo = max(0, local - int(WINDOW_BEFORE_S * FPS))
         hi = min(features.present.size, local + int(WINDOW_AFTER_S * FPS))
+        # A switch is explained by what the match did, not by what the tracker could not see: the
+        # ball gap is context that goes last, and only beside evidence that carries the change.
+        context = _rule_ball_missing(features, local)
         reasons = [r for r in (
             _rule_out_of_bounds(features, lo, hi, features_offset),
             _rule_parked(features, local),
             _rule_restart(features, local, features_offset) if target != D else None,
             _rule_teams_slow(features, local, live_median),
-            _rule_ball_missing(features, local),
             _rule_tag(tag_index, frame),
+            _rule_stopped_field(features, local) if target == D else None,
             _rule_geometry(features, local) if target in (H, A) else None,
         ) if r]
+        if reasons and context:
+            reasons.append(context)
         if not reasons:
             reasons = [_reason("prior", f"Sin señal local fuerte: el prior de transición del HMM mantiene «{TEAM_NAMES[target]}».", prior=True)]
         band = log_emission[max(0, local - FPS // 2): local + FPS // 2 + 1]

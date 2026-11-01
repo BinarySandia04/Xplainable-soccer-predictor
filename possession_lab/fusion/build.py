@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-from ..config import GRADED_HALVES, D, X
+from ..config import D, X
 from ..features import extract_features
 from ..model import (
     DEFAULT_PARAMS,
@@ -87,8 +87,9 @@ def build_fusion(
 
     ``features``/``track``/``whistle``/``events`` are injectable so the CLI and tests can
     reuse the validated event products instead of re-extracting audio and the ATD ball
-    tracker.  ``halves`` overrides the graded windows; the default is the module-level
-    ``GRADED_HALVES``, resolved at call time so it stays patchable.
+    tracker.  ``halves`` overrides the active windows; the default is
+    :func:`possession_lab.pipeline.active_halves` on the supplied tags, so a pre-kickoff
+    warm-up in the recording window is not decoded as possession.
     """
     n_frames = int(tracking.n_frames)
     if features is None:
@@ -104,7 +105,9 @@ def build_fusion(
     if features.start != 0 or features.stop != n_frames:
         raise ValueError("fusion needs full-match features starting at frame 0")
     if halves is None:
-        halves = GRADED_HALVES
+        from ..pipeline import active_halves
+
+        halves = active_halves(tags)
     resolved_weights = dict(DEFAULT_WEIGHTS)
     if weights:
         resolved_weights.update({str(k): float(v) for k, v in weights.items()})
@@ -115,6 +118,7 @@ def build_fusion(
             tracking,
             tags,
             params,
+            halves=halves,
             track=track,
             whistle=whistle,
             events=events,
@@ -161,6 +165,9 @@ def build_fusion(
     confidence = np.max(posterior, axis=1)
     entropy = -np.sum(np.where(posterior > 0, posterior * np.log(np.maximum(posterior, EPS)), 0.0), axis=1)
     codes[~graded] = X
+    from ..pipeline import fill_match_breaks
+
+    codes = fill_match_breaks(codes, halves)
 
     hmm_diagnostics = sources["hmm_atd"].diagnostics
     if not include_baseline:

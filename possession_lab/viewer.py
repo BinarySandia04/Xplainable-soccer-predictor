@@ -623,6 +623,9 @@ class FrameStore:
                         "end": int(stop.end),
                         "trigger": str(stop.trigger),
                         "confidence": float(stop.confidence),
+                        "restart": (
+                            None if getattr(stop, "restart", None) is None else int(stop.restart)
+                        ),
                     }
                 )
         return active

@@ -150,6 +150,18 @@ class TransitionParams:
     keeper_hold_pass_m: float = 3.0  # ball-to-teammate radius that still counts as control
     keeper_hold_pass_frames: int = 90  # max look-back through the pass (3.6 s)
     keeper_hold_pass_gap: int = 8  # missing-ball frames tolerated inside the flight
+    # The catch owns play until the keeper puts the ball back in it, not until the fused poll
+    # happens to move: inside a long ball gap the poll is blind, so "to the next fused boundary"
+    # stamped one 39-frame hold over 70 s the camera watched Barcelona win (measured 80 651 ->
+    # 82 359: the hold ran to 82 359 while the fused codes held H, a live-play tag was on, and a
+    # Barcelona player had the ball at 0.4 m at 81 918).  6 s past the release frame.
+    keeper_hold_release_frames: int = 150
+    # A win-and-clear fingerprint is feet evidence from the dedicated detector; it needs the pitch
+    # stream to agree about *where* the ball is.  While the ATD ball is gone the fused poll is
+    # carried by its own prior, so "the evidence catches up" cannot be replaced by a fingerprint:
+    # a release measured in a blind window is a camera reading with nothing to check it against
+    # (measured 86 219: 6.4 px from feet, 131 px clear, the ATD ball blind since 86 186).
+    pixel_fingerprint_needs_atd: bool = True
 
 
 DEFAULT_TRANSITION_PARAMS = TransitionParams()
@@ -966,6 +978,7 @@ def gate_pixel_events(
     params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
     relay: frozenset[tuple[int, int]] = frozenset(),
     holds: Sequence[KeeperHold] = (),
+    atd_ball: np.ndarray | None = None,
 ) -> tuple[list[TransitionEvent], list[tuple[int, int, int]]]:
     """Admit pixel events into a sequential stream and hand out owned intervals.
 
@@ -990,6 +1003,7 @@ def gate_pixel_events(
     """
     n = codes_pooled.shape[0]
     bnd = np.flatnonzero(np.r_[True, codes_pooled[1:] != codes_pooled[:-1]])
+    atd_seen = np.ones(n, dtype=bool) if atd_ball is None else np.asarray(atd_ball, dtype=bool)
     contact_keys = {(int(e[0]), int(e[2])) for e in contact}
     kicker_map = {(int(e[0]), int(e[2])): e for e in kicker}
     intervals: list[list[int]] = []
@@ -1018,6 +1032,7 @@ def gate_pixel_events(
             and close_px <= params.pixel_fingerprint_close
             and dom_px >= params.pixel_fingerprint_dom
             and strength <= params.pixel_fingerprint_release_max
+            and (not params.pixel_fingerprint_needs_atd or bool(atd_seen[frame]))
         )
         if not (momentum or fingerprint or is_relay):
             continue  # fused evidence never comes around and no winning fingerprint: noise
@@ -1059,9 +1074,9 @@ def gate_pixel_events(
                             team=team, distance=close_px if not is_contact else 1.0, support=support)
         )
         intervals.append([start, stop, team])
-    # keeper holds own the stretch from the catch to the next fused boundary: the camera
-    # watched the ball sit in the defender's box, so this needs no boundary proximity and
-    # no momentum, but it never cuts into a frame the pixel channel already decided.
+    # keeper holds own the stretch from the catch to the next fused boundary or to the release
+    # cap: the camera watched the ball sit in the defender's box, so this needs no boundary
+    # proximity and no momentum, but it never cuts into a frame the pixel channel already decided.
     for hold in sorted(holds, key=lambda h: h.frame):
         frame, team = int(hold.frame), int(hold.team)
         if team not in (H, 1) or hold.length < params.keeper_hold_min_frames:
@@ -1091,11 +1106,15 @@ def gate_pixel_events(
                 start = iv[1]
         if start >= next_b:
             continue
+        cap = int(params.keeper_hold_release_frames)
+        stop = min(next_b, frame + cap) if cap > 0 else next_b
+        if stop <= start:
+            continue
         kept.append(
             TransitionEvent(start=start, frame=frame, kind="hold", team=team,
                             distance=1.0, support=1.0)
         )
-        intervals.append([start, next_b, team])
+        intervals.append([start, stop, team])
     return kept, [(a, b, t_) for a, b, t_ in intervals]
 
 
@@ -1311,6 +1330,47 @@ def carry_dead_through_blind(
     return out
 
 
+def dead_needs_support(
+    codes: np.ndarray,
+    blind: np.ndarray,
+    support: np.ndarray,
+    halves: tuple[tuple[int, int], ...] | None = None,
+) -> np.ndarray:
+    """Inside a ball-blind window, ``D`` has to come from an event, never from the gap itself.
+
+    The deeper the ATD ball gap, the more the decode reads the pitch shape around the *last*
+    known ball position: a long enough hole eventually looks like a ball parked at a touchline,
+    whatever the match was doing (measured 86 307: the boundary crossing 120 blind frames is
+    what flipped the state, and the only reason attached to it was "the tracker lost the ball").
+    A missing ball is not a stoppage.  Keep the dead state only where independent evidence says
+    the game was stopped -- a confirmed whistle/out-of-play stoppage from
+    :mod:`possession_lab.events`, or a ``SET PIECES`` smart tag -- and hand every other blind
+    ``D`` back to the last live team the decode held in the same half.  Frames before that half
+    ever held a live team have nothing to go back to, and are left as they were.
+    """
+    out = np.asarray(codes).copy()
+    mask = np.asarray(blind, dtype=bool)
+    supported = np.asarray(support, dtype=bool)
+    if out.size == 0 or not mask.any() or supported.size != out.size:
+        return out
+    if halves is None:
+        halves = GRADED_HALVES
+    for start, stop in halves:
+        start, stop = int(start), int(min(stop, out.size))
+        if start >= stop:
+            continue
+        segment = out[start:stop]
+        # last index of a live (H/A) state at or before each frame; -1 while the half has only
+        # ever been D/X, where there is no team to hand the frames back to
+        live_index = np.maximum.accumulate(np.where((segment == H) | (segment == 1), np.arange(segment.size), -1))
+        bad = mask[start:stop] & (segment == D) & ~supported[start:stop] & (live_index >= 0)
+        if not bad.any():
+            continue
+        segment[bad] = segment[live_index[bad]]
+        out[start:stop] = segment
+    return out
+
+
 def apply_transition_layer(
     *,
     codes_pooled: np.ndarray,
@@ -1328,6 +1388,8 @@ def apply_transition_layer(
     ballots: Mapping[str, tuple[np.ndarray, np.ndarray]] | None = None,
     keeper_defenders: np.ndarray | None = None,
     keeper_pitch: tuple[float, float] | None = None,
+    atd_ball_present: np.ndarray | None = None,
+    dead_support: np.ndarray | None = None,
 ) -> TransitionLayerResult:
     """Detect, gate, and decode ball-control transitions on top of the fused poll.
 
@@ -1342,7 +1404,9 @@ def apply_transition_layer(
     spells to the pitch geometry.  With ``ballots`` (voter key -> ``(probability,
     weight)`` for the four ball/control voters) the cross-stream relay
     (``relay_contacts``) additionally admits a camera-attested takeover inside a
-    settled spell.
+    settled spell.  ``atd_ball_present`` tells the pixel channel which frames the pitch
+    stream actually saw the ball on; ``dead_support`` (a confirmed stoppage or a
+    ``SET PIECES`` smart tag) is what a ``D`` inside a ball-blind window must be backed by.
     """
     consensus = np.asarray(consensus_ball, dtype=np.float64)
     sets64 = [(np.asarray(p, dtype=np.float64), np.asarray(t), np.asarray(pr, dtype=bool)) for p, t, pr in player_sets]
@@ -1373,7 +1437,7 @@ def apply_transition_layer(
         )
         pixel_kept, intervals = gate_pixel_events(
             contact, kicker, contain, codes_pooled, np.asarray(fused_probability, dtype=np.float64),
-            event_dead, events, params, relay=relay, holds=holds,
+            event_dead, events, params, relay=relay, holds=holds, atd_ball=atd_ball_present,
         )
         events = tuple(sorted(events + tuple(pixel_kept), key=lambda e: (e.start, e.frame)))
         dropped += len(contact) + len(kicker) + len(holds) - len(pixel_kept)
@@ -1395,10 +1459,16 @@ def apply_transition_layer(
     if intervals:
         log_em -= np.log(np.exp(log_em).sum(axis=1, keepdims=True))
     codes = decode_with_events(log_em, boost, protect, np.asarray(event_dead, dtype=bool), model_params, halves)
+    if dead_support is not None and ball_stale is not None:
+        # a ball the tracker cannot see never *becomes* a dead ball on the strength of the gap
+        codes = dead_needs_support(codes, np.asarray(ball_stale, dtype=bool), dead_support, halves)
     if blind_dead is not None:
         # a dead ball that went blind stays dead: the "restart" inside the window is the
         # carried trajectory, not play (post-decode so a window cannot disturb the half)
         codes = carry_dead_through_blind(codes, blind_dead, halves)
+    from ..pipeline import fill_match_breaks
+
+    codes = fill_match_breaks(codes, halves if halves is not None else GRADED_HALVES)
     return TransitionLayerResult(
         codes=codes,
         events=events,
@@ -1432,6 +1502,7 @@ __all__ = [
     "build_pulse",
     "carry_dead_through_blind",
     "control_map",
+    "dead_needs_support",
     "decode_with_events",
     "detect_contact_events",
     "detect_kick_events",
