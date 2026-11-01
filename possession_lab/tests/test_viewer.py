@@ -195,20 +195,18 @@ class FrameStoreTopViewTest(unittest.TestCase):
         )
         # A moving camera: the historical point must use its own frame's homography.
         homography.matrices[0, 0, 2] = 100.0
-        track = SimpleNamespace(
-            source=np.array([0, 1, 2], dtype=np.int8),
-            estimate=np.array([[10.0, 20.0], [11.0, 21.0], [np.nan, np.nan]], dtype=np.float32),
-            confidence=np.array([1.0, 0.4, 0.0], dtype=np.float32),
-            gap_s=np.array([0.0, 0.04, 0.08], dtype=np.float32),
-            out_of_play=np.zeros(3, dtype=bool),
+        fusion = SimpleNamespace(
+            consensus_ball=np.array([[10.0, 20.0], [11.0, 21.0], [np.nan, np.nan]], dtype=np.float32),
+            consensus_confidence=np.array([0.8, 0.8, 0.0], dtype=np.float32),
         )
         store = FrameStore(
             tracking,
             homography,
-            track,
+            None,
             SimpleNamespace(goals=(), stoppages=()),
             SimpleNamespace(start=0),
             trail_frames=3,
+            fusion=fusion,
         )
         payload = store.frame_payload(1)
         self.assertAlmostEqual(payload["pitch"]["length"], 105.3)
@@ -217,12 +215,14 @@ class FrameStoreTopViewTest(unittest.TestCase):
         self.assertEqual(payload["players"][0]["y"], 21.0)
         self.assertAlmostEqual(payload["players"][0]["px"], 11.0 / 105.3 * 1920.0, places=1)
         self.assertAlmostEqual(payload["players"][0]["py"], 21.0 / 68.0 * 1080.0, places=1)
-        self.assertEqual(payload["ball"]["ex"], 11.0)
-        self.assertEqual(payload["trail_pitch"], [[10.0, 20.0, 0], [11.0, 21.0, 1]])
+        self.assertEqual(payload["layers"]["consensus"]["x"], 11.0)
+        self.assertEqual(payload["trails"]["consensus"]["pitch"], [[10.0, 20.0, 0], [11.0, 21.0, 0]])
         self.assertAlmostEqual(
-            payload["trail"][0][0], 100.0 + 10.0 / 105.3 * 1920.0, places=1
+            payload["trails"]["consensus"]["video"][0][0], 100.0 + 10.0 / 105.3 * 1920.0, places=1
         )
-        self.assertAlmostEqual(payload["trail"][1][0], 11.0 / 105.3 * 1920.0, places=1)
+        self.assertAlmostEqual(
+            payload["trails"]["consensus"]["video"][1][0], 11.0 / 105.3 * 1920.0, places=1
+        )
 
         # The map is independent of video projection: a broken homography removes pixels
         # but keeps the pitch coordinates and pitch-space trail intact.
@@ -230,14 +230,15 @@ class FrameStoreTopViewTest(unittest.TestCase):
         payload = store.frame_payload(1)
         self.assertIsNone(payload["players"][0]["px"])
         self.assertIsNone(payload["players"][0]["py"])
-        self.assertIsNone(payload["ball"]["px"])
-        self.assertEqual(payload["players"][0]["x"], 11.0)
-        self.assertEqual(payload["ball"]["ex"], 11.0)
-        self.assertEqual(payload["trail_pitch"], [[10.0, 20.0, 0], [11.0, 21.0, 1]])
+        self.assertIsNone(payload["layers"]["consensus"]["px"])
+        self.assertEqual(payload["layers"]["consensus"]["x"], 11.0)
+        self.assertEqual(payload["trails"]["consensus"]["pitch"], [[10.0, 20.0, 0], [11.0, 21.0, 0]])
+        # frame 1 no longer projects, so its pixel is gone from the video trail
+        self.assertEqual(len(payload["trails"]["consensus"]["video"]), 1)
 
 
 class FrameStoreLayersTest(unittest.TestCase):
-    def test_payload_separates_raw_and_combined_layers(self):
+    def test_payload_separates_raw_and_consensus_layers(self):
         tracking = SimpleNamespace(
             n_frames=3,
             ball=np.array([[10.0, 20.0], [np.nan, np.nan], [12.0, 22.0]], dtype=np.float32),
@@ -262,38 +263,39 @@ class FrameStoreLayersTest(unittest.TestCase):
                 axis=0,
             )
         )
-        combined = SimpleNamespace(
-            source=np.array([0, 1, 0], dtype=np.int8),
-            estimate=np.array([[10.0, 20.0], [11.0, 21.0], [12.0, 22.0]], dtype=np.float32),
-            confidence=np.array([1.0, 0.4, 1.0], dtype=np.float32),
-            gap_s=np.array([0.0, 0.04, 0.0], dtype=np.float32),
-            out_of_play=np.zeros(3, dtype=bool),
+        consensus = SimpleNamespace(
+            consensus_ball=np.array([[10.0, 20.0], [11.0, 21.0], [12.0, 22.0]], dtype=np.float32),
+            consensus_confidence=np.array([1.0, 0.4, 1.0], dtype=np.float32),
+            meta={},
         )
         store = FrameStore(
             tracking,
             homography,
-            combined,
+            None,
             SimpleNamespace(goals=(), stoppages=()),
             SimpleNamespace(start=0),
             trail_frames=3,
+            fusion=consensus,
         )
         payload = store.frame_payload(1)
 
-        self.assertNotIn("kalman", payload["layers"])
-        self.assertNotIn("kalman", payload["trails"])
+        self.assertEqual(set(payload["layers"]), {"raw", "yolo", "consensus"})
+        self.assertEqual(set(payload["trails"]), {"raw", "yolo", "consensus"})
+        self.assertNotIn("ball", payload)
+        self.assertNotIn("fusion", payload)
         self.assertIsNone(payload["layers"]["raw"]["x"])
         self.assertEqual(payload["layers"]["raw"]["source"], 2)
-        self.assertEqual(payload["layers"]["combined"]["x"], 11.0)
-        self.assertEqual(payload["layers"]["combined"]["source"], 1)
+        self.assertEqual(payload["layers"]["consensus"]["x"], 11.0)
+        self.assertEqual(payload["layers"]["consensus"]["source"], 0)
         self.assertEqual(payload["trails"]["raw"]["pitch"], [])
         self.assertEqual(
-            payload["trails"]["combined"]["pitch"],
-            [[10.0, 20.0, 0], [11.0, 21.0, 1]],
+            payload["trails"]["consensus"]["pitch"],
+            [[10.0, 20.0, 0], [11.0, 21.0, 0]],
         )
 
 
 class FrameStoreMultiSourceTest(unittest.TestCase):
-    def test_payload_carries_video_yolo_fusion_and_source_ballots(self):
+    def test_payload_carries_raw_yolo_and_consensus_layers(self):
         tracking = SimpleNamespace(
             n_frames=3,
             ball=np.array([[10.0, 20.0], [11.0, 21.0], [12.0, 22.0]], dtype=np.float32),
@@ -405,35 +407,6 @@ class FrameStoreMultiSourceTest(unittest.TestCase):
             consensus_confidence: ClassVar[np.ndarray] = np.full(3, 0.8, dtype=np.float32)
             meta: ClassVar[dict[str, str]] = {"combine_mode": "log"}
 
-            @staticmethod
-            def sample(frame):
-                frame = int(frame)
-                return {
-                    "code": H,
-                    "label": "H",
-                    "baseline_code": A,
-                    "fused_probability": [0.7, 0.2, 0.1],
-                    "posterior": [0.7, 0.2, 0.1],
-                    "confidence": 0.8,
-                    "entropy": 0.6,
-                    "event_dead": False,
-                    "consensus_ball": {"x": 10.0 + frame, "y": 20.0 + frame, "confidence": 0.8},
-                    "sources": [
-                        {
-                            "key": "hmm_atd",
-                            "label": "HMM ATD",
-                            "role": "prior",
-                            "active": True,
-                            "status": 0,
-                            "status_name": "observed",
-                            "probability": [0.7, 0.2, 0.1],
-                            "weight": 1.0,
-                            "ball": {"x": 10.0 + frame, "y": 20.0 + frame},
-                            "reason": "posterior del HMM ATD validado",
-                        }
-                    ],
-                }
-
         store = FrameStore(
             tracking,
             homography,
@@ -446,21 +419,21 @@ class FrameStoreMultiSourceTest(unittest.TestCase):
         )
         payload = store.frame_payload(1)
 
-        self.assertEqual(payload["layers"]["video"]["x"], 11.0)
-        self.assertEqual(payload["layers"]["video"]["px"], 501.0)
+        self.assertEqual(set(payload["layers"]), {"raw", "yolo", "consensus"})
+        self.assertEqual(payload["layers"]["raw"]["x"], 11.0)
         self.assertEqual(payload["layers"]["yolo"]["x"], 13.0)
         payload_far = store.frame_payload(2)
         self.assertEqual(payload_far["layers"]["yolo"]["source"], 2)
         self.assertIsNone(payload_far["layers"]["yolo"]["x"])
-        self.assertEqual(payload["layers"]["fusion"]["x"], 11.0)
-        self.assertEqual(payload["layers"]["fusion"]["source"], 0)
+        self.assertEqual(payload["layers"]["consensus"]["x"], 11.0)
+        self.assertEqual(payload["layers"]["consensus"]["source"], 0)
         self.assertEqual(len(payload["video_players"]), 2)
         self.assertEqual(payload["video_players"][0]["track"], 4)
         # officials reach the payload flagged, so the renderer can skip their dots
         self.assertFalse(payload["video_players"][0]["official"])
         self.assertTrue(payload["video_players"][1]["official"])
-        self.assertEqual(len(payload["trails"]["video"]["pitch"]), 2)
-        self.assertEqual(len(payload["trails"]["fusion"]["pitch"]), 2)
+        self.assertEqual(set(payload["trails"]), {"raw", "yolo", "consensus"})
+        self.assertEqual(len(payload["trails"]["consensus"]["pitch"]), 2)
         # The yolo layer now draws a persistent trajectory (BotSORT-style) from its accepted track:
         # frame 0 is the seeding frame (unaccepted), so the trail holds only the accepted point.
         self.assertEqual(payload["trails"]["yolo"]["pitch"], [[13.0, 23.0, 0]])
@@ -470,10 +443,9 @@ class FrameStoreMultiSourceTest(unittest.TestCase):
         self.assertEqual(candidates[13.0], BALL_CAND_ACCEPTED)
         candidates_far = {round(c["x"], 1): c["decision"] for c in payload_far["yolo_candidates"]}
         self.assertEqual(candidates_far[80.0], BALL_CAND_REJECTED_UNREACHABLE)
-        self.assertTrue(payload["fusion"]["available"])
-        self.assertEqual(payload["fusion"]["label"], "H")
-        self.assertEqual(payload["fusion"]["baseline_label"], "A")
-        self.assertEqual(payload["fusion"]["sources"][0]["role"], "prior")
+        self.assertTrue(payload["fusion_available"])
+        self.assertNotIn("fusion", payload)
+        self.assertNotIn("ball", payload)
 
 
 class AtdKeeperTeamTest(unittest.TestCase):
@@ -927,13 +899,21 @@ class ViewerAssetTest(unittest.TestCase):
         referenced = set(re.findall(r'\$\("#([^"]+)"\)', js))
         self.assertEqual(sorted(referenced - ids), [])
 
-    def test_fusion_label_is_updated_in_both_summary_and_panel(self):
-        # The summary cell and the poll card intentionally have separate ids.  A missing update
-        # left the summary showing "—" while the card showed the fused label.
+    def test_legacy_fusion_panel_is_fully_removed(self):
+        # The old "Combinado / Balón vídeo / Fusión" UI is gone: the ball layers are now
+        # raw + yolo + consensus only. No fusion payload key, ids or code may survive.
         assets = Path(__file__).resolve().parents[1] / "viewer_assets"
         js = (assets / "viewer.js").read_text(encoding="utf-8")
-        self.assertIn('setBadge(ui.fusionBadge, code)', js)
-        self.assertIn('setBadge(ui.fusedBadge, code)', js)
+        html = (assets / "index.html").read_text(encoding="utf-8")
+        css = (assets / "viewer.css").read_text(encoding="utf-8")
+        for token in ("fusion", "combined", "fused"):
+            self.assertNotIn(token, js)
+        self.assertNotIn("fusion", html.lower().replace("fusiona", ""))  # "fusiona" verb is fine
+        self.assertNotIn("fusion", css.lower())
+        self.assertIn('const BALL_LAYERS = ["raw", "yolo", "consensus"];', js)
+        self.assertIn('data-layer="consensus"', html)
+        ids = set(re.findall(r'id="([^"]+)"', html))
+        self.assertNotIn("fusionCard", ids)
 
     def test_detail_scrub_gesture_uses_frozen_window_and_flush_instead_of_reseek(self):
         # The detail window is relative to state.frame; re-deriving it on pointerup made a
@@ -948,15 +928,12 @@ class ViewerAssetTest(unittest.TestCase):
         self.assertNotIn("const frame = eventFrame(event, source);\n          if (frame !== null) seekToFrame", js)
 
     def test_frame_chips_reserve_space_against_reflow_flicker(self):
-        # hoverInfo swapping line counts bounced the detail hint; the fusion chip toggled
-        # between "cargando poll…" and the full text every tick while a fetch was in flight.
+        # hoverInfo swapping line counts bounced the detail hint; every per-frame chip must
+        # pin its height so a payload arriving late never toggles the card size.
         assets = Path(__file__).resolve().parents[1] / "viewer_assets"
         css = (assets / "viewer.css").read_text(encoding="utf-8")
-        js = (assets / "viewer.js").read_text(encoding="utf-8")
         self.assertRegex(css, r"#hoverInfo\s*\{[^}]*text-overflow:\s*ellipsis")
-        self.assertRegex(css, r"#fusionStatus\s*\{[^}]*min-height:\s*2\.7em")
-        self.assertIn("state.fusionRendered", js)
-        self.assertRegex(js, r"if \(data\.fusion_available && state\.fusionRendered\)")
+        self.assertRegex(css, r"#trackingStatus\s*\{[^}]*min-height:\s*2\.7em")
 
     def test_officials_are_never_drawn_as_player_dots(self):
         # referee boxes used to render as extra team-coloured dots with no player behind

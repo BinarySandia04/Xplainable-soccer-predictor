@@ -645,40 +645,6 @@ class FrameStore:
         sample["age_frames"] = age
         return sample
 
-    def _video_layer_payload(self, frame: int) -> dict[str, Any]:
-        sample = self._perception_sample(frame)
-        if sample is None:
-            return {
-                "source": 2,
-                "observed": False,
-                "x": None,
-                "y": None,
-                "px": None,
-                "py": None,
-                "confidence": 0.0,
-                "gap_s": None,
-                "out_of_play": False,
-                "age_frames": None,
-            }
-        ball = sample.get("ball", {})
-        source = int(ball.get("source", 2))
-        x = ball.get("x")
-        y = ball.get("y")
-        available = source != 2 and x is not None and y is not None
-        gap = (abs(int(sample.get("age_frames", 0))) / FPS) if available and source != 0 else (0.0 if available else None)
-        return {
-            "source": source,
-            "observed": bool(source == 0),
-            "x": x if available else None,
-            "y": y if available else None,
-            "px": ball.get("px") if available else None,
-            "py": ball.get("py") if available else None,
-            "confidence": _finite(ball.get("confidence")) if available else 0.0,
-            "gap_s": gap,
-            "out_of_play": bool(available and self._outside_pitch(float(x), float(y))),
-            "age_frames": int(sample.get("age_frames", 0)),
-        }
-
     def _yolo_layer_payload(self, frame: int) -> dict[str, Any]:
         sample = self._perception_sample(frame)
         if sample is None or self._yolo_ball_pitch is None:
@@ -810,43 +776,32 @@ class FrameStore:
 
     def _layer_payload(self, frame: int, layer: str) -> dict[str, Any]:
         """Describe one ball layer at one frame without changing the model tracker."""
-        if layer == "video":
-            return self._video_layer_payload(frame)
+        if layer == "consensus":
+            return self._fusion_layer_payload(frame)
         if layer == "yolo":
             return self._yolo_layer_payload(frame)
-        if layer == "fusion":
-            return self._fusion_layer_payload(frame)
+        if layer != "raw":
+            return {
+                "source": 2,
+                "observed": False,
+                "x": None,
+                "y": None,
+                "px": None,
+                "py": None,
+                "confidence": 0.0,
+                "gap_s": None,
+                "out_of_play": False,
+            }
         raw_present = bool(self.tracking.ball_present[frame])
         raw = self.tracking.ball[frame]
-        if layer == "raw":
-            available = raw_present and np.isfinite(raw[0]) and np.isfinite(raw[1])
-            x = float(raw[0]) if available else np.nan
-            y = float(raw[1]) if available else np.nan
-            source = 0 if available else 2
-            confidence = 1.0 if available else 0.0
-            gap = 0.0 if available else None
-            observed = available
-            outside = self._outside_pitch(x, y) if available else False
-        else:
-            track = self.track
-            if track is None:
-                available = False
-                x = y = float("nan")
-                source = 2
-                confidence = 0.0
-                gap = None
-                observed = False
-                outside = False
-            else:
-                source = int(track.source[frame])
-                point = track.estimate[frame]
-                available = source != 2 and np.isfinite(point[0]) and np.isfinite(point[1])
-                x = float(point[0]) if available else np.nan
-                y = float(point[1]) if available else np.nan
-                confidence = _finite(track.confidence[frame])
-                gap = _finite(track.gap_s[frame])
-                observed = bool(getattr(track, "observed", np.zeros(self.n_frames, dtype=bool))[frame])
-                outside = bool(track.out_of_play[frame]) if available else False
+        available = raw_present and np.isfinite(raw[0]) and np.isfinite(raw[1])
+        x = float(raw[0]) if available else np.nan
+        y = float(raw[1]) if available else np.nan
+        source = 0 if available else 2
+        confidence = 1.0 if available else 0.0
+        gap = 0.0 if available else None
+        observed = available
+        outside = self._outside_pitch(x, y) if available else False
 
         pixel = _project(self.homography, frame, x, y, self.tracking.pitch) if available else None
         return {
@@ -869,24 +824,6 @@ class FrameStore:
         The broadcast camera moves, so each historical pitch point must use the homography of its
         own frame on the video overlay, not the homography of the current frame.
         """
-        if layer == "video":
-            points: list[tuple[int, float, float, int]] = []
-            seen: set[int] = set()
-            start = max(0, frame - self.trail_frames + 1)
-            for k in range(start, frame + 1):
-                sample = self._perception_sample(k)
-                if sample is None:
-                    continue
-                sample_frame = int(sample.get("sample_frame", k))
-                if sample_frame in seen:
-                    continue
-                seen.add(sample_frame)
-                ball = sample.get("ball", {})
-                source = int(ball.get("source", 2))
-                if source == 2 or ball.get("x") is None or ball.get("y") is None:
-                    continue
-                points.append((k, float(ball["x"]), float(ball["y"]), source))
-            return points
         if layer == "yolo":
             if self._yolo_ball_pitch is None or self.perception is None:
                 return []
@@ -910,7 +847,7 @@ class FrameStore:
                     continue
                 yolo_points.append((k, float(point[0]), float(point[1]), 0 if confidence >= 0.25 else 1))
             return yolo_points
-        if layer == "fusion":
+        if layer == "consensus":
             if self.fusion is None:
                 return []
             points = []
@@ -918,8 +855,9 @@ class FrameStore:
             for k in range(start, frame + 1):
                 point = self.fusion.consensus_ball[k]
                 if not (np.isfinite(point[0]) and np.isfinite(point[1])):
+                    points = []
                     continue
-                points.append((k, float(point[0]), float(point[1]), 0))
+                points.append((k, float(point[0]), float(point[1]), 0 if self.fusion.consensus_confidence[k] > 0 else 1))
             return points
 
         if layer == "raw":
@@ -936,21 +874,7 @@ class FrameStore:
                 points.append((k, float(point[0]), float(point[1]), 0))
             return points
 
-        track = self.track
-        if track is None:
-            return []
-        points = []
-        start = max(0, frame - self.trail_frames + 1)
-        for k in range(start, frame + 1):
-            source_k = int(track.source[k])
-            if source_k == 2:
-                points = []
-                continue
-            point = track.estimate[k]
-            if not (np.isfinite(point[0]) and np.isfinite(point[1])):
-                continue
-            points.append((k, float(point[0]), float(point[1]), source_k))
-        return points
+        return []
 
     def _trail_payload(self, frame: int, layer: str) -> dict[str, list[list[float | int]]]:
         series = self._trail_series(frame, layer)
@@ -966,23 +890,13 @@ class FrameStore:
 
     def frame_payload(self, frame: int) -> dict[str, Any]:
         frame = max(0, min(int(frame), self.n_frames - 1))
-        raw_present = bool(self.tracking.ball_present[frame])
-        source = int(self.track.source[frame])
-        estimate = self.track.estimate[frame]
-        raw = self.tracking.ball[frame]
-        ex, ey = float(estimate[0]), float(estimate[1])
-        has_estimate = np.isfinite(ex) and np.isfinite(ey)
-        ball_pixel = _project(self.homography, frame, ex, ey, self.tracking.pitch) if has_estimate else None
-
         trails = {
             layer: self._trail_payload(frame, layer)
-            for layer in ("raw", "combined", "video", "yolo", "fusion")
+            for layer in ("raw", "yolo", "consensus")
         }
-        trail = trails["combined"]["video"]
-        trail_pitch = trails["combined"]["pitch"]
         layers = {
             layer: self._layer_payload(frame, layer)
-            for layer in ("raw", "combined", "video", "yolo", "fusion")
+            for layer in ("raw", "yolo", "consensus")
         }
 
         players: list[dict[str, Any]] = []
@@ -1028,19 +942,7 @@ class FrameStore:
                     }
                 )
 
-        fusion_payload: dict[str, Any]
-        if self.fusion is None:
-            fusion_payload = {"available": False, "reason": "fusion cache not loaded"}
-        else:
-            fusion_payload = self.fusion.sample(frame)
-            fusion_payload["available"] = True
-            fusion_payload["baseline_label"] = (
-                CODE_TO_LABEL.get(int(fusion_payload["baseline_code"]), "X")
-                if fusion_payload.get("baseline_code") is not None
-                else None
-            )
-            fusion_payload["combine_mode"] = self.fusion.meta.get("combine_mode", "log")
-
+        fusion_available = self.fusion is not None
         return {
             "available": True,
             "frame": frame,
@@ -1052,25 +954,8 @@ class FrameStore:
                 "length": float(self.tracking.pitch[0]),
                 "width": float(self.tracking.pitch[1]),
             },
-            "ball": {
-                "present": raw_present,
-                "source": source,
-                "x": _finite(raw[0]) if raw_present else None,
-                "y": _finite(raw[1]) if raw_present else None,
-                "ex": _finite(ex) if has_estimate else None,
-                "ey": _finite(ey) if has_estimate else None,
-                "px": ball_pixel[0] if ball_pixel is not None else None,
-                "py": ball_pixel[1] if ball_pixel is not None else None,
-                "confidence": _finite(self.track.confidence[frame]),
-                "gap_s": _finite(self.track.gap_s[frame]),
-                "out_of_play": bool(
-                    self.track.out_of_play[frame] or self._feature("out_of_play", frame)
-                ),
-            },
             "layers": layers,
             "trails": trails,
-            "trail": trail,
-            "trail_pitch": trail_pitch,
             "players": players,
             "video_players": video_players,
             "yolo_candidates": self._yolo_candidates_payload(frame),
@@ -1081,8 +966,7 @@ class FrameStore:
                 "id": int(layers["yolo"].get("track", -1)) if layers.get("yolo") else -1,
             },
             "perception_available": bool(self.perception is not None),
-            "fusion_available": bool(self.fusion is not None),
-            "fusion": fusion_payload,
+            "fusion_available": fusion_available,
             "features": self._features_payload(frame),
             "active_events": self._active_events(frame),
         }

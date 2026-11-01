@@ -22,27 +22,16 @@
     1: "Athletic Club",
   };
   const MONO = '"SFMono-Regular", "Cascadia Code", "Roboto Mono", monospace';
-  const BALL_LAYERS = ["raw", "yolo", "video", "combined", "fusion"];
+  const BALL_LAYERS = ["raw", "yolo", "consensus"];
   const LAYER_NAMES = {
     raw: "ATD bruto",
-    combined: "Combinado",
-    video: "Balón vídeo",
     yolo: "YOLO balón",
-    fusion: "Fusión",
+    consensus: "Consenso (ATD+YOLO)",
   };
   const LAYER_SHORT_NAMES = {
     raw: "ATD",
-    combined: "comb.",
-    video: "vídeo",
     yolo: "YOLO",
-    fusion: "fusión",
-  };
-  const SOURCE_STATUS_NAMES = {
-    observed: "observado",
-    estimated: "estimado",
-    abstain: "sin datos",
-    event: "evento",
-    unknown: "?",
+    consensus: "consenso",
   };
   const ui = {
     video: $("#video"),
@@ -71,15 +60,6 @@
     utName: $("#utName"),
     agreement: $("#agreement"),
     utAgreement: $("#utAgreement"),
-    fusionAgreement: $("#fusionAgreement"),
-    fusionBadge: $("#fusionBadge"),
-    fusionName: $("#fusionName"),
-    fusedBadge: $("#fusedBadge"),
-    fusedName: $("#fusedName"),
-    fusionConfidence: $("#fusionConfidence"),
-    fusionSummary: $("#fusionSummary"),
-    fusionStatus: $("#fusionStatus"),
-    sourceList: $("#sourceList"),
     spellText: $("#spellText"),
     spellDuration: $("#spellDuration"),
     tagText: $("#tagText"),
@@ -153,7 +133,7 @@
     switchFilter: "all",
     switchFrames: [],
     overlayEnabled: true,
-    layers: { raw: true, combined: true, video: true, yolo: true, fusion: true },
+    layers: { raw: true, yolo: true, consensus: true },
     yoloPlayersEnabled: true,
     yoloCandidatesEnabled: true,
     frameData: null,
@@ -301,14 +281,13 @@
   function layerData(frameData, layer) {
     if (!frameData) return null;
     if (frameData.layers && frameData.layers[layer]) return frameData.layers[layer];
-    if (layer === "combined") return frameData.ball || null;
     return null;
   }
 
   function layerSummary(frameData, compact = false, includeGap = true) {
     if (!frameData) return "cargando seguimiento…";
     const parts = [];
-    for (const layer of ["fusion", "combined", "video", "yolo", "raw"]) {
+    for (const layer of BALL_LAYERS) {
       if (!state.layers[layer]) continue;
       const data = layerData(frameData, layer);
       const source = data ? Number(data.source) : 2;
@@ -325,16 +304,13 @@
 
   function layerColor(layer, source, alpha = 1) {
     if (layer === "raw") return `rgba(244, 248, 251, ${alpha})`;
-    if (layer === "video") {
-      if (source === 1) return `rgba(255, 200, 87, ${alpha})`;
-      if (source === 3) return `rgba(85, 209, 135, ${alpha})`;
-      return `rgba(46, 220, 150, ${alpha})`;
-    }
     if (layer === "yolo") return `rgba(255, 180, 92, ${alpha})`;
-    if (layer === "fusion") return `rgba(232, 121, 249, ${alpha})`;
-    return source === 1
-      ? `rgba(255, 200, 87, ${alpha})`
-      : `rgba(244, 248, 251, ${alpha})`;
+    if (layer === "consensus") {
+      return source === 1
+        ? `rgba(167, 139, 250, ${alpha})`
+        : `rgba(232, 121, 249, ${alpha})`;
+    }
+    return `rgba(244, 248, 251, ${alpha})`;
   }
 
   function frameCachePut(frame, payload) {
@@ -374,15 +350,15 @@
       setText(ui.trackingStatus, loading, loading);
       return;
     }
-    const ball = frameData.ball || {};
+    const consensus = layerData(frameData, "consensus") || {};
     const features = frameData.features || {};
     const status = `frame ${formatFrame(frameData.frame)} · ${frameData.players.length} jugadores · ${layerSummary(frameData, false, false)}`;
     setText(ui.trackingStatus, status, status);
-    ui.ballState.textContent = `${sourceText(ball.source)}${ball.out_of_play ? " · fuera" : ""}`;
+    ui.ballState.textContent = `${sourceText(consensus.source)}${consensus.out_of_play ? " · fuera" : ""}`;
     ui.ballPosition.textContent =
-      ball.ex === null || ball.ex === undefined
+      consensus.x === null || consensus.x === undefined
         ? "—"
-        : `${numberText(ball.ex, 2)} , ${numberText(ball.ey, 2)} m`;
+        : `${numberText(consensus.x, 2)} , ${numberText(consensus.y, 2)} m`;
     ui.ballSpeed.textContent = numberText(features.ball_speed, 2, " m/s");
     ui.teamSpeed.textContent = numberText(features.team_speed, 2, " m/s");
     ui.nearPlayer.textContent =
@@ -430,7 +406,6 @@
     if (cached) {
       state.frameData = cached;
       updateExplorer();
-      updateFusionPanel();
       return;
     }
     if (state.frameData && state.frameData.frame === frame) {
@@ -453,7 +428,6 @@
         state.frameData = payload;
         state.frameDataError = false;
         updateExplorer();
-        updateFusionPanel();
         drawOverlay();
       })
       .catch((error) => {
@@ -505,10 +479,6 @@
     if (!frameData) return [];
     const trails = frameData.trails && frameData.trails[layer];
     if (trails && Array.isArray(trails[coordinates])) return trails[coordinates];
-    if (layer === "combined") {
-      const legacy = coordinates === "pitch" ? frameData.trail_pitch : frameData.trail;
-      return Array.isArray(legacy) ? legacy : [];
-    }
     return [];
   }
 
@@ -517,7 +487,7 @@
       const points = layerTrail(frameData, layer, coordinates);
       if (points.length < 2) continue;
       ctx.save();
-      ctx.lineWidth = layer === "combined" ? 1.8 : 1.3;
+      ctx.lineWidth = layer === "consensus" ? 1.8 : 1.3;
       for (let index = 1; index < points.length; index++) {
         const previous = points[index - 1];
         const current = points[index];
@@ -571,9 +541,11 @@
       return;
     }
     ctx.save();
-    if (layer === "fusion") {
-      // Diamond for the consensus/fused ball; it should read as a decision, not a detection.
+    if (layer === "consensus") {
+      // Diamond for the consensus ball; it should read as a decision, not a detection.
+      // A dashed edge marks the inertial prediction inside an observation gap.
       const radius = 8.6 * scale;
+      if (source === 1) ctx.setLineDash([3, 2]);
       ctx.beginPath();
       ctx.moveTo(x, y - radius);
       ctx.lineTo(x + radius, y);
@@ -583,6 +555,7 @@
       ctx.lineWidth = 2.2;
       ctx.strokeStyle = color;
       ctx.stroke();
+      ctx.setLineDash([]);
       ctx.beginPath();
       ctx.arc(x, y, 2.6 * scale, 0, Math.PI * 2);
       ctx.fillStyle = color;
@@ -590,27 +563,6 @@
       ctx.restore();
       return;
     }
-    const radius = (layer === "video" ? 7.2 : 8.2) * scale;
-    ctx.beginPath();
-    ctx.arc(x, y, radius, 0, Math.PI * 2);
-    ctx.lineWidth = layer === "combined" || layer === "video" ? 2 : 1.7;
-    if (source === 1) ctx.setLineDash([3, 2]);
-    ctx.strokeStyle = color;
-    ctx.stroke();
-    ctx.setLineDash([]);
-    if (layer === "video" && source === 3) {
-      // ATD anchor: a small tick above the ring marks a video track that is currently pinned.
-      ctx.beginPath();
-      ctx.moveTo(x, y - radius - 2.5 * scale);
-      ctx.lineTo(x, y - radius + 2.5 * scale);
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.3;
-      ctx.stroke();
-    }
-    ctx.beginPath();
-    ctx.arc(x, y, 2.2 * scale, 0, Math.PI * 2);
-    ctx.fillStyle = color;
-    ctx.fill();
     ctx.restore();
   }
 
@@ -961,8 +913,8 @@
       );
     }
 
-    const combined = layerData(frameData, "combined");
-    if (state.layers.combined && (!combined || combined.source === 2)) {
+    const consensus = layerData(frameData, "consensus");
+    if (state.layers.consensus && (!consensus || consensus.source === 2)) {
       const label = "balón perdido";
       ctx.save();
       ctx.font = `600 11px ${MONO}`;
@@ -1115,148 +1067,6 @@
     return Boolean(state.data) && frame >= state.data.public[0] && frame < state.data.public[1];
   }
 
-  function probabilityBars(probability) {
-    const bars = document.createElement("div");
-    bars.className = "source-bars";
-    for (let index = 0; index < 3; index++) {
-      const value = Math.max(0, Math.min(1, Number(probability[index]) || 0));
-      const segment = document.createElement("i");
-      segment.className = `bar-${LABELS[index]}`;
-      segment.style.flex = `${value} 1 0`;
-      bars.appendChild(segment);
-    }
-    return bars;
-  }
-
-  function updateFusionPanel() {
-    const data = state.data;
-    if (!data) return;
-    const frameData =
-      state.frameData && state.frameData.frame === state.frame ? state.frameData : null;
-    const fusion = frameData && frameData.fusion ? frameData.fusion : null;
-
-    if (!fusion || !fusion.available) {
-      if (data.fusion_available && state.fusionRendered) {
-        // The payload for this frame is still in flight while playback already moved:
-        // keep the last rendered panel. Blanking it every tick is what made the card
-        // flicker (same anti-flash rule as updatePitchStatus for the pitch map).
-        return;
-      }
-      setBadge(ui.fusionBadge, "X");
-      ui.fusionName.textContent = data.fusion_available ? "Cargando…" : "Sin cache";
-      setBadge(ui.fusedBadge, "X");
-      ui.fusedName.textContent = data.fusion_available ? "Cargando…" : "Sin cache";
-      ui.fusionConfidence.textContent = "—";
-      ui.fusionAgreement.textContent = data.fusion_available
-        ? "Frame de fusión cargando"
-        : "Cache de fusión no cargado · ejecuta `fusion` y reinicia el viewer";
-      ui.fusionAgreement.className = "agreement na";
-      ui.fusionStatus.textContent = data.fusion_available
-        ? `frame ${formatFrame(state.frame)} · cargando poll…`
-        : "Fusión no disponible";
-      ui.fusionSummary.textContent = data.fusion_available
-        ? "Esperando los votos del frame."
-        : "No hay votos que mostrar.";
-      ui.sourceList.replaceChildren();
-      const empty = document.createElement("div");
-      empty.className = "fusion-empty";
-      empty.textContent = data.fusion_available
-        ? "Cargando fuentes…"
-        : "Ejecuta `python -m possession_lab fusion` para generar outputs/fusion.npz.";
-      ui.sourceList.appendChild(empty);
-      return;
-    }
-
-    state.fusionRendered = true;
-    const code = LABELS[fusion.code] || "X";
-    setBadge(ui.fusionBadge, code);
-    ui.fusionName.textContent = NAMES[code] || "—";
-    setBadge(ui.fusedBadge, code);
-    ui.fusedName.textContent = NAMES[code] || "—";
-    ui.fusionConfidence.textContent = `${(Number(fusion.confidence || 0) * 100).toFixed(0)}%`;
-    const baseline = fusion.baseline_label || null;
-    const mainPred = codeAt(data.labels, state.frame);
-    let agreementText;
-    let agreementClass;
-    if (!baseline) {
-      agreementText = "HMM base no disponible en este frame";
-      agreementClass = "agreement na";
-    } else if (baseline === code) {
-      agreementText = `✓ fusión coincide con el HMM base (${baseline})`;
-      agreementClass = "agreement ok";
-    } else {
-      agreementText = `⚠ fusión difiere del HMM base (${baseline} → ${code})`;
-      agreementClass = "agreement warn";
-    }
-    if (mainPred && mainPred !== code) {
-      agreementText += ` · predicción principal ${mainPred}`;
-    }
-    ui.fusionAgreement.textContent = agreementText;
-    ui.fusionAgreement.className = agreementClass;
-    const sourceCount = Array.isArray(fusion.sources) ? fusion.sources.length : 0;
-    setText(
-      ui.fusionStatus,
-      `frame ${formatFrame(state.frame)} · ${sourceCount} fuentes · modo ${
-        fusion.combine_mode || "log"
-      }${baseline ? ` · HMM base ${baseline}` : ""}`,
-    );
-
-    const probability = fusion.fused_probability || [0, 0, 0];
-    const summary = [
-      `H ${(Number(probability[0]) * 100).toFixed(0)}%`,
-      `A ${(Number(probability[1]) * 100).toFixed(0)}%`,
-      `D ${(Number(probability[2]) * 100).toFixed(0)}%`,
-      fusion.event_dead ? "evento D" : "",
-    ].filter(Boolean).join(" · ");
-    ui.fusionSummary.replaceChildren(probabilityBars(probability));
-    const summaryText = document.createElement("span");
-    summaryText.textContent = summary;
-    ui.fusionSummary.appendChild(summaryText);
-
-    ui.sourceList.replaceChildren();
-    for (const source of fusion.sources || []) {
-      const row = document.createElement("div");
-      row.className = "source-row";
-      const statusName = source.status_name || "unknown";
-      if (statusName === "abstain") row.classList.add("abstain");
-      if (statusName === "estimated") row.classList.add("estimated");
-      if (statusName === "event") row.classList.add("event");
-
-      const head = document.createElement("div");
-      head.className = "source-row-head";
-      const name = document.createElement("span");
-      name.className = "source-name";
-      name.textContent = source.label || source.key || "fuente";
-      const status = document.createElement("span");
-      status.className = "source-status";
-      status.textContent = SOURCE_STATUS_NAMES[statusName] || statusName;
-      head.append(name, status);
-
-      const weight = document.createElement("span");
-      weight.className = "source-weight";
-      const numericWeight = Number(source.weight || 0);
-      if (source.role === "prior") weight.textContent = "prior";
-      else if (source.role === "override") weight.textContent = "override";
-      else if (source.role === "redundant") weight.textContent = `diagnóstico ${numericWeight.toFixed(2)}`;
-      else weight.textContent = numericWeight >= 0.001 ? `peso ${numericWeight.toFixed(2)}` : "peso 0";
-      weight.title = `Peso efectivo ${numericWeight.toFixed(4)}`;
-
-      row.append(head, weight, probabilityBars(source.probability || [0, 0, 0]));
-      const reason = document.createElement("span");
-      reason.className = "source-reason";
-      reason.textContent = source.reason || "";
-      reason.title = source.reason || "";
-      row.appendChild(reason);
-      ui.sourceList.appendChild(row);
-    }
-    if (!ui.sourceList.childElementCount) {
-      const empty = document.createElement("div");
-      empty.className = "fusion-empty";
-      empty.textContent = "El poll no tiene fuentes activas en este frame.";
-      ui.sourceList.appendChild(empty);
-    }
-  }
-
   function updateUI() {
     const data = state.data;
     if (!data || state.frame < 0) return;
@@ -1336,7 +1146,6 @@
     if (document.activeElement !== ui.frameInput) {
       ui.frameInput.value = String(frame);
     }
-    updateFusionPanel();
   }
 
   function renderMetrics() {

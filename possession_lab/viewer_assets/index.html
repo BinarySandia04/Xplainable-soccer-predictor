@@ -67,10 +67,8 @@
               <span><i class="pitch-dot dot-H"></i>Barcelona</span>
               <span><i class="pitch-dot dot-A"></i>Athletic</span>
               <span><i class="pitch-dot dot-atd"></i>ATD bruto</span>
-              <span><i class="pitch-dot dot-combined"></i>Combinado</span>
-              <span><i class="pitch-dot dot-video"></i>Balón vídeo</span>
               <span><i class="pitch-dot dot-yolo"></i>YOLO</span>
-              <span><i class="pitch-dot dot-fusion"></i>Fusión</span>
+              <span><i class="pitch-dot dot-consensus"></i>Consenso</span>
             </div>
           </div>
           <div class="layer-bar" role="group" aria-label="Capas de balón visibles">
@@ -79,28 +77,20 @@
               <input type="checkbox" data-layer="raw" checked>
               ATD bruto
             </label>
-            <label class="layer-toggle" title="ATD observado + extrapolación causal de ≤ 1,2 s; es la capa del modelo">
-              <input type="checkbox" data-layer="combined" checked>
-              Combinado
-            </label>
-            <label class="layer-toggle" title="Tracker propio sobre el video: detecta el balón con YOLO y rellena huecos del ATD">
-              <input type="checkbox" data-layer="video" checked>
-              Balón vídeo
-            </label>
             <label class="layer-toggle" title="Detecciones YOLO sports-ball tras la puerta física temporal + 2.ª etapa ByteTrack (recupera el balón en un parpadeo del detector) + guarda de oclusión de Kamble (rechaza el candidato sentado sobre un jugador). Traza la trayectoria continua del balón.">
               <input type="checkbox" data-layer="yolo" checked>
               YOLO balón
             </label>
-            <label class="layer-toggle" title="Balón de consenso del poll multi-fuente">
-              <input type="checkbox" data-layer="fusion" checked>
-              Fusión
+            <label class="layer-toggle" title="Balón de consenso: filtro de Kalman sobre las observaciones aceptadas de ATD e YOLO">
+              <input type="checkbox" data-layer="consensus" checked>
+              Consenso
             </label>
           </div>
           <div class="pitch-wrap">
             <canvas id="pitchMap" class="pitch-canvas" role="img" aria-label="Vista cenital del balón y los slots de jugadores en metros de cancha"></canvas>
             <div id="pitchEmpty" class="pitch-empty hidden">Seguimiento no disponible</div>
           </div>
-          <p class="fine-print">Vista directa del ATD en metros (105,3 × 68 m), sin homografía ni video. Los 46 slots son anónimos: el color indica el equipo del XML, no una identidad. <strong>ATD bruto</strong> solo dibuja observaciones; <strong>combinado</strong> usa ATD y rellena solo huecos de ≤ 1,2 s. Los puntos tenues son estimaciones, no observaciones.</p>
+          <p class="fine-print">Vista directa del ATD en metros (105,3 × 68 m), sin homografía ni video. Los 46 slots son anónimos: el color indica el equipo del XML, no una identidad. <strong>ATD bruto</strong> solo dibuja observaciones; <strong>YOLO balón</strong> es el tracker propio sobre el video; <strong>consenso</strong> fusiona ATD e YOLO con un Kalman de velocidad constante. Los puntos tenues son estimaciones, no observaciones.</p>
         </section>
 
         <section class="timeline-card" aria-label="Línea temporal del partido">
@@ -159,13 +149,6 @@
                 <span id="gtName" class="label-name">—</span>
               </div>
             </div>
-            <div class="label-cell fusion-label-cell">
-              <span class="eyebrow" title="Consenso del poll multi-fuente">Fusión</span>
-              <div class="label-line">
-                <span id="fusionBadge" class="badge badge-X">—</span>
-                <span id="fusionName" class="label-name">—</span>
-              </div>
-            </div>
             <div class="label-cell ut-cell">
               <span class="eyebrow">UT (User truth)</span>
               <div class="label-line">
@@ -176,7 +159,6 @@
           </div>
 
           <div id="agreement" class="agreement na">GT pública no disponible en este frame</div>
-          <div id="fusionAgreement" class="agreement na">Fusión no cargada</div>
           <div id="utAgreement" class="agreement na">UT sin etiqueta en este frame</div>
 
           <dl class="facts">
@@ -202,28 +184,7 @@
             <div><dt>Último toque</dt><dd id="touchState">—</dd></div>
             <div><dt>Evento</dt><dd id="eventState">—</dd></div>
           </dl>
-          <p class="fine-print">Proyección del ATD sobre el video con la homografía del frame. El explorador muestra el tracker combinado del modelo: ATD observado y extrapolación causal de ≤ 1,2 s. El mapa añade la capa ATD bruto para comparar, pero no cambia el modelo ni los eventos.</p>
-        </section>
-
-        <section id="fusionCard" class="card fusion-card" aria-label="Poll multi-fuente de posesión">
-          <div class="eyebrow">Poll multi-fuente · frame</div>
-          <div id="fusionStatus" class="muted small">Cargando consenso…</div>
-          <div class="fusion-head">
-            <div>
-              <span class="eyebrow">Decisión</span>
-              <div class="label-line">
-                <span id="fusedBadge" class="badge badge-X">—</span>
-                <span id="fusedName" class="label-name">—</span>
-              </div>
-            </div>
-            <div class="fusion-confidence" title="Confianza posterior de la secuencia HMM; las barras de resumen muestran la probabilidad fusionada del frame">
-              <span class="mono" id="fusionConfidence">—</span>
-              <span class="muted small">confianza HMM</span>
-            </div>
-          </div>
-          <div id="fusionSummary" class="muted small">Sin votos todavía.</div>
-          <div id="sourceList" class="source-list" aria-live="polite"></div>
-          <p class="fine-print">Cada fila es un voto independiente (probabilidad H/A/D y peso). El HMM ATD validado es el prior; el balón de vídeo y los jugadores YOLO pueden moverlo. Los eventos confirmados fuerzan <strong>D</strong>. Ninguna GT pública entra en el poll.</p>
+          <p class="fine-print">Proyección del ATD sobre el video con la homografía del frame. El explorador muestra el balón de consenso: Kalman de velocidad constante sobre las observaciones aceptadas del ATD y del tracker YOLO. La capa ATD bruto sirve para comparar, pero no cambia el modelo ni los eventos.</p>
         </section>
 
         <section id="explainCard" class="card explain-card" aria-label="Por qué el modelo cambió de estado">
