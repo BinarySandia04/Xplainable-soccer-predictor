@@ -547,6 +547,26 @@ class FrameStore:
             return None
         return values[frame]
 
+    def _roster_team(self, frame: int, x: float, y: float) -> int | None:
+        """Team of the nearest present tracking slot within 2 m — the file's roster
+        identity beats a failed jersey read; ``None`` when the tracker has nobody there."""
+        tk = self.tracking
+        i = min(max(int(frame), 0), self.n_frames - 1)
+        slots = np.flatnonzero(np.asarray(tk.player_present, dtype=bool)[i])
+        if slots.size == 0:
+            return None
+        pos = np.asarray(tk.players, dtype=np.float64)[i][slots]
+        with np.errstate(invalid="ignore"):
+            d = np.linalg.norm(pos - np.array([x, y], dtype=np.float64), axis=1)
+        finite = np.isfinite(d)
+        if not finite.any():
+            return None
+        j = int(np.nanargmin(np.where(finite, d, np.inf)))
+        if float(d[j]) > 2.0:
+            return None
+        team = int(tk.teams[slots[j]])
+        return team if team in (0, 1) else None
+
     def _atd_team(self, frame: int, index: int, x: float, y: float) -> int:
         """Team for an ATD dot, with a keeper relabelled by the goal he stands in.
 
@@ -927,13 +947,21 @@ class FrameStore:
             for player in sample.get("players", []):
                 if player.get("x") is None or player.get("y") is None:
                     continue
+                team = int(player.get("team", -1))
+                if not bool(player.get("official", False)):
+                    # the jersey classifier loses both teams when the light fails
+                    # (measured 155 945: everyone blue); the tracking file carries the
+                    # roster identity - when it recognises this player, it decides
+                    roster = self._roster_team(frame, float(player["x"]), float(player["y"]))
+                    if roster is not None:
+                        team = roster
                 video_players.append(
                     {
                         "x": player.get("x"),
                         "y": player.get("y"),
                         "px": player.get("px"),
                         "py": player.get("py"),
-                        "team": int(player.get("team", -1)),
+                        "team": team,
                         "team_confidence": _finite(player.get("team_confidence")),
                         "confidence": _finite(player.get("confidence")),
                         "track": int(player.get("track", -1)),

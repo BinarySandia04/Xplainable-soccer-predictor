@@ -1302,5 +1302,158 @@ class RawPoolTests(unittest.TestCase):
         self.assertGreater(raw_evidence_pool(prob, weight)[:, 0].min(), evidence_probability(prob, weight)[:, 0].min())
 
 
+class BallLostMaskTests(unittest.TestCase):
+    """A consensus with no active voter for a second is a ball the system lost."""
+
+    def test_sustained_zero_confidence_marks_the_whole_run(self):
+        from possession_lab.fusion.transitions import ball_lost_mask
+
+        conf = np.ones(200)
+        conf[100:130] = 0.0
+        m = ball_lost_mask(conf, min_frames=25)
+        self.assertTrue(bool(m[100:130].all()))
+        self.assertFalse(bool(m[:100].any() or m[130:].any()))
+
+    def test_short_blip_is_not_lost(self):
+        from possession_lab.fusion.transitions import ball_lost_mask
+
+        conf = np.ones(200)
+        conf[100:115] = 0.0
+        self.assertFalse(bool(ball_lost_mask(conf, min_frames=25).any()))
+
+
+class OutOfBoundsMaskTests(unittest.TestCase):
+    """A ball that stays past the touchline is out of play, tag or no tag."""
+
+    @staticmethod
+    def _ball(n=200):
+        y = np.full(n, 30.0)
+        y[100:135] = -4.0  # over the side line for 35 frames
+        return np.stack([np.full(n, 50.0), y], axis=1)
+
+    def test_outside_run_marks_dead(self):
+        from possession_lab.fusion.transitions import out_of_bounds_mask
+
+        m = out_of_bounds_mask(self._ball(), (105.0, 68.0), margin_m=0.8, min_frames=25)
+        self.assertTrue(bool(m[100:135].all()))
+        self.assertFalse(bool(m[:100].any() or m[135:].any()))
+
+    def test_ball_on_the_line_stays_live(self):
+        from possession_lab.fusion.transitions import out_of_bounds_mask
+
+        ball = self._ball()
+        ball[:, 1] = 68.4  # half over the chalk, inside the margin
+        m = out_of_bounds_mask(ball, (105.0, 68.0), margin_m=0.8, min_frames=25)
+        self.assertFalse(bool(m.any()))
+
+    def test_short_excursion_is_live(self):
+        from possession_lab.fusion.transitions import out_of_bounds_mask
+
+        ball = self._ball()
+        ball[100:112, 1] = -4.0
+        ball[112:135, 1] = 20.0
+        m = out_of_bounds_mask(ball, (105.0, 68.0), margin_m=0.8, min_frames=25)
+        self.assertFalse(bool(m.any()))
+
+    def test_nan_breaks_the_run(self):
+        from possession_lab.fusion.transitions import out_of_bounds_mask
+
+        ball = self._ball()
+        ball[115:120, 1] = np.nan
+        m = out_of_bounds_mask(ball, (105.0, 68.0), margin_m=0.8, min_frames=25)
+        self.assertFalse(bool(m.any()))
+
+
+class PitchContradictionGateTests(unittest.TestCase):
+    """Box overlap at depth must not claim a ball a player is standing on.
+
+    Measured 136 891: the ball pixel sat inside Barcelona players' boxes for four
+    frames while an Athletic player was 0.4 m from the ball and his side led the
+    raw pool -1 (the pixel side 4.5 m away); the contact punctured a settled H
+    spell.  The pitch distance between the nearest players of each side to the
+    ball decides the tie the pixel geometry cannot.
+    """
+
+    @staticmethod
+    def world(n=220):
+        codes = np.where(np.arange(n) < 108, H, A).astype(np.int8)  # boundary near the contact
+        prob = np.zeros((n, 3))
+        prob[:, 1] = 1.0  # the fused poll catches up on A: the momentum gate is open
+        contain = np.zeros(n, dtype=np.int8)
+        contain[96:101] = 2  # A boxes contain the ball pixel: run of 5, ends at frame 100
+        contact = [(100, 5.0, 1, 1.0)]
+        dead = np.zeros(n, dtype=bool)
+        return codes, prob, contain, contact, dead
+
+    def test_contact_dropped_when_the_other_side_is_on_the_ball(self):
+        codes, prob, contain, contact, dead = self.world()
+        pitch_close = np.full((len(codes), 2), 3.0)
+        pitch_close[100] = [0.5, 4.6]  # H on the ball, the containing side 4 m away
+        kept, ivs = gate_pixel_events(contact, [], contain, codes, prob, dead, [], pitch_close=pitch_close)
+        self.assertEqual(kept, [])
+        self.assertEqual(ivs, [])
+
+    def test_contact_kept_when_its_side_is_closer(self):
+        codes, prob, contain, contact, dead = self.world()
+        pitch_close = np.full((len(codes), 2), 3.0)
+        pitch_close[100] = [4.6, 0.5]
+        kept, ivs = gate_pixel_events(contact, [], contain, codes, prob, dead, [], pitch_close=pitch_close)
+        self.assertEqual(len(kept), 1)
+        self.assertTrue(ivs)
+
+    def test_no_pitch_data_no_veto(self):
+        codes, prob, contain, contact, dead = self.world()
+        kept, _ = gate_pixel_events(contact, [], contain, codes, prob, dead, [])
+        self.assertEqual(len(kept), 1)
+
+
+class RelabelTeamsFromTrackingTests(unittest.TestCase):
+    """The tracking file carries each slot's roster team — the authority the jersey
+    classifier loses when the light fails (measured 155 945: every visible player
+    labelled Barcelona, eight more unknown)."""
+
+    def test_matched_detections_adopt_the_roster_team(self):
+        from possession_lab.perception import relabel_teams_from_tracking
+
+        pitch = np.array([[[10.0, 20.0], [50.0, 10.0], [70.0, 40.0]]])
+        present = np.array([[True, True, True]])
+        teams = np.array([[0, 0, 0]], dtype=np.int8)
+        track_xy = np.array([[[10.2, 20.1], [49.5, 10.5], [30.0, 30.0]]])
+        track_teams = np.array([1, 0, 1], dtype=np.int8)
+        track_present = np.array([[True, True, False]])
+        out = relabel_teams_from_tracking(
+            pitch, present, teams, track_xy, track_teams, track_present, (105.0, 68.0)
+        )
+        self.assertEqual(out[0].tolist(), [1, 0, 0])  # slot 3 not present: raw label stands
+
+    def test_off_pitch_ghost_slot_is_never_a_match(self):
+        from possession_lab.perception import relabel_teams_from_tracking
+
+        pitch = np.array([[[10.0, 70.9]]])
+        present = np.array([[True]])
+        teams = np.array([[0]], dtype=np.int8)
+        track_xy = np.array([[[10.0, 71.0]]])
+        track_teams = np.array([1], dtype=np.int8)
+        track_present = np.array([[True]])
+        out = relabel_teams_from_tracking(
+            pitch, present, teams, track_xy, track_teams, track_present, (105.0, 68.0)
+        )
+        self.assertEqual(out[0].tolist(), [0])
+
+    def test_far_detection_keeps_its_own_label(self):
+        from possession_lab.perception import relabel_teams_from_tracking
+
+        pitch = np.array([[[40.0, 20.0]]])
+        present = np.array([[True]])
+        teams = np.array([[-1]], dtype=np.int8)
+        track_xy = np.array([[[45.0, 20.0]]])
+        track_teams = np.array([1], dtype=np.int8)
+        track_present = np.array([[True]])
+        out = relabel_teams_from_tracking(
+            pitch, present, teams, track_xy, track_teams, track_present, (105.0, 68.0)
+        )
+        self.assertEqual(out[0].tolist(), [-1])
+
+
 if __name__ == "__main__":
     unittest.main()
