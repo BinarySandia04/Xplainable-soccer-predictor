@@ -411,7 +411,11 @@
             .map((event) =>
               event.type === "goal"
                 ? `GOL · ${event.kind}`
-                : `PARADA · ${event.trigger}`,
+                : `PARADA · ${event.trigger} · ${formatFrame(event.start)}–${formatFrame(event.end)}${
+                    event.restart === null || event.restart === undefined
+                      ? ""
+                      : ` · saque ${formatFrame(event.restart)}`
+                  }`,
             )
             .join(" · ");
   }
@@ -1449,15 +1453,47 @@
     for (const event of data.events || []) {
       if (event.type === "stoppage") {
         const x = xOf(event.start);
-        if (x < 0 || x > width) continue;
-        ctx.strokeStyle = "rgba(255,200,87,0.5)";
-        ctx.lineWidth = 1;
-        ctx.setLineDash([3, 4]);
-        ctx.beginPath();
-        ctx.moveTo(x + 0.5, 0);
-        ctx.lineTo(x + 0.5, height);
-        ctx.stroke();
-        ctx.setLineDash([]);
+        if (x >= 0 && x <= width) {
+          ctx.strokeStyle = "rgba(255,200,87,0.5)";
+          ctx.lineWidth = 1;
+          ctx.setLineDash([3, 4]);
+          ctx.beginPath();
+          ctx.moveTo(x + 0.5, 0);
+          ctx.lineTo(x + 0.5, height);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+        const end = xOf(event.end);
+        if (end >= 0 && end <= width) {
+          ctx.strokeStyle = "rgba(255,200,87,0.28)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(end + 0.5, 0);
+          ctx.lineTo(end + 0.5, height);
+          ctx.stroke();
+          ctx.fillStyle = "rgba(255,200,87,0.6)";
+          ctx.fillRect(end - 1.5, height - 4, 3, 4);
+        }
+        const kick =
+          event.restart === null || event.restart === undefined ? null : xOf(event.restart);
+        if (kick !== null && kick >= 0 && kick <= width) {
+          ctx.strokeStyle = "rgba(140,214,255,0.35)";
+          ctx.lineWidth = 1;
+          ctx.setLineDash([1, 3]);
+          ctx.beginPath();
+          ctx.moveTo(kick + 0.5, 0);
+          ctx.lineTo(kick + 0.5, height);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = "rgba(140,214,255,0.9)";
+          ctx.beginPath();
+          ctx.moveTo(kick, 1);
+          ctx.lineTo(kick + 3.5, 5);
+          ctx.lineTo(kick, 9);
+          ctx.lineTo(kick - 3.5, 5);
+          ctx.closePath();
+          ctx.fill();
+        }
       } else if (event.type === "goal") {
         const x = xOf(event.frame);
         if (x < 0 || x > width) continue;

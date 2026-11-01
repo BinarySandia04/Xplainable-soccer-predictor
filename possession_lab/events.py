@@ -84,6 +84,7 @@ class StopEvent:
     whistle_peak: float | None = None
     low_start: int | None = None
     low_stop: int | None = None
+    restart: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +97,7 @@ class StopEvent:
             "whistle_peak": None if self.whistle_peak is None else float(self.whistle_peak),
             "low_start": None if self.low_start is None else int(self.low_start),
             "low_stop": None if self.low_stop is None else int(self.low_stop),
+            "restart": None if self.restart is None else int(self.restart),
         }
 
 
@@ -181,6 +183,10 @@ def _merge_stop_events(candidates: list[StopEvent]) -> list[StopEvent]:
                     previous.low_start if previous.low_start is not None else event.low_start
                 ),
                 low_stop=previous.low_stop if previous.low_stop is not None else event.low_stop,
+                restart=max(
+                    (frame for frame in (previous.restart, event.restart) if frame is not None),
+                    default=None,
+                ),
             )
         else:
             merged.append(event)
@@ -459,6 +465,46 @@ def _restart_end(
     return None
 
 
+def _restart_kick(
+    start: int,
+    end: int,
+    present: np.ndarray,
+    ball_speed: np.ndarray,
+    near_distance: np.ndarray,
+) -> int | None:
+    """First slow-to-fast kick after ``start``, for the viewer's restart marker.
+
+    Display metadata only: this never trims the stoppage.  Unlike :func:`_restart_end` it does not
+    require the ball near a touchline, because a goal kick is taken well inside the box (measured
+    131 427: ball at x=11.0 m, 1.1 m from the goalkeeper, 22.3 m/s) and the edge gate made the
+    restart invisible exactly where the user looks for it.
+    """
+    n = present.size
+    lo = max(start + FPS // 2, 0)
+    hi = min(n, int(end))
+    hits = 0
+    for k in range(lo, hi):
+        fast = (
+            present[k]
+            and np.isfinite(ball_speed[k])
+            and ball_speed[k] > STOP_RESTART_SPEED
+            and np.isfinite(near_distance[k])
+            and near_distance[k] < STOP_RESTART_CONTROL_R
+        )
+        if not fast:
+            hits = 0
+            continue
+        before = np.asarray(ball_speed[max(lo, k - 3) : k], dtype=np.float64)
+        still_before = bool(np.isfinite(before).any() and np.nanmin(before) < STOP_RESTART_SPEED)
+        if not still_before:
+            hits = 0
+            continue
+        hits += 1
+        if hits >= STOP_RESTART_FRAMES:
+            return k - hits + 1
+    return None
+
+
 def _control_resume(
     start: int,
     limit: int,
@@ -548,11 +594,15 @@ def detect_stoppages(
             end = min(end, int(restart))
         if end <= start:
             return None
+        kick = _restart_kick(start, end, present, ball_speed, near_distance)
+        if kick is not None and not (start < kick < end - 5):
+            kick = None
         return StopEvent(
             start=int(start),
             end=int(end),
             trigger=trigger,
             confidence=float(confidence),
+            restart=kick,
             **kwargs,
         )
 
@@ -714,6 +764,9 @@ def detect_stoppages(
         restart = min((k for k in kickoffs if event.start <= k < event.end), default=None)
         if restart is not None and restart > event.start:
             event = replace(event, end=int(restart))
+        kick = event.restart if event.restart is not None and event.restart < event.end else None
+        if kick != event.restart:
+            event = replace(event, restart=kick)
         if event.end > event.start:
             trimmed.append(event)
     return tuple(trimmed)

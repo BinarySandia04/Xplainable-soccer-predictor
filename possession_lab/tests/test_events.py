@@ -14,6 +14,7 @@ from possession_lab.events import (
     EventData,
     StopEvent,
     _merge_stop_events,
+    _restart_kick,
     _run_end_containing,
     apply_event_overrides,
     detect_goals,
@@ -301,6 +302,29 @@ class MergeStopEventsTest(unittest.TestCase):
         second = StopEvent(start=50, end=200, trigger="low_motion", confidence=0.4, low_start=40)
         merged = _merge_stop_events([first, second])
         self.assertEqual(merged[0].low_start, 40)
+
+
+class RestartKickTest(unittest.TestCase):
+    """The viewer's restart marker needs the slow-to-fast kick, even away from a touchline."""
+
+    def test_goal_kick_after_a_still_ball_is_found(self):
+        n = 40
+        present = np.ones(n, dtype=bool)
+        ball_speed = np.zeros(n, dtype=np.float64)
+        ball_speed[20:22] = 20.0
+        near_distance = np.ones(n, dtype=np.float64)
+        self.assertEqual(_restart_kick(5, 30, present, ball_speed, near_distance), 20)
+
+    def test_a_run_that_is_already_fast_has_no_restart_marker(self):
+        n = 40
+        present = np.ones(n, dtype=bool)
+        ball_speed = np.full(n, 20.0, dtype=np.float64)
+        near_distance = np.ones(n, dtype=np.float64)
+        self.assertIsNone(_restart_kick(5, 30, present, ball_speed, near_distance))
+
+    def test_to_dict_carries_the_restart_frame(self):
+        event = StopEvent(start=10, end=50, trigger="whistle", confidence=0.8, restart=32)
+        self.assertEqual(event.to_dict()["restart"], 32)
 
 
 if __name__ == "__main__":
