@@ -498,6 +498,11 @@ class FrameStore:
         self.fusion = fusion
         self.trail_frames = max(1, int(trail_frames))
         self.n_frames = int(tracking.n_frames)
+        # One float64 view of the roster positions for the relabel lookup: converting
+        # (199 319 x 46 x 2) per call, once per video player per frame, cost 3 GB of
+        # memcpy per served frame and made every request take 400 ms.
+        self._tk_players = np.asarray(tracking.players, dtype=np.float64)
+        self._tk_present = np.asarray(tracking.player_present, dtype=bool)
         # ATD swaps or freezes its keeper slots under pressure (measured 19 814: the Barcelona
         # keeper is carried by Athletic's roster slot).  The roster geometry still says which
         # team defends each goal, so the 2D dots can relabel a keeper by the area he stands in.
@@ -552,10 +557,10 @@ class FrameStore:
         identity beats a failed jersey read; ``None`` when the tracker has nobody there."""
         tk = self.tracking
         i = min(max(int(frame), 0), self.n_frames - 1)
-        slots = np.flatnonzero(np.asarray(tk.player_present, dtype=bool)[i])
+        slots = np.flatnonzero(self._tk_present[i])
         if slots.size == 0:
             return None
-        pos = np.asarray(tk.players, dtype=np.float64)[i][slots]
+        pos = self._tk_players[i][slots]
         with np.errstate(invalid="ignore"):
             d = np.linalg.norm(pos - np.array([x, y], dtype=np.float64), axis=1)
         finite = np.isfinite(d)
