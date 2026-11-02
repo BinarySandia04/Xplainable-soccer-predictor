@@ -223,6 +223,10 @@ class TransitionParams:
     revive_min_frames: int = 25  # frames of live-play evidence before reopening
     revive_gap_min: float = 0.2  # raw pool margin the tagged team must command
     revive_speed_min: float = 1.5  # m/s of the consensus ball proving play is live
+    # the ball-state revival: a player at the ball + pool backing reopens the lock
+    revive_touch_dist_m: float = 2.0  # how close a player must be to own the ball
+    revive_touch_cov: float = 0.7  # share of each second's frame holding that glue
+    revive_touch_gap: float = 0.1  # raw pool margin the gluing player's team needs
 
 
 DEFAULT_TRANSITION_PARAMS = TransitionParams()
@@ -735,7 +739,7 @@ def raw_evidence_pool(
 
 def _bool_runs(mask: np.ndarray) -> list[tuple[int, int]]:
     """Maximal ``[start, stop)`` runs of True in a boolean mask."""
-    d = np.diff(np.r_[0, np.asarray(mask, dtype=np.int8)])
+    d = np.diff(np.r_[0, np.asarray(mask, dtype=np.int8), 0])
     return list(zip(np.flatnonzero(d == 1).tolist(), np.flatnonzero(d == -1).tolist()))
 
 
@@ -877,6 +881,87 @@ def dead_revival_mask(
         if e - s >= int(min_frames):
             mask[s:e] = True
             out_team[s:e] = team[s]
+    return mask, out_team
+
+
+def possession_revival_mask(
+    ball_pitch: np.ndarray,
+    players: np.ndarray,
+    player_present: np.ndarray,
+    player_teams: np.ndarray,
+    evidence_pool: np.ndarray,
+    pitch: tuple[float, float],
+    blocked: np.ndarray,
+    dist_max: float = 2.0,
+    hold_cov: float = 0.7,
+    gap_min: float = 0.1,
+    speed_min: float = 1.5,
+    min_frames: int = 25,
+    hold_half: int = 25,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Frames where a dead-ball lock sat on top of a player who was simply playing.
+
+    The events ballot pins ``D`` while a false stoppage lasts and neither the smart
+    tags nor any voter can reach the label.  The ball's own state can: a player of
+    one team is at the ball (``dist_max``), the ball is on the grass and moving
+    (``speed_min``) and the raw pool backs that same player's team (``gap_min``) —
+    for a ``hold_cov`` share of every ``hold_half``-frame neighbourhood and at
+    least ``min_frames`` in a row.  The pool condition is what keeps goal
+    celebrations out (the crowd around the ball belongs to the scoring team, but
+    while the play is really dead the pool has collapsed onto D); ``blocked``
+    frames — setpiece tags, a ball the cameras lost, a ball out of bounds — never
+    revive.  Measured 170 623: Athletic's BUILD UP carried the ball 17 m while the
+    label sat dead; 143 488 filled the hole between the false out and the tag's
+    start; inside the public window the rule touches zero frames.
+    """
+    b = np.asarray(ball_pitch, dtype=np.float64)
+    pl = np.asarray(players, dtype=np.float64)
+    present = np.asarray(player_present, dtype=bool)
+    team_of = np.asarray(player_teams, dtype=np.int8)
+    pool = np.asarray(evidence_pool, dtype=np.float64)
+    n = b.shape[0]
+    fin = np.isfinite(b).all(axis=1)
+    d = np.linalg.norm(pl - b[:, None, :], axis=2)
+    d[~present] = np.inf
+    d[~fin] = np.inf
+    dmin = d.min(axis=1)
+    nearest = team_of[np.clip(np.argmin(d, axis=1), 0, team_of.shape[0] - 1)]
+    length, width = float(pitch[0]), float(pitch[1])
+    inside = (
+        fin
+        & (b[:, 0] > -0.3) & (b[:, 0] < length + 0.3)
+        & (b[:, 1] > -0.3) & (b[:, 1] < width + 0.3)
+    )
+    speed = np.full(n, np.nan, dtype=np.float64)
+    ok = fin[1:] & fin[:-1]
+    speed[1:][ok] = np.linalg.norm((b[1:] - b[:-1])[ok], axis=1) * FPS
+    gap = np.abs(pool[:, 1] - pool[:, 0])
+    winner = np.argmax(pool[:, :2], axis=1)
+    glue = (
+        inside
+        & np.isfinite(speed)
+        & (speed >= float(speed_min))
+        & (dmin <= float(dist_max))
+        & (nearest >= 0) & (nearest < 2)
+        & (winner == nearest)
+        & (gap >= float(gap_min))
+        & ~np.asarray(blocked, dtype=bool)
+    )
+    kernel = np.ones(2 * int(hold_half) + 1)
+    cov = np.convolve(glue.astype(np.float64), kernel, mode="same") / np.convolve(
+        np.ones(n), kernel, mode="same"
+    )
+    mask = np.zeros(n, dtype=bool)
+    out_team = np.full(n, -1, dtype=np.int8)
+    for s, e in _bool_runs(cov >= float(hold_cov)):
+        if e - s < int(min_frames):
+            continue
+        teams_in = nearest[s:e][glue[s:e]]
+        if not len(teams_in):
+            continue
+        vals, counts = np.unique(teams_in, return_counts=True)
+        mask[s:e] = True
+        out_team[s:e] = int(vals[int(np.argmax(counts))])
     return mask, out_team
 
 
@@ -2113,6 +2198,7 @@ __all__ = [
     "keeper_holds",
     "KeeperHold",
     "out_of_bounds_mask",
+    "possession_revival_mask",
     "pixel_contact",
     "raw_evidence_pool",
 ]

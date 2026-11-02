@@ -1555,5 +1555,89 @@ class DeadRevivalMaskTests(unittest.TestCase):
         self.assertFalse(mask.any())
 
 
+class PossessionRevivalMaskTests(unittest.TestCase):
+    """A dead lock reopens when a player is simply playing the ball."""
+
+    @staticmethod
+    def scene(n: int = 200):
+        ball = np.zeros((n, 2), dtype=np.float64)
+        ball[:, 0] = np.arange(n) * (2.0 / 25.0)  # 2 m/s along x, on the grass
+        ball[:, 1] = 10.0
+        players = np.full((n, 2, 2), np.nan, dtype=np.float64)
+        players[:, 0] = ball + 0.5  # an A player at the ball all along
+        players[:, 1] = [100.0, 40.0]  # an H player far away
+        present = np.ones((n, 2), dtype=bool)
+        teams = np.array([1, 0], dtype=np.int8)
+        pool = np.tile([0.05, 0.75, 0.02], (n, 1))  # the pool backs A by 0.70
+        return ball, players, present, teams, pool
+
+    def run_case(self, **kw):
+        from possession_lab.fusion.transitions import possession_revival_mask
+
+        ball, players, present, teams, pool = self.scene()
+        return possession_revival_mask(
+            ball, players, present, teams, pool, (105.0, 68.0), np.zeros(len(ball), bool), **kw
+        )
+
+    def test_player_at_the_ball_reopens_the_lock(self):
+        mask, team = self.run_case()
+        # the coverage kernel normalises by the frames actually present, so glue
+        # that holds from the first second owns its edges
+        self.assertTrue(mask.all())
+        self.assertTrue((team == 1).all())
+
+    def test_pool_against_the_player_never_reopens(self):
+        from possession_lab.fusion.transitions import possession_revival_mask
+
+        ball, players, present, teams, _ = self.scene()
+        pool = np.tile([0.75, 0.05, 0.02], (len(ball), 1))  # pool backs H, player is A
+        mask, _ = possession_revival_mask(
+            ball, players, present, teams, pool, (105.0, 68.0), np.zeros(len(ball), bool)
+        )
+        self.assertFalse(mask.any())
+
+    def test_stationary_ball_never_reopens(self):
+        from possession_lab.fusion.transitions import possession_revival_mask
+
+        ball, players, present, teams, pool = self.scene()
+        ball[:, 0] = 50.0  # parked: not play
+        players[:, 0, 0] = 50.5
+        mask, _ = possession_revival_mask(
+            ball, players, present, teams, pool, (105.0, 68.0), np.zeros(len(ball), bool)
+        )
+        self.assertFalse(mask.any())
+
+    def test_blocked_frames_never_reopen(self):
+        from possession_lab.fusion.transitions import possession_revival_mask
+
+        ball, players, present, teams, pool = self.scene()
+        blocked = np.zeros(len(ball), dtype=bool)
+        blocked[:] = True  # a real setpiece covers the window
+        mask, _ = possession_revival_mask(
+            ball, players, present, teams, pool, (105.0, 68.0), blocked
+        )
+        self.assertFalse(mask.any())
+
+    def test_no_player_near_the_ball_never_reopens(self):
+        from possession_lab.fusion.transitions import possession_revival_mask
+
+        ball, players, present, teams, pool = self.scene()
+        players[:, 0] = [100.0, 40.0]  # nobody at the ball
+        mask, _ = possession_revival_mask(
+            ball, players, present, teams, pool, (105.0, 68.0), np.zeros(len(ball), bool)
+        )
+        self.assertFalse(mask.any())
+
+    def test_short_glue_run_does_not_reopen(self):
+        from possession_lab.fusion.transitions import possession_revival_mask
+
+        ball, players, present, teams, pool = self.scene()
+        players[:170, 0] = [100.0, 40.0]  # the glue lasts barely 30 frames
+        mask, _ = possession_revival_mask(
+            ball, players, present, teams, pool, (105.0, 68.0), np.zeros(len(ball), bool)
+        )
+        self.assertFalse(mask.any())
+
+
 if __name__ == "__main__":
     unittest.main()

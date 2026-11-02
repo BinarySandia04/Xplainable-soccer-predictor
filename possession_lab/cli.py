@@ -506,6 +506,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         events_to_rows,
         evidence_probability,
         out_of_bounds_mask,
+        possession_revival_mask,
         raw_evidence_pool,
     )
     from .fusion.voters import ROLE_BY_KEY
@@ -703,13 +704,34 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     )
     revived &= result.codes == _D_CODE  # reopen a false lock; never overrule a live label
     result.codes[revived] = revived_team[revived]
+    # the ball's own state gets the last word over its own lock: a player at the ball,
+    # the ball rolling, and the voters backing that player's team means the game is on,
+    # whatever false trigger pinned the label (measured 170 623: Athletic's build-up
+    # carried the ball 17 m while the label sat dead; 143 488 and 143 990 stitched the
+    # hole around the 143 524 tag revival; zero frames inside the public window)
+    touched, touched_team = possession_revival_mask(
+        arrays["consensus_ball"].astype(np.float64),
+        np.asarray(lab.tracking.players, dtype=np.float64),
+        np.asarray(lab.tracking.player_present, dtype=bool),
+        np.asarray(lab.tracking.teams, dtype=np.int8),
+        pool,
+        tuple(lab.tracking.pitch),
+        out_of_play | np.asarray(lab.tags.setpiece, dtype=bool),
+        dist_max=float(params.revive_touch_dist_m),
+        hold_cov=float(params.revive_touch_cov),
+        gap_min=float(params.revive_touch_gap),
+        speed_min=float(params.revive_speed_min),
+        min_frames=int(params.revive_min_frames),
+    )
+    touched &= result.codes == _D_CODE  # same rule: reopen dead frames, never a live label
+    result.codes[touched] = touched_team[touched]
     print(
         f"transitions: {result.n_kicks} kicks + {result.n_onsets} onsets detected, "
         f"{result.n_contact} contacts + {result.n_kicker} win-and-clear kicks + {result.n_hold} keeper holds "
         f"+ {result.n_area} area catches from boxes, {result.n_control} spell expiries, "
         f"{result.n_gated_out} gated out -> {len(result.events)} transition events; "
         f"{int(out_of_play.sum()):,} frames of lost/out-of-bounds ball marked D; "
-        f"{int(revived.sum()):,} frames revived by live tags"
+        f"{int(revived.sum()):,} frames revived by live tags, {int(touched.sum()):,} by a player at the ball"
     )
     events_path = output_dir / "transition_events.csv"
     rows = events_to_rows(result.events)
