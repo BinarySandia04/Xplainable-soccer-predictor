@@ -500,9 +500,14 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         BoxEvidence,
         apply_transition_layer,
         ball_conflict_mask,
+        ball_lost_mask,
         ball_stale_mask,
+        dead_revival_mask,
         events_to_rows,
         evidence_probability,
+        out_of_bounds_mask,
+        possession_revival_mask,
+        raw_evidence_pool,
     )
     from .fusion.voters import ROLE_BY_KEY
     from .pipeline import active_halves, load_lab, validate_codes, write_submission
@@ -539,6 +544,20 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                 if "players_official" in z:
                     # officials are not players: no teams, no pixel box evidence
                     vpresent = vpresent & ~np.asarray(z["players_official"], dtype=bool)
+                from .perception import relabel_teams_from_tracking
+
+                # the jersey classifier loses both teams when the light fails (measured
+                # 155 945); the tracking file carries every slot's roster identity — it
+                # is the authority for who wears what whenever it recognises the player
+                vteam = relabel_teams_from_tracking(
+                    vpitch,
+                    vpresent,
+                    vteam,
+                    np.asarray(lab.tracking.players, dtype=np.float64),
+                    np.asarray(lab.tracking.teams),
+                    np.asarray(lab.tracking.player_present, dtype=bool),
+                    tuple(lab.tracking.pitch),
+                )
                 box_evidence = None
                 if not args.no_box and "players_box" in z:
                     yolo_all = np.asarray(z["yolo_ball_pixel"])
@@ -610,6 +629,22 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     ):
         relay_ballots = {key: (arrays[f"src_{key}_probability"], arrays[f"src_{key}_weight"]) for key in relay_keys}
     params = replace(DEFAULT_TRANSITION_PARAMS, relay_min_prob=float(args.relay_min_prob))
+    # play the tags missed: nobody possesses a ball the camera has lost for a second
+    # or that sits over the chalk (measured 163 282: conf 0.00, the consensus coasting
+    # to y = -59 m across the stoppage while spells traded hands)
+    from .config import D as _D_CODE
+
+    out_of_play = ball_lost_mask(
+        arrays["consensus_confidence"].astype(np.float64),
+        min_frames=int(params.lost_min_frames),
+        eps=float(params.lost_conf_eps),
+    ) | out_of_bounds_mask(
+        arrays["consensus_ball"].astype(np.float64),
+        tuple(lab.tracking.pitch),
+        margin_m=float(params.oob_margin_m),
+        min_frames=int(params.oob_min_frames),
+    )
+    event_dead = event_dead | out_of_play
     # the keeper-hold channel reads the half-level keeper roster geometry: which team
     # defends each goal; the hold itself is detected in pixel evidence (see keeper_holds)
     keeper_defenders = None
@@ -620,6 +655,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
             lab.tracking.players, lab.tracking.teams, tuple(lab.tracking.pitch), GRADED_HALVES
         ).team
         params = replace(params, keeper_hold_min_frames=int(args.keeper_hold_min_frames))
+    pool = raw_evidence_pool(probabilities, weights)
     result = apply_transition_layer(
         codes_pooled=arrays["codes"].astype(np.int8),
         fused_probability=arrays["fused_probability"].astype(np.float64),
@@ -640,15 +676,66 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         dead_support=event_dead | np.asarray(lab.tags.setpiece, dtype=bool),
         halves=halves,
         params=params,
+        evidence_pool=pool,
     )
+    result.codes[out_of_play] = _D_CODE  # nobody possesses a ball that is not on the pitch
+    # the false-stoppage escape: while the events ballot pins D, no voter can reopen the
+    # label — but the tags can. A live-phase tag naming the team the voters already back,
+    # ball on the grass and moving, means the "out" never happened (measured 143 524: an
+    # ATD excursion 4 m past the chalk held D for 16 s while Athletic drove forward;
+    # 116 791: a decimetre of calibration noise over the chalk punctured live Barça
+    # possession in the box). Revival only reopens dead frames — never a live label
+    live_tags = [
+        (int(ev.start_frame), int(ev.stop_frame), int(ev.team),
+         ev.code in ("PROGRESSION", "CREATING CHANCES"))
+        for ev in lab.tags.events
+        if ev.code in ("PROGRESSION", "CREATING CHANCES", "BALL IN FINAL THIRD", "BALL IN THE BOX", "PLAYERS IN THE BOX")
+    ]
+    revived, revived_team = dead_revival_mask(
+        arrays["consensus_ball"].astype(np.float64),
+        pool,
+        live_tags,
+        tuple(lab.tracking.pitch),
+        out_of_play | np.asarray(lab.tags.setpiece, dtype=bool),
+        min_frames=int(params.revive_min_frames),
+        gap_min=float(params.revive_gap_min),
+        speed_min=float(params.revive_speed_min),
+        raw_ball=np.asarray(lab.tracking.ball, dtype=np.float64),
+    )
+    revived &= result.codes == _D_CODE  # reopen a false lock; never overrule a live label
+    result.codes[revived] = revived_team[revived]
+    # the ball's own state gets the last word over its own lock: a player at the ball,
+    # the ball rolling, and the voters backing that player's team means the game is on,
+    # whatever false trigger pinned the label (measured 170 623: Athletic's build-up
+    # carried the ball 17 m while the label sat dead; 143 488 and 143 990 stitched the
+    # hole around the 143 524 tag revival; zero frames inside the public window)
+    touched, touched_team = possession_revival_mask(
+        arrays["consensus_ball"].astype(np.float64),
+        np.asarray(lab.tracking.players, dtype=np.float64),
+        np.asarray(lab.tracking.player_present, dtype=bool),
+        np.asarray(lab.tracking.teams, dtype=np.int8),
+        pool,
+        tuple(lab.tracking.pitch),
+        out_of_play | np.asarray(lab.tags.setpiece, dtype=bool),
+        dist_max=float(params.revive_touch_dist_m),
+        hold_cov=float(params.revive_touch_cov),
+        gap_min=float(params.revive_touch_gap),
+        speed_min=float(params.revive_speed_min),
+        min_frames=int(params.revive_min_frames),
+    )
+    touched &= result.codes == _D_CODE  # same rule: reopen dead frames, never a live label
+    result.codes[touched] = touched_team[touched]
     print(
         f"transitions: {result.n_kicks} kicks + {result.n_onsets} onsets detected, "
         f"{result.n_contact} contacts + {result.n_kicker} win-and-clear kicks + {result.n_hold} keeper holds "
-        f"from boxes, {result.n_gated_out} gated out -> {len(result.events)} transition events"
+        f"+ {result.n_area} area catches from boxes, {result.n_control} spell expiries, "
+        f"{result.n_gated_out} gated out -> {len(result.events)} transition events; "
+        f"{int(out_of_play.sum()):,} frames of lost/out-of-bounds ball marked D; "
+        f"{int(revived.sum()):,} frames revived by live tags, {int(touched.sum()):,} by a player at the ball"
     )
     events_path = output_dir / "transition_events.csv"
     rows = events_to_rows(result.events)
-    kind_names = np.array(["kick", "onset", "contact", "kicker", "hold"])
+    kind_names = np.array(["kick", "onset", "contact", "kicker", "hold", "control", "area"])
     pd.DataFrame(
         {
             "start_frame": rows[:, 0].astype(int),

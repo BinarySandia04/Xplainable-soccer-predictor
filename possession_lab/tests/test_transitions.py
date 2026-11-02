@@ -28,11 +28,14 @@ from possession_lab.fusion.transitions import (
     detect_onset_events,
     events_to_rows,
     evidence_probability,
+    expire_owned_spells,
     gate_events,
     gate_pixel_events,
     hold_touch_through,
+    keeper_area_catches,
     keeper_holds,
     pixel_contact,
+    raw_evidence_pool,
     relay_contacts,
 )
 
@@ -1121,6 +1124,519 @@ class ConflictMaskTests(unittest.TestCase):
         self.assertEqual(len(idx), last - first + 1)  # one contiguous grown block
         self.assertEqual(first, int(base.argmax()) - 15)
         self.assertEqual(last, int(np.flatnonzero(base)[-1]) + 15)
+
+
+class KeeperAreaCatchTests(unittest.TestCase):
+    """The pitch-side twin of the keeper hold where the pixel channel goes blind at the goal.
+
+    Measured 132 355: the ball decelerated 13.1 -> 1.1 m/s at x = 9.4 m (the Athletic
+    keeper's six-yard box, second half) and left again at 18.9 m/s; the boxes near the
+    goal compress in depth, the pixel channel saw nothing, and the fused prior kept
+    claiming H through the catch and the punt.
+    """
+
+    def catch_world(self, n=240, opp_far=True, stop_x=9.6, dead=None):
+        ramp = np.array([0.36, 0.24, 0.12, 0.06])  # 12 -> 0 m/s over frames 94..97
+        off = np.zeros(n)
+        for t in range(n):
+            if t < 94:
+                off[t] = 0.48 * (94 - max(t, 60)) + ramp.sum()
+            elif t < 98:
+                off[t] = ramp[t - 94 :].sum()
+        punt = np.maximum(0.0, np.arange(n) - 105) * 0.72  # the punt away, 18 m/s
+        x = stop_x + off + punt
+        ball = np.stack([x, np.full(n, 34.0)], axis=1)
+        pitch = np.zeros((n, 2, 2))
+        pitch[:, 0] = [9.0, 34.4]  # the keeper of the side that defends goal 0
+        pitch[:, 1] = [45.0, 34.0] if opp_far else [10.8, 33.0]
+        teams = np.asarray([1, H], dtype=np.int8)
+        sets = [(pitch, teams, np.ones((n, 2), dtype=bool))]
+        defenders = np.array([[1, H]], dtype=np.int8)  # this half: A defends goal 0
+        ev_dead = np.zeros(n, dtype=bool)
+        if dead is not None:
+            ev_dead[92:102] = dead
+        return ball, sets, defenders, ev_dead
+
+    def test_catch_in_own_area_is_won_by_the_defending_side(self):
+        ball, sets, defenders, ev_dead = self.catch_world()
+        from possession_lab.fusion.transitions import ball_speed
+
+        speed, valid = ball_speed(ball)
+        catches = keeper_area_catches(
+            ball, speed, valid, ev_dead, sets, defenders, (105.0, 68.0), ((0, 240),)
+        )
+        self.assertEqual(len(catches), 1)
+        start, frame, team = catches[0]
+        self.assertEqual(team, 1)
+        self.assertTrue(96 <= frame <= 100)
+        self.assertTrue(60 <= start < 96)  # the pass-in kick, not the standstill
+
+    def test_contested_catch_is_not_given(self):
+        ball, sets, defenders, ev_dead = self.catch_world(opp_far=False)
+        from possession_lab.fusion.transitions import ball_speed
+
+        speed, valid = ball_speed(ball)
+        self.assertEqual(
+            keeper_area_catches(ball, speed, valid, ev_dead, sets, defenders, (105.0, 68.0), ((0, 240),)),
+            [],
+        )
+
+    def test_midfield_stopper_is_not_an_area_catch(self):
+        ball, sets, defenders, ev_dead = self.catch_world(stop_x=60.0)
+        ball[:, 0] = np.where(np.arange(len(ball)) < 99, 60.0, ball[:, 0])
+        from possession_lab.fusion.transitions import ball_speed
+
+        speed, valid = ball_speed(ball)
+        self.assertEqual(
+            keeper_area_catches(ball, speed, valid, ev_dead, sets, defenders, (105.0, 68.0), ((0, 240),)),
+            [],
+        )
+
+    def test_dead_catch_is_not_given(self):
+        ball, sets, defenders, ev_dead = self.catch_world(dead=True)
+        from possession_lab.fusion.transitions import ball_speed
+
+        speed, valid = ball_speed(ball)
+        self.assertEqual(
+            keeper_area_catches(ball, speed, valid, ev_dead, sets, defenders, (105.0, 68.0), ((0, 240),)),
+            [],
+        )
+
+    def test_neutral_pool_is_not_a_keeper_catch(self):
+        """Measured 11 598: ball dead at the goal mouth with the voter pool flat (0.07) —
+        a conceded goal, not a keeper gathering his side's ball.  The raw-pool margin
+        must back the catcher or the channel stays quiet."""
+        ball, sets, defenders, ev_dead = self.catch_world()
+        from possession_lab.fusion.transitions import ball_speed
+
+        speed, valid = ball_speed(ball)
+        flat = np.full((len(ball), 3), 1.0 / 3.0)
+        self.assertEqual(
+            keeper_area_catches(ball, speed, valid, ev_dead, sets, defenders, (105.0, 68.0),
+                                ((0, 240),), evidence_pool=flat),
+            [],
+        )
+        backing = np.tile([0.20, 0.70, 0.10], (len(ball), 1))
+        self.assertEqual(
+            len(keeper_area_catches(ball, speed, valid, ev_dead, sets, defenders, (105.0, 68.0),
+                                    ((0, 240),), evidence_pool=backing)),
+            1,
+        )
+
+
+class ExpireOwnedSpellsTests(unittest.TestCase):
+    """A pixel-owned interval cannot outlive the camera's own evidence."""
+
+    def world(self, n=300, prob_a=0.05, prob_h=0.90, speed_val=4.0):
+        pool = np.full((n, 3), 1.0 / 3.0)
+        pool[100:150] = [prob_h, prob_a, 1.0 - prob_h - prob_a]
+        dead = np.zeros(n, dtype=bool)
+        speed = np.full(n, speed_val)
+        return pool, dead, speed
+
+    def test_sustained_contrary_pool_cuts_the_interval(self):
+        pool, dead, speed = self.world()
+        intervals = [[60, 200, 1]]  # an A contact owns the stretch
+        events, ivs = expire_owned_spells(intervals, pool, dead, speed)
+        self.assertEqual(len(events), 1)
+        self.assertEqual((events[0].kind, events[0].team, events[0].start), ("control", H, 100))
+        self.assertIn((60, 100, 1), ivs)
+
+    def test_short_burst_does_not_expire_the_interval(self):
+        pool, dead, speed = self.world()
+        pool[100:130] = 1.0 / 3.0  # only 20 contrary frames
+        events, ivs = expire_owned_spells([[60, 200, 1]], pool, dead, speed)
+        self.assertEqual(events, [])
+        self.assertEqual(list(ivs), [(60, 200, 1)])
+
+    def test_weak_contrary_pool_does_not_expire_the_interval(self):
+        pool, dead, speed = self.world(prob_a=0.25, prob_h=0.71)
+        events, _ = expire_owned_spells([[60, 200, 1]], pool, dead, speed)
+        self.assertEqual(events, [])
+
+    def test_ball_in_flight_does_not_expire_the_interval(self):
+        pool, dead, speed = self.world(speed_val=14.0)
+        events, _ = expire_owned_spells([[60, 200, 1]], pool, dead, speed)
+        self.assertEqual(events, [])
+
+    def test_keeper_hold_is_never_expired(self):
+        pool, dead, speed = self.world()
+        events, ivs = expire_owned_spells([[60, 200, 1]], pool, dead, speed, protected=frozenset({(60, 1)}))
+        self.assertEqual(events, [])
+        self.assertEqual(list(ivs), [(60, 200, 1)])
+
+    def test_run_must_lie_fully_inside_the_owned_interval(self):
+        pool, dead, speed = self.world()
+        pool[150:170] = [0.90, 0.05, 0.05]  # the contrary run runs past the interval end
+        events, ivs = expire_owned_spells([[60, 160, 1]], pool, dead, speed)
+        self.assertEqual(events, [])
+        self.assertEqual(list(ivs), [(60, 160, 1)])
+
+
+class ControlRowTests(unittest.TestCase):
+    def test_control_and_area_kind_rows_round_trip(self):
+        rows = events_to_rows(
+            [
+                TransitionEvent(start=10, frame=12, kind="control", team=H, distance=1.0, support=0.8),
+                TransitionEvent(start=20, frame=24, kind="area", team=1, distance=1.0, support=1.0),
+            ]
+        )
+        self.assertEqual(rows[0, 2], 5)
+        self.assertEqual(rows[1, 2], 6)
+
+
+class RawPoolTests(unittest.TestCase):
+    def test_single_voter_pool_is_exact_and_unprior(self):
+        prob = {"x": np.tile([0.9, 0.05, 0.05], (4, 1))}
+        weight = {"x": np.ones(4)}
+        np.testing.assert_allclose(raw_evidence_pool(prob, weight), np.tile([0.9, 0.05, 0.05], (4, 1)))
+
+    def test_zero_weight_frames_fall_back_to_uniform(self):
+        prob = {"x": np.tile([0.9, 0.05, 0.05], (4, 1))}
+        weight = {"x": np.zeros(4)}
+        np.testing.assert_allclose(raw_evidence_pool(prob, weight), np.full((4, 3), 1.0 / 3.0))
+
+    def test_raw_pool_beats_the_flat_prior_dilution(self):
+        prob = {"x": np.tile([0.9, 0.05, 0.05], (4, 1))}
+        weight = {"x": np.ones(4)}
+        self.assertGreater(raw_evidence_pool(prob, weight)[:, 0].min(), evidence_probability(prob, weight)[:, 0].min())
+
+
+class BallLostMaskTests(unittest.TestCase):
+    """A consensus with no active voter for a second is a ball the system lost."""
+
+    def test_sustained_zero_confidence_marks_the_whole_run(self):
+        from possession_lab.fusion.transitions import ball_lost_mask
+
+        conf = np.ones(200)
+        conf[100:130] = 0.0
+        m = ball_lost_mask(conf, min_frames=25)
+        self.assertTrue(bool(m[100:130].all()))
+        self.assertFalse(bool(m[:100].any() or m[130:].any()))
+
+    def test_short_blip_is_not_lost(self):
+        from possession_lab.fusion.transitions import ball_lost_mask
+
+        conf = np.ones(200)
+        conf[100:115] = 0.0
+        self.assertFalse(bool(ball_lost_mask(conf, min_frames=25).any()))
+
+
+class OutOfBoundsMaskTests(unittest.TestCase):
+    """A ball that stays past the touchline is out of play, tag or no tag."""
+
+    @staticmethod
+    def _ball(n=200):
+        y = np.full(n, 30.0)
+        y[100:135] = -4.0  # over the side line for 35 frames
+        return np.stack([np.full(n, 50.0), y], axis=1)
+
+    def test_outside_run_marks_dead(self):
+        from possession_lab.fusion.transitions import out_of_bounds_mask
+
+        m = out_of_bounds_mask(self._ball(), (105.0, 68.0), margin_m=0.8, min_frames=25)
+        self.assertTrue(bool(m[100:135].all()))
+        self.assertFalse(bool(m[:100].any() or m[135:].any()))
+
+    def test_ball_on_the_line_stays_live(self):
+        from possession_lab.fusion.transitions import out_of_bounds_mask
+
+        ball = self._ball()
+        ball[:, 1] = 68.4  # half over the chalk, inside the margin
+        m = out_of_bounds_mask(ball, (105.0, 68.0), margin_m=0.8, min_frames=25)
+        self.assertFalse(bool(m.any()))
+
+    def test_short_excursion_is_live(self):
+        from possession_lab.fusion.transitions import out_of_bounds_mask
+
+        ball = self._ball()
+        ball[100:112, 1] = -4.0
+        ball[112:135, 1] = 20.0
+        m = out_of_bounds_mask(ball, (105.0, 68.0), margin_m=0.8, min_frames=25)
+        self.assertFalse(bool(m.any()))
+
+    def test_nan_breaks_the_run(self):
+        from possession_lab.fusion.transitions import out_of_bounds_mask
+
+        ball = self._ball()
+        ball[115:120, 1] = np.nan
+        m = out_of_bounds_mask(ball, (105.0, 68.0), margin_m=0.8, min_frames=25)
+        self.assertFalse(bool(m.any()))
+
+
+class PitchContradictionGateTests(unittest.TestCase):
+    """Box overlap at depth must not claim a ball a player is standing on.
+
+    Measured 136 891: the ball pixel sat inside Barcelona players' boxes for four
+    frames while an Athletic player was 0.4 m from the ball and his side led the
+    raw pool -1 (the pixel side 4.5 m away); the contact punctured a settled H
+    spell.  The pitch distance between the nearest players of each side to the
+    ball decides the tie the pixel geometry cannot.
+    """
+
+    @staticmethod
+    def world(n=220):
+        codes = np.where(np.arange(n) < 108, H, A).astype(np.int8)  # boundary near the contact
+        prob = np.zeros((n, 3))
+        prob[:, 1] = 1.0  # the fused poll catches up on A: the momentum gate is open
+        contain = np.zeros(n, dtype=np.int8)
+        contain[96:101] = 2  # A boxes contain the ball pixel: run of 5, ends at frame 100
+        contact = [(100, 5.0, 1, 1.0)]
+        dead = np.zeros(n, dtype=bool)
+        return codes, prob, contain, contact, dead
+
+    def test_contact_dropped_when_the_other_side_is_on_the_ball(self):
+        codes, prob, contain, contact, dead = self.world()
+        pitch_close = np.full((len(codes), 2), 3.0)
+        pitch_close[100] = [0.5, 4.6]  # H on the ball, the containing side 4 m away
+        kept, ivs = gate_pixel_events(contact, [], contain, codes, prob, dead, [], pitch_close=pitch_close)
+        self.assertEqual(kept, [])
+        self.assertEqual(ivs, [])
+
+    def test_contact_kept_when_its_side_is_closer(self):
+        codes, prob, contain, contact, dead = self.world()
+        pitch_close = np.full((len(codes), 2), 3.0)
+        pitch_close[100] = [4.6, 0.5]
+        kept, ivs = gate_pixel_events(contact, [], contain, codes, prob, dead, [], pitch_close=pitch_close)
+        self.assertEqual(len(kept), 1)
+        self.assertTrue(ivs)
+
+    def test_no_pitch_data_no_veto(self):
+        codes, prob, contain, contact, dead = self.world()
+        kept, _ = gate_pixel_events(contact, [], contain, codes, prob, dead, [])
+        self.assertEqual(len(kept), 1)
+
+
+class RelabelTeamsFromTrackingTests(unittest.TestCase):
+    """The tracking file carries each slot's roster team — the authority the jersey
+    classifier loses when the light fails (measured 155 945: every visible player
+    labelled Barcelona, eight more unknown)."""
+
+    def test_matched_detections_adopt_the_roster_team(self):
+        from possession_lab.perception import relabel_teams_from_tracking
+
+        pitch = np.array([[[10.0, 20.0], [50.0, 10.0], [70.0, 40.0]]])
+        present = np.array([[True, True, True]])
+        teams = np.array([[0, 0, 0]], dtype=np.int8)
+        track_xy = np.array([[[10.2, 20.1], [49.5, 10.5], [30.0, 30.0]]])
+        track_teams = np.array([1, 0, 1], dtype=np.int8)
+        track_present = np.array([[True, True, False]])
+        out = relabel_teams_from_tracking(
+            pitch, present, teams, track_xy, track_teams, track_present, (105.0, 68.0)
+        )
+        self.assertEqual(out[0].tolist(), [1, 0, 0])  # slot 3 not present: raw label stands
+
+    def test_off_pitch_ghost_slot_is_never_a_match(self):
+        from possession_lab.perception import relabel_teams_from_tracking
+
+        pitch = np.array([[[10.0, 70.9]]])
+        present = np.array([[True]])
+        teams = np.array([[0]], dtype=np.int8)
+        track_xy = np.array([[[10.0, 71.0]]])
+        track_teams = np.array([1], dtype=np.int8)
+        track_present = np.array([[True]])
+        out = relabel_teams_from_tracking(
+            pitch, present, teams, track_xy, track_teams, track_present, (105.0, 68.0)
+        )
+        self.assertEqual(out[0].tolist(), [0])
+
+    def test_far_detection_keeps_its_own_label(self):
+        from possession_lab.perception import relabel_teams_from_tracking
+
+        pitch = np.array([[[40.0, 20.0]]])
+        present = np.array([[True]])
+        teams = np.array([[-1]], dtype=np.int8)
+        track_xy = np.array([[[45.0, 20.0]]])
+        track_teams = np.array([1], dtype=np.int8)
+        track_present = np.array([[True]])
+        out = relabel_teams_from_tracking(
+            pitch, present, teams, track_xy, track_teams, track_present, (105.0, 68.0)
+        )
+        self.assertEqual(out[0].tolist(), [-1])
+
+
+class DeadRevivalMaskTests(unittest.TestCase):
+    """A falsely locked D reopens only to a live tag the voters back."""
+
+    @staticmethod
+    def scene(n: int = 200) -> tuple[np.ndarray, np.ndarray]:
+        ball = np.zeros((n, 2), dtype=np.float64)
+        ball[:, 0] = np.arange(n) * (2.0 / 25.0)  # 2 m/s along x, on the grass
+        ball[:, 1] = 10.0
+        pool = np.tile([0.05, 0.75, 0.02], (n, 1))  # the pool backs A by 0.70
+        return ball, pool
+
+    def run_case(self, tags, blocked=None, **kw):
+        from possession_lab.fusion.transitions import dead_revival_mask
+
+        ball, pool = self.scene()
+        blocked = np.zeros(200, dtype=bool) if blocked is None else blocked
+        return dead_revival_mask(ball, pool, tags, (105.0, 68.0), blocked, **kw)
+
+    def test_tagged_live_run_revives_with_the_tagged_team(self):
+        mask, team = self.run_case([(50, 149, 1, True)])
+        self.assertTrue(mask[50:150].all())
+        self.assertFalse(mask[:50].any() or mask[150:].any())
+        self.assertEqual(int(team[60]), 1)
+
+    def test_short_run_does_not_revive(self):
+        mask, _ = self.run_case([(50, 60, 1, True)], min_frames=25)
+        self.assertFalse(mask.any())
+
+    def test_stationary_ball_does_not_revive(self):
+        from possession_lab.fusion.transitions import dead_revival_mask
+
+        ball, pool = self.scene()
+        ball[:, 0] = 50.0  # parked: play is not live
+        mask, _ = dead_revival_mask(ball, pool, [(50, 149, 1, True)], (105.0, 68.0), np.zeros(200, bool))
+        self.assertFalse(mask.any())
+
+    def test_blocked_frames_never_revive(self):
+        blocked = np.zeros(200, dtype=bool)
+        blocked[50:150] = True  # a real setpiece covers the window
+        mask, _ = self.run_case([(50, 149, 1, True)], blocked=blocked)
+        self.assertFalse(mask.any())
+
+    def test_pool_against_the_tag_never_revives(self):
+        from possession_lab.fusion.transitions import dead_revival_mask
+
+        ball, _ = self.scene()
+        pool = np.tile([0.75, 0.05, 0.02], (200, 1))  # voters back H, tag says A
+        mask, _ = dead_revival_mask(ball, pool, [(50, 149, 1, True)], (105.0, 68.0), np.zeros(200, bool))
+        self.assertFalse(mask.any())
+
+    def test_off_pitch_ball_does_not_revive(self):
+        from possession_lab.fusion.transitions import dead_revival_mask
+
+        ball, pool = self.scene()
+        ball[:, 1] = 75.0  # 7 m past the touchline: this one is genuinely out
+        mask, _ = dead_revival_mask(ball, pool, [(50, 149, 1, True)], (105.0, 68.0), np.zeros(200, bool))
+        self.assertFalse(mask.any())
+
+    def test_weak_tag_without_crossing_does_not_revive(self):
+        # a celebration: zone tag over a parked-the-game scene, ball never left the grass
+        from possession_lab.fusion.transitions import dead_revival_mask
+
+        ball, pool = self.scene()
+        pool = np.tile([0.46, 0.52, 0.02], (200, 1))  # winner backs the tag, but no gap
+        mask, _ = dead_revival_mask(
+            ball, pool, [(50, 149, 1, False)], (105.0, 68.0), np.zeros(200, bool),
+            raw_ball=ball.copy(),
+        )
+        self.assertFalse(mask.any())
+
+    def test_weak_tag_revives_a_marginal_chalk_crossing(self):
+        # measured 116 791: consensus grazes 0.1 m over the chalk, pool gap is tiny,
+        # a zone tag names the winner — the out never happened
+        from possession_lab.fusion.transitions import dead_revival_mask
+
+        ball, pool = self.scene()
+        ball[:, 1] = 67.95  # consensus grazes the touchline but stays inside the pad
+        pool = np.tile([0.46, 0.52, 0.02], (200, 1))  # winner A by 0.06 only
+        raw_ball = ball.copy()
+        raw_ball[:, 1] = 68.1  # raw ball 0.1 m past the 68.0 chalk: a calibration graze
+        mask, team = dead_revival_mask(
+            ball, pool, [(50, 149, 1, False)], (105.0, 68.0), np.zeros(200, bool),
+            raw_ball=raw_ball,
+        )
+        self.assertTrue(mask[50:150].all())
+        self.assertEqual(int(team[60]), 1)
+
+    def test_weak_tag_not_guaranteed_for_full_gap_needs_no_crossing_never_opens(self):
+        # strong tags still demand the gap: no crossing, thin gap -> stays locked
+        from possession_lab.fusion.transitions import dead_revival_mask
+
+        ball, _ = self.scene()
+        pool = np.tile([0.30, 0.40, 0.02], (200, 1))  # A wins by 0.10 < gap_min
+        mask, _ = dead_revival_mask(
+            ball, pool, [(50, 149, 1, True)], (105.0, 68.0), np.zeros(200, bool),
+            raw_ball=ball.copy(),
+        )
+        self.assertFalse(mask.any())
+
+
+class PossessionRevivalMaskTests(unittest.TestCase):
+    """A dead lock reopens when a player is simply playing the ball."""
+
+    @staticmethod
+    def scene(n: int = 200):
+        ball = np.zeros((n, 2), dtype=np.float64)
+        ball[:, 0] = np.arange(n) * (2.0 / 25.0)  # 2 m/s along x, on the grass
+        ball[:, 1] = 10.0
+        players = np.full((n, 2, 2), np.nan, dtype=np.float64)
+        players[:, 0] = ball + 0.5  # an A player at the ball all along
+        players[:, 1] = [100.0, 40.0]  # an H player far away
+        present = np.ones((n, 2), dtype=bool)
+        teams = np.array([1, 0], dtype=np.int8)
+        pool = np.tile([0.05, 0.75, 0.02], (n, 1))  # the pool backs A by 0.70
+        return ball, players, present, teams, pool
+
+    def run_case(self, **kw):
+        from possession_lab.fusion.transitions import possession_revival_mask
+
+        ball, players, present, teams, pool = self.scene()
+        return possession_revival_mask(
+            ball, players, present, teams, pool, (105.0, 68.0), np.zeros(len(ball), bool), **kw
+        )
+
+    def test_player_at_the_ball_reopens_the_lock(self):
+        mask, team = self.run_case()
+        # the coverage kernel normalises by the frames actually present, so glue
+        # that holds from the first second owns its edges
+        self.assertTrue(mask.all())
+        self.assertTrue((team == 1).all())
+
+    def test_pool_against_the_player_never_reopens(self):
+        from possession_lab.fusion.transitions import possession_revival_mask
+
+        ball, players, present, teams, _ = self.scene()
+        pool = np.tile([0.75, 0.05, 0.02], (len(ball), 1))  # pool backs H, player is A
+        mask, _ = possession_revival_mask(
+            ball, players, present, teams, pool, (105.0, 68.0), np.zeros(len(ball), bool)
+        )
+        self.assertFalse(mask.any())
+
+    def test_stationary_ball_never_reopens(self):
+        from possession_lab.fusion.transitions import possession_revival_mask
+
+        ball, players, present, teams, pool = self.scene()
+        ball[:, 0] = 50.0  # parked: not play
+        players[:, 0, 0] = 50.5
+        mask, _ = possession_revival_mask(
+            ball, players, present, teams, pool, (105.0, 68.0), np.zeros(len(ball), bool)
+        )
+        self.assertFalse(mask.any())
+
+    def test_blocked_frames_never_reopen(self):
+        from possession_lab.fusion.transitions import possession_revival_mask
+
+        ball, players, present, teams, pool = self.scene()
+        blocked = np.zeros(len(ball), dtype=bool)
+        blocked[:] = True  # a real setpiece covers the window
+        mask, _ = possession_revival_mask(
+            ball, players, present, teams, pool, (105.0, 68.0), blocked
+        )
+        self.assertFalse(mask.any())
+
+    def test_no_player_near_the_ball_never_reopens(self):
+        from possession_lab.fusion.transitions import possession_revival_mask
+
+        ball, players, present, teams, pool = self.scene()
+        players[:, 0] = [100.0, 40.0]  # nobody at the ball
+        mask, _ = possession_revival_mask(
+            ball, players, present, teams, pool, (105.0, 68.0), np.zeros(len(ball), bool)
+        )
+        self.assertFalse(mask.any())
+
+    def test_short_glue_run_does_not_reopen(self):
+        from possession_lab.fusion.transitions import possession_revival_mask
+
+        ball, players, present, teams, pool = self.scene()
+        players[:170, 0] = [100.0, 40.0]  # the glue lasts barely 30 frames
+        mask, _ = possession_revival_mask(
+            ball, players, present, teams, pool, (105.0, 68.0), np.zeros(len(ball), bool)
+        )
+        self.assertFalse(mask.any())
 
 
 if __name__ == "__main__":

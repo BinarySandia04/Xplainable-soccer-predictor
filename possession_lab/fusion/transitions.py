@@ -174,6 +174,59 @@ class TransitionParams:
     # a release measured in a blind window is a camera reading with nothing to check it against
     # (measured 86 219: 6.4 px from feet, 131 px clear, the ATD ball blind since 86 186).
     pixel_fingerprint_needs_atd: bool = True
+    # -- keeper area catch: the pixel channel goes blind near the goal, where depth
+    # compresses the boxes, so the catch is read off the pitch geometry (the pitch
+    # twin of the keeper hold for camera-blind moments).  Measured 132 355: the ball
+    # decelerated 13.1 -> 1.1 m/s at x = 9.4 m (the Athletic keeper's six-yard box,
+    # defending the low side in the second half) and left again at 18.9 m/s, with no
+    # opponent closer; the fused prior kept claiming H through catch and punt.
+    area_catch_in_min_speed: float = 8.0  # m/s the ball must arrive with
+    area_catch_max_speed: float = 3.5  # m/s the stop counts as a catch below
+    area_catch_prior_frames: int = 40  # window the arrival speed is read from
+    area_catch_depth_m: float = 16.5  # penalty-area depth from the goal line
+    area_catch_half_width_m: float = 20.2  # half the area width around the centre
+    area_catch_opp_min_m: float = 2.5  # an opponent closer contests the catch
+    area_catch_kick_gain: float = 3.0  # m/s jump marking the pass-in kick
+    area_catch_extend_max: int = 200  # frames searched back for that kick
+    area_catch_extend_margin: float = 0.15  # raw-pool support that anchors the start
+    area_catch_extend_dip_max: int = 15  # frames the support may dip for mid-flight
+    area_catch_max_span: int = 330  # ownership cap: catch, gather, punt
+    area_catch_min_pool_margin: float = 0.25  # the voters must back the catcher
+    # -- evidence expiry of a pixel-owned spell: an owned interval cannot outlive
+    # the camera's own evidence.  A lone touch that is never followed up must not
+    # hold the spell while the ball settles on the other team's feet (measured
+    # 132 743: one A contact at 132 619 owned 326 frames while the raw voter pool
+    # read 0.80-0.94 H with the ball dribbling at 3-6 m/s under a Barcelona player).
+    expire_min_prob: float = 0.80
+    expire_min_margin: float = 0.25
+    expire_min_frames: int = 25
+    expire_max_ball_speed: float = 8.0  # m/s: control, not flight
+    # -- pitch contradiction veto on pixel events: boxes overlap at depth, a pitch
+    # distance never lies (measured 136 891: four frames of ball-inside-A-box while
+    # an H player stood 0.4 m from the ball and his side led the raw pool)
+    contact_opp_pitch_margin: float = 2.0  # m the other side must be closer by to veto
+    contact_opp_pool_margin: float = 0.15  # and the raw pool must side with that player
+    # -- ball out of play without a tag: the camera lost the ball, or it crossed
+    # the touchline; the fused confidence says no voter sees it anymore, and the
+    # consensus then coasts off the grass (measured 163 282: conf 0.00 for minutes,
+    # the Kalman point drifting to y = -59 m while spells kept trading hands)
+    lost_min_frames: int = 25  # frames without any ball voter before "lost" (1 s)
+    lost_conf_eps: float = 0.02
+    oob_margin_m: float = 0.8  # metres past the chalk before "out" (a line ball is in)
+    oob_min_frames: int = 25  # frames outside before the stoppage is called
+    # -- escape from a falsely locked dead state: the events ballot (weight 1.0)
+    # pins the label to D, so no voter can reopen it — but the smart tags can.
+    # A live-phase tag naming the team the voters already back, with the ball on
+    # the grass and moving, means the stoppage never happened (measured 143 524:
+    # an ATD excursion 4 m past the chalk held D for 16 s while Athletic drove
+    # forward under a PROGRESSION tag the voters agreed with at 0.85)
+    revive_min_frames: int = 25  # frames of live-play evidence before reopening
+    revive_gap_min: float = 0.2  # raw pool margin the tagged team must command
+    revive_speed_min: float = 1.5  # m/s of the consensus ball proving play is live
+    # the ball-state revival: a player at the ball + pool backing reopens the lock
+    revive_touch_dist_m: float = 2.0  # how close a player must be to own the ball
+    revive_touch_cov: float = 0.7  # share of each second's frame holding that glue
+    revive_touch_gap: float = 0.1  # raw pool margin the gluing player's team needs
 
 
 DEFAULT_TRANSITION_PARAMS = TransitionParams()
@@ -194,7 +247,7 @@ class TransitionEvent:
     hold_through: bool = False
 
     def as_row(self) -> tuple[int, int, int, int, float, float]:
-        kind_code = {"kick": 0, "onset": 1, "contact": 2, "kicker": 3, "hold": 4}[self.kind]
+        kind_code = {"kick": 0, "onset": 1, "contact": 2, "kicker": 3, "hold": 4, "control": 5, "area": 6}[self.kind]
         return (self.start, self.frame, kind_code, self.team, self.distance, self.support)
 
 
@@ -210,6 +263,8 @@ class TransitionLayerResult:
     n_contact: int = 0
     n_kicker: int = 0
     n_hold: int = 0
+    n_control: int = 0
+    n_area: int = 0
 
 
 # --------------------------------------------------------------------------- ball kinematics
@@ -414,6 +469,33 @@ def _box_foot_distance(evidence: BoxEvidence) -> np.ndarray:
         for col, team in ((0, H), (1, 1)):
             dm = np.where(ok & (teams[s:e] == team), d, np.inf)
             out[s:e, col] = dm.min(axis=1)
+    return out
+
+
+def _pitch_nearest_m(evidence: BoxEvidence) -> np.ndarray | None:
+    """Per-frame metres from the video ball to the nearest player of each team.
+
+    ``(n, 2)`` float array, column 0 = team H, column 1 = team A; ``inf`` where
+    that team shows no finite player.  The pitch twin of :func:`_box_foot_distance`
+    — pixel boxes confound depth, pitch metres do not.
+    """
+    if evidence.pitch is None or evidence.ball_pitch is None:
+        return None
+    p = np.asarray(evidence.pitch, dtype=np.float64)
+    teams = np.asarray(evidence.team)
+    present = np.asarray(evidence.present, dtype=bool)
+    b = np.asarray(evidence.ball_pitch, dtype=np.float64)
+    n = min(p.shape[0], b.shape[0])
+    out = np.full((n, 2), np.inf)
+    for s in range(0, n, CHUNK):
+        e = min(n, s + CHUNK)
+        ok = present[s:e] & np.isin(teams[s:e], (H, 1)) & np.isfinite(p[s:e]).all(axis=2)
+        with np.errstate(invalid="ignore"):
+            d = np.linalg.norm(p[s:e] - b[s:e, None, :], axis=2)
+        for col, team in ((0, H), (1, 1)):
+            dm = np.where(ok & (teams[s:e] == team), d, np.inf)
+            out[s:e, col] = dm.min(axis=1)
+    out[~np.isfinite(b[:n]).all(axis=1)] = np.inf
     return out
 
 
@@ -632,6 +714,255 @@ def evidence_probability(
         weighted += w[:, None] * np.asarray(prob, dtype=np.float64)
         total += w
     return (PRIOR_WEIGHT * PRIOR[None, :] + weighted) / (PRIOR_WEIGHT + total[:, None])
+
+
+def raw_evidence_pool(
+    probabilities: Mapping[str, np.ndarray],
+    weights: Mapping[str, np.ndarray],
+) -> np.ndarray:
+    """The weighted pool of the ball/control voters *without* the flat prior.
+
+    ``evidence_probability`` damps the pool toward the three-way prior; a spell
+    expiry must read the voters at full strength (the 0.92 the voters insisted on
+    at 132 743 damps below the bar once the prior is mixed in).  Frames where no
+    voter carries weight fall back to the uniform three-way split.
+    """
+    n = int(next(iter(probabilities.values())).shape[0])
+    total = np.zeros(n)
+    weighted = np.zeros((n, 3))
+    for key, prob in probabilities.items():
+        w = np.clip(np.asarray(weights[key], dtype=np.float64), 0.0, 1.0)
+        weighted += w[:, None] * np.asarray(prob, dtype=np.float64)
+        total += w
+    return np.where(total[:, None] > 0, weighted / np.maximum(total, 1e-9)[:, None], 1.0 / 3.0)
+
+
+def _bool_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Maximal ``[start, stop)`` runs of True in a boolean mask."""
+    d = np.diff(np.r_[0, np.asarray(mask, dtype=np.int8), 0])
+    return list(zip(np.flatnonzero(d == 1).tolist(), np.flatnonzero(d == -1).tolist()))
+
+
+def ball_lost_mask(
+    confidence: np.ndarray,
+    min_frames: int = 25,
+    eps: float = 0.02,
+) -> np.ndarray:
+    """Frames where no ball voter has carried the consensus for ``min_frames`` straight.
+
+    A fused confidence of zero means both ball streams stopped seeing the ball; a
+    minute of that is a stoppage the smart tags missed, not a play the system may
+    keep attributing (measured 163 265+: conf 0.00 while spells traded hands).  The
+    whole qualifying run is marked, never just its tail.
+    """
+    conf = np.asarray(confidence, dtype=np.float64)
+    gone = ~np.isfinite(conf) | (conf <= eps)
+    mask = np.zeros(conf.shape[0], dtype=bool)
+    for s, e in _bool_runs(gone):
+        if e - s >= int(min_frames):
+            mask[s:e] = True
+    return mask
+
+
+def out_of_bounds_mask(
+    ball_pitch: np.ndarray,
+    pitch: tuple[float, float],
+    margin_m: float = 0.8,
+    min_frames: int = 25,
+) -> np.ndarray:
+    """Frames with the ball centre fully past the touchline for ``min_frames`` straight.
+
+    ``margin_m`` forgives the chalk and calibration jitter (a ball on the line is
+    in play); non-finite frames break a run rather than extend it.  The tags miss
+    stoppages late in scrambled sequences (measured 163 282: the ball sailed over
+    the side with no stoppage tag until the goal-kick restart minutes later), and
+    out of bounds nobody possesses the ball: the caller marks those frames dead.
+    """
+    b = np.asarray(ball_pitch, dtype=np.float64)
+    length, width = float(pitch[0]), float(pitch[1])
+    finite = np.isfinite(b).all(axis=1)
+    out = finite & (
+        (b[:, 0] < -margin_m)
+        | (b[:, 0] > length + margin_m)
+        | (b[:, 1] < -margin_m)
+        | (b[:, 1] > width + margin_m)
+    )
+    mask = np.zeros(b.shape[0], dtype=bool)
+    for s, e in _bool_runs(out):
+        if e - s >= int(min_frames):
+            mask[s:e] = True
+    return mask
+
+
+def dead_revival_mask(
+    ball_pitch: np.ndarray,
+    evidence_pool: np.ndarray,
+    live_tags: Sequence[tuple[int, int, int, bool]],
+    pitch: tuple[float, float],
+    blocked: np.ndarray,
+    min_frames: int = 25,
+    gap_min: float = 0.2,
+    speed_min: float = 1.5,
+    raw_ball: np.ndarray | None = None,
+    marginal_max_m: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Frames where a dead-ball lock broke against evidence that play never stopped.
+
+    The events ballot (weight 1.0) pins the label to ``D``, so while a dead run
+    lasts no voter can reopen it — but the smart tags can read the situation the
+    out-of-play trigger misfired on.  ``live_tags`` are ``(start, stop, team,
+    strong)`` triples: a *strong* live-phase tag (PROGRESSION, CREATING CHANCES)
+    naming the team the raw pool already backs by ``gap_min``, with the consensus
+    ball on the grass and moving at ``speed_min``, revives the run outright — the
+    stoppage is a tracking excursion (measured 143 524: an ATD swing 4 m past the
+    chalk held D for 16 s while Athletic drove forward).  A *weak* team tag (ball
+    in the box, final third) only revives when the out was geometrically marginal:
+    the raw ball crossed the chalk but never passed ``marginal_max_m`` (measured
+    116 791: 10 cm of calibration noise at y = 68.1 on a 68.0 m pitch punctured
+    live possession).  ``blocked`` frames — setpiece tags, or a ball the cameras
+    actually lost — never revive.
+    """
+    b = np.asarray(ball_pitch, dtype=np.float64)
+    n = b.shape[0]
+    pool = np.asarray(evidence_pool, dtype=np.float64)
+    length, width = float(pitch[0]), float(pitch[1])
+    live = np.zeros(n, dtype=bool)
+    strong = np.zeros(n, dtype=bool)
+    team = np.full(n, -1, dtype=np.int8)
+    # two passes, weak tags first: a strong tag always wins the frame's team
+    for want_strong in (False, True):
+        for s, e, t, st in live_tags:
+            if bool(st) != want_strong:
+                continue
+            s2, e2 = max(0, int(s)), min(n, int(e) + 1)
+            if e2 > s2:
+                live[s2:e2] = True
+                strong[s2:e2] |= bool(st)
+                team[s2:e2] = int(t)
+    finite = np.isfinite(b).all(axis=1)
+    inside = (
+        finite
+        & (b[:, 0] > -0.3)
+        & (b[:, 0] < length + 0.3)
+        & (b[:, 1] > -0.3)
+        & (b[:, 1] < width + 0.3)
+    )
+    speed = np.full(n, np.nan, dtype=np.float64)
+    ok = finite[1:] & finite[:-1]
+    speed[1:][ok] = np.linalg.norm((b[1:] - b[:-1])[ok], axis=1) * FPS
+    gap = np.abs(pool[:, 1] - pool[:, 0])
+    winner = np.argmax(pool[:, :2], axis=1)
+    core = (
+        live
+        & inside
+        & np.isfinite(speed)
+        & (speed >= float(speed_min))
+        & (winner == team)
+        & ~np.asarray(blocked, dtype=bool)
+    )
+    # how far past the chalk the raw ball strayed, per frame (a marginal cross only)
+    if raw_ball is None:
+        crossed = np.zeros(n, dtype=bool)
+    else:
+        rb = np.asarray(raw_ball, dtype=np.float64)
+        rfinite = np.isfinite(rb).all(axis=1)
+        over = np.maximum(
+            np.maximum(np.maximum(-rb[:, 0], rb[:, 0] - length), np.maximum(-rb[:, 1], rb[:, 1] - width)),
+            0.0,
+        )
+        crossed = rfinite & (over > 0.0) & (over <= float(marginal_max_m))
+    # a strong live tag reopens when the pool clearly backs it (gap); a weak tag needs
+    # the marginal chalk crossing itself as proof — a celebration has no crossing at all,
+    # a real throw-in restart is setpiece-blocked
+    qualified = core & ((strong & (gap >= float(gap_min))) | crossed)
+    mask = np.zeros(n, dtype=bool)
+    out_team = np.full(n, -1, dtype=np.int8)
+    for s, e in _bool_runs(qualified):
+        if e - s >= int(min_frames):
+            mask[s:e] = True
+            out_team[s:e] = team[s]
+    return mask, out_team
+
+
+def possession_revival_mask(
+    ball_pitch: np.ndarray,
+    players: np.ndarray,
+    player_present: np.ndarray,
+    player_teams: np.ndarray,
+    evidence_pool: np.ndarray,
+    pitch: tuple[float, float],
+    blocked: np.ndarray,
+    dist_max: float = 2.0,
+    hold_cov: float = 0.7,
+    gap_min: float = 0.1,
+    speed_min: float = 1.5,
+    min_frames: int = 25,
+    hold_half: int = 25,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Frames where a dead-ball lock sat on top of a player who was simply playing.
+
+    The events ballot pins ``D`` while a false stoppage lasts and neither the smart
+    tags nor any voter can reach the label.  The ball's own state can: a player of
+    one team is at the ball (``dist_max``), the ball is on the grass and moving
+    (``speed_min``) and the raw pool backs that same player's team (``gap_min``) —
+    for a ``hold_cov`` share of every ``hold_half``-frame neighbourhood and at
+    least ``min_frames`` in a row.  The pool condition is what keeps goal
+    celebrations out (the crowd around the ball belongs to the scoring team, but
+    while the play is really dead the pool has collapsed onto D); ``blocked``
+    frames — setpiece tags, a ball the cameras lost, a ball out of bounds — never
+    revive.  Measured 170 623: Athletic's BUILD UP carried the ball 17 m while the
+    label sat dead; 143 488 filled the hole between the false out and the tag's
+    start; inside the public window the rule touches zero frames.
+    """
+    b = np.asarray(ball_pitch, dtype=np.float64)
+    pl = np.asarray(players, dtype=np.float64)
+    present = np.asarray(player_present, dtype=bool)
+    team_of = np.asarray(player_teams, dtype=np.int8)
+    pool = np.asarray(evidence_pool, dtype=np.float64)
+    n = b.shape[0]
+    fin = np.isfinite(b).all(axis=1)
+    d = np.linalg.norm(pl - b[:, None, :], axis=2)
+    d[~present] = np.inf
+    d[~fin] = np.inf
+    dmin = d.min(axis=1)
+    nearest = team_of[np.clip(np.argmin(d, axis=1), 0, team_of.shape[0] - 1)]
+    length, width = float(pitch[0]), float(pitch[1])
+    inside = (
+        fin
+        & (b[:, 0] > -0.3) & (b[:, 0] < length + 0.3)
+        & (b[:, 1] > -0.3) & (b[:, 1] < width + 0.3)
+    )
+    speed = np.full(n, np.nan, dtype=np.float64)
+    ok = fin[1:] & fin[:-1]
+    speed[1:][ok] = np.linalg.norm((b[1:] - b[:-1])[ok], axis=1) * FPS
+    gap = np.abs(pool[:, 1] - pool[:, 0])
+    winner = np.argmax(pool[:, :2], axis=1)
+    glue = (
+        inside
+        & np.isfinite(speed)
+        & (speed >= float(speed_min))
+        & (dmin <= float(dist_max))
+        & (nearest >= 0) & (nearest < 2)
+        & (winner == nearest)
+        & (gap >= float(gap_min))
+        & ~np.asarray(blocked, dtype=bool)
+    )
+    kernel = np.ones(2 * int(hold_half) + 1)
+    cov = np.convolve(glue.astype(np.float64), kernel, mode="same") / np.convolve(
+        np.ones(n), kernel, mode="same"
+    )
+    mask = np.zeros(n, dtype=bool)
+    out_team = np.full(n, -1, dtype=np.int8)
+    for s, e in _bool_runs(cov >= float(hold_cov)):
+        if e - s < int(min_frames):
+            continue
+        teams_in = nearest[s:e][glue[s:e]]
+        if not len(teams_in):
+            continue
+        vals, counts = np.unique(teams_in, return_counts=True)
+        mask[s:e] = True
+        out_team[s:e] = int(vals[int(np.argmax(counts))])
+    return mask, out_team
 
 
 def gate_events(
@@ -988,6 +1319,196 @@ def keeper_holds(
     return out
 
 
+def keeper_area_catches(
+    consensus: np.ndarray,
+    speed: np.ndarray,
+    valid: np.ndarray,
+    event_dead: np.ndarray,
+    player_sets: Sequence[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    defenders: np.ndarray,
+    pitch: tuple[float, float],
+    halves: tuple[tuple[int, int], ...],
+    params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
+    evidence_pool: np.ndarray | None = None,
+) -> list[tuple[int, int, int]]:
+    """Ball stops inside the penalty area of the goal its defending side protects.
+
+    The pixel twin (``keeper_holds``) goes blind right by the goal, where depth
+    compresses the boxes and a gathered ball never trips the contain bits; the pitch
+    geometry reads the same story: the ball decelerates from flight speed to a stop
+    inside the defended area (``area_catch_*``) with no opponent near, then
+    leaves again.  The catch belongs to the defending side (``defenders[h, g]``, the
+    keeper-roster geometry of :mod:`possession_lab.keepers`) from the kick that sent
+    the ball in — the nearest velocity jump searched back over
+    ``area_catch_extend_max`` frames, so the pass to the keeper is the keeper's ball
+    the whole way — through the clearance.  A keeper gathering the ball keeps his
+    keeper's possession, not the side the lagging prior last saw it with (measured
+    132 355: the Athletic keeper took the ball at x = 9.4 m and punted at 18.9 m/s
+    while the fused prior kept the spell H).  Where ``evidence_pool`` (the raw
+    voter pool) is given, its mean margin for the defending side over the catch
+    must reach ``area_catch_min_pool_margin``: a ball that dies inside the area
+    while the voters are neutral belongs to whatever the rest of the system
+    already read (measured 11 598: the ball rolled out at the goal mouth with the
+    pool at 0.07 -- a conceded goal, not a keeper's catch; without the guard it
+    cost the correct A spell 11 552-11 627).  With the pool given the spell start
+    anchors on the earliest frame whose support runs up to the catch (dips of at
+    most ``area_catch_extend_dip_max`` frames tolerated through the flight);
+    without it the start is the nearest velocity jump (``area_catch_kick_gain``)
+    searched back over ``area_catch_extend_max`` frames.  Returns
+    ``(start, catch, team)``.
+    """
+    length, width = float(pitch[0]), float(pitch[1])
+    pool = None if evidence_pool is None else np.asarray(evidence_pool, dtype=np.float64)
+    ball = np.asarray(consensus, dtype=np.float64)
+    sp = np.asarray(speed, dtype=np.float64)
+    ok = np.asarray(valid, dtype=bool)
+    dead = np.asarray(event_dead, dtype=bool)
+    n = ball.shape[0]
+    half_of = np.full(n, -1, dtype=np.int8)
+    for h, (a, b) in enumerate(halves):
+        half_of[int(a) : int(b)] = h
+    sets = [
+        (np.asarray(p, dtype=np.float64), np.asarray(t), np.asarray(pr, dtype=bool))
+        for p, t, pr in player_sets
+    ]
+    trigger = np.zeros(n, dtype=bool)
+    team_at = np.full(n, -1, dtype=np.int8)
+    for t in range(1, n):
+        if not ok[t] or dead[t]:
+            continue
+        if float(np.mean(dead[max(0, t - 10): min(n, t + 10)])) > params.dead_max:
+            continue
+        if not np.isfinite(sp[t]) or sp[t] > params.area_catch_max_speed:
+            continue
+        w = sp[max(0, t - int(params.area_catch_prior_frames)) : t]
+        if w.size == 0 or not np.isfinite(w).any() or float(np.nanmax(w)) < params.area_catch_in_min_speed:
+            continue
+        x, y = ball[t]
+        if not np.isfinite([x, y]).all():
+            continue
+        side = 0 if x < length / 2.0 else 1
+        goal_x = 0.0 if side == 0 else length
+        if abs(x - goal_x) > params.area_catch_depth_m or abs(y - width / 2.0) > params.area_catch_half_width_m:
+            continue
+        h_i = int(half_of[t])
+        if h_i < 0 or h_i >= defenders.shape[0]:
+            continue
+        team = int(defenders[h_i, side])
+        if team not in (H, 1):
+            continue
+        d_min = np.inf
+        for pitch_p, teams_p, present_p in sets:
+            if t >= pitch_p.shape[0]:
+                continue
+            teams_t = teams_p[t] if teams_p.ndim == 2 else teams_p
+            m = present_p[t] & (teams_t == (1 if team == H else H))
+            if not np.any(m):
+                continue
+            with np.errstate(invalid="ignore"):
+                dist = np.linalg.norm(pitch_p[t][m] - ball[t], axis=1)
+            finite = dist[np.isfinite(dist)]
+            if finite.size:
+                d_min = min(d_min, float(finite.min()))
+        if d_min < params.area_catch_opp_min_m:
+            continue
+        trigger[t] = True
+        team_at[t] = team
+    out: list[tuple[int, int, int]] = []
+    for s, e in _bool_runs(trigger):
+        catch = s
+        team = int(team_at[catch])
+        if pool is not None:
+            seg = pool[s:e, team] - pool[s:e, 1 - team]
+            if seg.size == 0 or float(np.mean(seg)) < params.area_catch_min_pool_margin:
+                continue  # voters neutral while the ball lay there — not their keeper's catch
+        start = catch
+        lo = max(1, catch - int(params.area_catch_extend_max))
+        if pool is not None:
+            # the pass-in belongs to the catcher's side from the touch the voters
+            # first backed, walking back over the flight's dips (measured 132 272:
+            # the pool turned A when his player won the ball at x = 37 m, dipped
+            # to 0.02 only while the ball was in the air towards the keeper)
+            best, dips = catch, 0
+            for k in range(catch - 1, lo - 1, -1):
+                if pool[k, team] - pool[k, 1 - team] >= params.area_catch_extend_margin:
+                    best, dips = k, 0
+                else:
+                    dips += 1
+                    if dips > int(params.area_catch_extend_dip_max):
+                        break
+            start = best
+        else:
+            for k in range(catch, lo, -1):
+                if (
+                    np.isfinite(sp[k])
+                    and np.isfinite(sp[k - 1])
+                    and sp[k] - sp[k - 1] >= params.area_catch_kick_gain
+                    and sp[k] >= params.area_catch_in_min_speed
+                ):
+                    start = k
+                    break
+        out.append((int(start), int(catch), team))
+    return out
+
+
+def expire_owned_spells(
+    intervals: Sequence[Sequence[int]],
+    evidence_pool: np.ndarray,
+    event_dead: np.ndarray,
+    speed: np.ndarray,
+    params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
+    protected: frozenset[tuple[int, int]] = frozenset(),
+) -> tuple[list[TransitionEvent], list[tuple[int, int, int]]]:
+    """Cut pixel-owned spells the camera's own evidence no longer supports.
+
+    An owned interval (contact/kicker/area) runs to the next fused boundary — made
+    for the touch that opens play, not the touch that dies out: measured 132 743, a
+    lone A touch at 132 619 owned 326 frames while the ball settled under a
+    Barcelona player and the raw voter pool (``raw_evidence_pool``) insisted on H at
+    0.80-0.94.  Where the pool dominates for the other team at probability ≥
+    ``expire_min_prob`` and margin ≥ ``expire_min_margin`` with a slow ball
+    (≤ ``expire_max_ball_speed`` m/s — control, not flight) for ≥ ``expire_min_frames``
+    live frames fully inside an interval, the interval ends at the run's start and a
+    ``control`` event marks the handover.  Keeper holds (``protected`` by
+    ``(start, team)``) are never expired: there the camera literally watched the ball
+    in the keeper's box.  Returns ``(events, intervals)``.
+    """
+    pool = np.asarray(evidence_pool, dtype=np.float64)
+    dead = np.asarray(event_dead, dtype=bool)
+    sp = np.asarray(speed, dtype=np.float64)
+    ivs = [list(iv) for iv in intervals]
+    found: list[tuple[int, int, int, int]] = []  # (interval index, run start, run end, taker)
+    for i, (a, b, team) in enumerate(ivs):
+        if (int(a), int(team)) in protected:
+            continue
+        if int(team) not in (H, 1):
+            continue
+        other = 1 if int(team) == H else H
+        ok = (
+            (pool[:, other] >= params.expire_min_prob)
+            & (pool[:, other] - pool[:, int(team)] >= params.expire_min_margin)
+            & (sp <= params.expire_max_ball_speed)
+            & (~dead)
+        )
+        for s, e in _bool_runs(ok):
+            if e - s < int(params.expire_min_frames):
+                continue
+            if a <= s and e <= b:
+                found.append((i, s, e, other))
+    events: list[TransitionEvent] = []
+    for i, s, e, other in sorted(found, key=lambda r: (r[0], r[1])):
+        iv = ivs[i]
+        if iv[1] <= s:
+            continue  # an earlier run already ended this interval
+        margin = float(np.mean(pool[s:e, other] - pool[s:e, int(iv[2])]))
+        iv[1] = s
+        events.append(
+            TransitionEvent(start=s, frame=s, kind="control", team=other,
+                            distance=1.0, support=min(1.0, margin))
+        )
+    return events, [(a, b, int(t_)) for a, b, t_ in ivs if b > a]
+
+
 def gate_pixel_events(
     contact: Sequence[tuple],
     kicker: Sequence[tuple],
@@ -1000,6 +1521,8 @@ def gate_pixel_events(
     relay: frozenset[tuple[int, int]] = frozenset(),
     holds: Sequence[KeeperHold] = (),
     atd_ball: np.ndarray | None = None,
+    pitch_close: np.ndarray | None = None,
+    pool: np.ndarray | None = None,
 ) -> tuple[list[TransitionEvent], list[tuple[int, int, int]]]:
     """Admit pixel events into a sequential stream and hand out owned intervals.
 
@@ -1014,6 +1537,10 @@ def gate_pixel_events(
     four agreeing sensors plus a cross-stream-attested hold that the prior team never
     shows on camera.  A settled spell is otherwise left to the pitch geometry: box
     overlap in depth looks identical to a take and must not puncture the spell.
+    And a contact never beats a player standing on the ball: where ``pitch_close``
+    gives it, if the other side's nearest player is ``contact_opp_pitch_margin``
+    metres closer to the ball than the containing side's, the box swallowed the
+    pixel at depth and the contact is dropped.
 
     Events are processed in frame order.  A team that already owns the stream cannot
     re-anchor, and admitting the other team's flip ends the previous interval.  Each
@@ -1079,6 +1606,18 @@ def gate_pixel_events(
             continue
         if float(np.mean(event_dead[max(0, frame - 10):frame + 10])) > params.dead_max:
             continue
+        if is_contact and pitch_close is not None and not is_relay:
+            d = pitch_close[min(frame, pitch_close.shape[0] - 1)]
+            if (
+                np.isfinite(d).all()
+                and d[1 - team] + params.contact_opp_pitch_margin <= d[team]
+            ):
+                contradicted = True
+                if pool is not None and params.contact_opp_pool_margin > 0:
+                    pm = pool[min(frame, pool.shape[0] - 1)]
+                    contradicted = float(pm[1 - team]) - float(pm[team]) >= params.contact_opp_pool_margin
+                if contradicted:
+                    continue  # the other side stands on the ball and the voters agree
         if any(kev.team == team and abs(kev.frame - frame) < params.nms_window for kev in kept_kinematic):
             continue  # kinematics already attributes this moment
         team_bit = 1 if team == H else 2
@@ -1164,7 +1703,9 @@ def build_pulse(
     for i, ev in enumerate(events):
         nxt = events[i + 1].start if i + 1 < len(events) else min(n_frames, ev.start + params.pulse_max_span)
         span = min(max(params.pulse_min_span, nxt - ev.start), params.pulse_max_span)
-        if ev.kind == "hold":
+        if ev.kind in ("hold", "area"):
+            strength = params.contact_pulse_solid if ev.kind == "area" else params.contact_pulse
+        elif ev.kind == "control":
             strength = params.contact_pulse
         elif ev.kind in ("contact", "kicker"):
             strength = (
@@ -1471,6 +2012,7 @@ def apply_transition_layer(
     keeper_pitch: tuple[float, float] | None = None,
     atd_ball_present: np.ndarray | None = None,
     dead_support: np.ndarray | None = None,
+    evidence_pool: np.ndarray | None = None,
 ) -> TransitionLayerResult:
     """Detect, gate, and decode ball-control transitions on top of the fused poll.
 
@@ -1519,13 +2061,59 @@ def apply_transition_layer(
         pixel_kept, intervals = gate_pixel_events(
             contact, kicker, contain, codes_pooled, np.asarray(fused_probability, dtype=np.float64),
             event_dead, events, params, relay=relay, holds=holds, atd_ball=atd_ball_present,
+            pitch_close=_pitch_nearest_m(box_evidence),
+            pool=None if evidence_pool is None else np.asarray(evidence_pool, dtype=np.float64),
         )
+        intervals = [list(iv) for iv in intervals]
         events = tuple(sorted(events + tuple(pixel_kept), key=lambda e: (e.start, e.frame)))
         dropped += len(contact) + len(kicker) + len(holds) - len(pixel_kept)
         n_contact, n_kicker, n_hold = len(contact), len(kicker), sum(1 for e in pixel_kept if e.kind == "hold")
+        hold_keys = frozenset((int(e.start), int(e.team)) for e in pixel_kept if e.kind == "hold")
     else:
         n_contact = n_kicker = n_hold = 0
         intervals: list[tuple[int, int, int]] = []
+        hold_keys: frozenset[tuple[int, int]] = frozenset()
+    n_area = 0
+    if keeper_defenders is not None and keeper_pitch is not None:
+        # the pitch twin of the keeper hold: a stop inside the defended area that the
+        # blind near-goal pixel channel never saw belongs to the side that owns goal
+        bnd = np.flatnonzero(np.r_[True, codes_pooled[1:] != codes_pooled[:-1]])
+        for start, frame, team in keeper_area_catches(
+            consensus, speed, valid, np.asarray(event_dead, dtype=bool), sets64,
+            keeper_defenders, keeper_pitch, halves if halves is not None else GRADED_HALVES, params,
+            evidence_pool=None if evidence_pool is None else np.asarray(evidence_pool, dtype=np.float64),
+        ):
+            if any(a <= frame < b and t_ == team for a, b, t_ in intervals):
+                continue  # the pixel channel already owns the catch with the same team
+            if any((a <= frame < b) and (a, int(t_)) in hold_keys for a, b, t_ in intervals):
+                continue  # a keeper hold literally watched the ball in the box
+            k = int(np.searchsorted(bnd, start, side="right"))
+            next_b = int(bnd[k]) if k < bnd.size else int(codes_pooled.shape[0])
+            stop = min(next_b, start + int(params.area_catch_max_span))
+            for iv in intervals:
+                if int(iv[2]) == team:
+                    continue
+                if iv[1] > start and iv[0] < stop and (iv[0], int(iv[2])) not in hold_keys:
+                    iv[1] = start  # the catch takes the spell over from its front edge
+            intervals = [iv for iv in intervals if iv[1] > iv[0]]
+            if not any(a <= frame < b and t_ != team for a, b, t_ in intervals):
+                intervals.append([start, stop, team])
+                events = tuple(sorted(
+                    (*events,
+                     TransitionEvent(start=start, frame=frame, kind="area", team=team,
+                                     distance=1.0, support=1.0)),
+                    key=lambda e: (e.start, e.frame),
+                ))
+                n_area += 1
+    n_control = 0
+    if evidence_pool is not None:
+        control, intervals = expire_owned_spells(
+            intervals, np.asarray(evidence_pool, dtype=np.float64),
+            np.asarray(event_dead, dtype=bool), speed, params, hold_keys,
+        )
+        n_control = len(control)
+        if control:
+            events = tuple(sorted(events + tuple(control), key=lambda e: (e.start, e.frame)))
     pulse, teams, boost, protect = build_pulse(events, codes_pooled.shape[0], params)
     log_em = np.log(np.clip(np.asarray(fused_probability, dtype=np.float64), EPS, 1.0)).copy()
     for team in (H, 1):
@@ -1566,12 +2154,14 @@ def apply_transition_layer(
         n_contact=n_contact,
         n_kicker=n_kicker,
         n_hold=n_hold,
+        n_control=n_control,
+        n_area=n_area,
     )
 
 
 def events_to_rows(events: Sequence[TransitionEvent]) -> np.ndarray:
     """Events as an ``(m, 6)`` array: start, frame, kind (0=kick, 1=onset, 2=contact,
-    3=kicker, 4=hold), team, distance, support."""
+    3=kicker, 4=hold, 5=control, 6=area), team, distance, support."""
     if not events:
         return np.zeros((0, 6), dtype=np.float64)
     return np.asarray([e.as_row() for e in events], dtype=np.float64)
@@ -1585,12 +2175,14 @@ __all__ = [
     "TransitionParams",
     "apply_transition_layer",
     "ball_conflict_mask",
+    "ball_lost_mask",
     "ball_speed",
     "ball_stale_mask",
     "build_pulse",
     "carry_dead_through_blind",
     "control_map",
     "dead_needs_support",
+    "dead_revival_mask",
     "decode_with_events",
     "detect_contact_events",
     "detect_kick_events",
@@ -1598,10 +2190,15 @@ __all__ = [
     "detect_onset_events",
     "events_to_rows",
     "evidence_probability",
+    "expire_owned_spells",
     "gate_events",
     "gate_pixel_events",
     "hold_touch_through",
+    "keeper_area_catches",
     "keeper_holds",
     "KeeperHold",
+    "out_of_bounds_mask",
+    "possession_revival_mask",
     "pixel_contact",
+    "raw_evidence_pool",
 ]

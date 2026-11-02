@@ -1764,3 +1764,53 @@ def resample_to_frames(
         "age": frame_array - sample_frames,
         "present": np.ones(frame_array.size, dtype=bool),
     }
+
+
+def relabel_teams_from_tracking(
+    players_pitch: np.ndarray,
+    present: np.ndarray,
+    teams: np.ndarray,
+    track_xy: np.ndarray,
+    track_teams: np.ndarray,
+    track_present: np.ndarray,
+    pitch_size: tuple[float, float],
+    max_match_m: float = 2.0,
+) -> np.ndarray:
+    """Adopt the tracking file's roster team for every detection it recognises.
+
+    The jersey classifier loses the teams when the light fails (measured 155 945:
+    every visible player labelled Barcelona, eight more unknown, while the camera
+    plainly showed both kits).  The tactical tracking file carries each slot's
+    roster team — an identity, not a guess — and its pitch positions agree with the
+    calibrated detections to well under a metre.  Each present detection takes the
+    team of the nearest present tracking slot within ``max_match_m`` metres; slots
+    outside the pitch (ghosts, throw-in corridors) are never a match, and a
+    detection nobody recognises keeps its own label.
+    """
+    p = np.asarray(players_pitch, dtype=np.float64)
+    pres = np.asarray(present, dtype=bool)
+    out_teams = np.asarray(teams).copy()
+    tk = np.asarray(track_xy, dtype=np.float64)
+    tk_t = np.asarray(track_teams)
+    tk_p = np.asarray(track_present, dtype=bool)
+    length, width = float(pitch_size[0]), float(pitch_size[1])
+    n = min(p.shape[0], tk.shape[0])
+    with np.errstate(invalid="ignore"):
+        inside = (
+            np.isfinite(tk[:n]).all(axis=2)
+            & (tk[:n, :, 0] > -1.0) & (tk[:n, :, 0] < length + 1.0)
+            & (tk[:n, :, 1] > -1.0) & (tk[:n, :, 1] < width + 1.0)
+        )
+    slot_ok = tk_p[:n] & inside & np.isin(tk_t, (0, 1))[None, :]
+    for f in range(n):
+        det = np.flatnonzero(pres[f] & np.isfinite(p[f]).all(axis=1))
+        if det.size == 0 or not slot_ok[f].any():
+            continue
+        slots = np.flatnonzero(slot_ok[f])
+        with np.errstate(invalid="ignore"):
+            d = np.linalg.norm(p[f][det, None, :] - tk[f][slots][None], axis=2)
+        nearest = d.argmin(axis=1)
+        close = d[np.arange(det.size), nearest] <= max_match_m
+        if close.any():
+            out_teams[f, det[close]] = tk_t[slots][nearest[close]]
+    return out_teams
