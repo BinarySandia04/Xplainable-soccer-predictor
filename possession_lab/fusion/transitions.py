@@ -214,6 +214,15 @@ class TransitionParams:
     lost_conf_eps: float = 0.02
     oob_margin_m: float = 0.8  # metres past the chalk before "out" (a line ball is in)
     oob_min_frames: int = 25  # frames outside before the stoppage is called
+    # -- escape from a falsely locked dead state: the events ballot (weight 1.0)
+    # pins the label to D, so no voter can reopen it — but the smart tags can.
+    # A live-phase tag naming the team the voters already back, with the ball on
+    # the grass and moving, means the stoppage never happened (measured 143 524:
+    # an ATD excursion 4 m past the chalk held D for 16 s while Athletic drove
+    # forward under a PROGRESSION tag the voters agreed with at 0.85)
+    revive_min_frames: int = 25  # frames of live-play evidence before reopening
+    revive_gap_min: float = 0.2  # raw pool margin the tagged team must command
+    revive_speed_min: float = 1.5  # m/s of the consensus ball proving play is live
 
 
 DEFAULT_TRANSITION_PARAMS = TransitionParams()
@@ -779,6 +788,96 @@ def out_of_bounds_mask(
         if e - s >= int(min_frames):
             mask[s:e] = True
     return mask
+
+
+def dead_revival_mask(
+    ball_pitch: np.ndarray,
+    evidence_pool: np.ndarray,
+    live_tags: Sequence[tuple[int, int, int, bool]],
+    pitch: tuple[float, float],
+    blocked: np.ndarray,
+    min_frames: int = 25,
+    gap_min: float = 0.2,
+    speed_min: float = 1.5,
+    raw_ball: np.ndarray | None = None,
+    marginal_max_m: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Frames where a dead-ball lock broke against evidence that play never stopped.
+
+    The events ballot (weight 1.0) pins the label to ``D``, so while a dead run
+    lasts no voter can reopen it — but the smart tags can read the situation the
+    out-of-play trigger misfired on.  ``live_tags`` are ``(start, stop, team,
+    strong)`` triples: a *strong* live-phase tag (PROGRESSION, CREATING CHANCES)
+    naming the team the raw pool already backs by ``gap_min``, with the consensus
+    ball on the grass and moving at ``speed_min``, revives the run outright — the
+    stoppage is a tracking excursion (measured 143 524: an ATD swing 4 m past the
+    chalk held D for 16 s while Athletic drove forward).  A *weak* team tag (ball
+    in the box, final third) only revives when the out was geometrically marginal:
+    the raw ball crossed the chalk but never passed ``marginal_max_m`` (measured
+    116 791: 10 cm of calibration noise at y = 68.1 on a 68.0 m pitch punctured
+    live possession).  ``blocked`` frames — setpiece tags, or a ball the cameras
+    actually lost — never revive.
+    """
+    b = np.asarray(ball_pitch, dtype=np.float64)
+    n = b.shape[0]
+    pool = np.asarray(evidence_pool, dtype=np.float64)
+    length, width = float(pitch[0]), float(pitch[1])
+    live = np.zeros(n, dtype=bool)
+    strong = np.zeros(n, dtype=bool)
+    team = np.full(n, -1, dtype=np.int8)
+    # two passes, weak tags first: a strong tag always wins the frame's team
+    for want_strong in (False, True):
+        for s, e, t, st in live_tags:
+            if bool(st) != want_strong:
+                continue
+            s2, e2 = max(0, int(s)), min(n, int(e) + 1)
+            if e2 > s2:
+                live[s2:e2] = True
+                strong[s2:e2] |= bool(st)
+                team[s2:e2] = int(t)
+    finite = np.isfinite(b).all(axis=1)
+    inside = (
+        finite
+        & (b[:, 0] > -0.3)
+        & (b[:, 0] < length + 0.3)
+        & (b[:, 1] > -0.3)
+        & (b[:, 1] < width + 0.3)
+    )
+    speed = np.full(n, np.nan, dtype=np.float64)
+    ok = finite[1:] & finite[:-1]
+    speed[1:][ok] = np.linalg.norm((b[1:] - b[:-1])[ok], axis=1) * FPS
+    gap = np.abs(pool[:, 1] - pool[:, 0])
+    winner = np.argmax(pool[:, :2], axis=1)
+    core = (
+        live
+        & inside
+        & np.isfinite(speed)
+        & (speed >= float(speed_min))
+        & (winner == team)
+        & ~np.asarray(blocked, dtype=bool)
+    )
+    # how far past the chalk the raw ball strayed, per frame (a marginal cross only)
+    if raw_ball is None:
+        crossed = np.zeros(n, dtype=bool)
+    else:
+        rb = np.asarray(raw_ball, dtype=np.float64)
+        rfinite = np.isfinite(rb).all(axis=1)
+        over = np.maximum(
+            np.maximum(np.maximum(-rb[:, 0], rb[:, 0] - length), np.maximum(-rb[:, 1], rb[:, 1] - width)),
+            0.0,
+        )
+        crossed = rfinite & (over > 0.0) & (over <= float(marginal_max_m))
+    # a strong live tag reopens when the pool clearly backs it (gap); a weak tag needs
+    # the marginal chalk crossing itself as proof — a celebration has no crossing at all,
+    # a real throw-in restart is setpiece-blocked
+    qualified = core & ((strong & (gap >= float(gap_min))) | crossed)
+    mask = np.zeros(n, dtype=bool)
+    out_team = np.full(n, -1, dtype=np.int8)
+    for s, e in _bool_runs(qualified):
+        if e - s >= int(min_frames):
+            mask[s:e] = True
+            out_team[s:e] = team[s]
+    return mask, out_team
 
 
 def gate_events(
@@ -1998,6 +2097,7 @@ __all__ = [
     "carry_dead_through_blind",
     "control_map",
     "dead_needs_support",
+    "dead_revival_mask",
     "decode_with_events",
     "detect_contact_events",
     "detect_kick_events",

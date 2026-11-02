@@ -1455,5 +1455,105 @@ class RelabelTeamsFromTrackingTests(unittest.TestCase):
         self.assertEqual(out[0].tolist(), [-1])
 
 
+class DeadRevivalMaskTests(unittest.TestCase):
+    """A falsely locked D reopens only to a live tag the voters back."""
+
+    @staticmethod
+    def scene(n: int = 200) -> tuple[np.ndarray, np.ndarray]:
+        ball = np.zeros((n, 2), dtype=np.float64)
+        ball[:, 0] = np.arange(n) * (2.0 / 25.0)  # 2 m/s along x, on the grass
+        ball[:, 1] = 10.0
+        pool = np.tile([0.05, 0.75, 0.02], (n, 1))  # the pool backs A by 0.70
+        return ball, pool
+
+    def run_case(self, tags, blocked=None, **kw):
+        from possession_lab.fusion.transitions import dead_revival_mask
+
+        ball, pool = self.scene()
+        blocked = np.zeros(200, dtype=bool) if blocked is None else blocked
+        return dead_revival_mask(ball, pool, tags, (105.0, 68.0), blocked, **kw)
+
+    def test_tagged_live_run_revives_with_the_tagged_team(self):
+        mask, team = self.run_case([(50, 149, 1, True)])
+        self.assertTrue(mask[50:150].all())
+        self.assertFalse(mask[:50].any() or mask[150:].any())
+        self.assertEqual(int(team[60]), 1)
+
+    def test_short_run_does_not_revive(self):
+        mask, _ = self.run_case([(50, 60, 1, True)], min_frames=25)
+        self.assertFalse(mask.any())
+
+    def test_stationary_ball_does_not_revive(self):
+        from possession_lab.fusion.transitions import dead_revival_mask
+
+        ball, pool = self.scene()
+        ball[:, 0] = 50.0  # parked: play is not live
+        mask, _ = dead_revival_mask(ball, pool, [(50, 149, 1, True)], (105.0, 68.0), np.zeros(200, bool))
+        self.assertFalse(mask.any())
+
+    def test_blocked_frames_never_revive(self):
+        blocked = np.zeros(200, dtype=bool)
+        blocked[50:150] = True  # a real setpiece covers the window
+        mask, _ = self.run_case([(50, 149, 1, True)], blocked=blocked)
+        self.assertFalse(mask.any())
+
+    def test_pool_against_the_tag_never_revives(self):
+        from possession_lab.fusion.transitions import dead_revival_mask
+
+        ball, _ = self.scene()
+        pool = np.tile([0.75, 0.05, 0.02], (200, 1))  # voters back H, tag says A
+        mask, _ = dead_revival_mask(ball, pool, [(50, 149, 1, True)], (105.0, 68.0), np.zeros(200, bool))
+        self.assertFalse(mask.any())
+
+    def test_off_pitch_ball_does_not_revive(self):
+        from possession_lab.fusion.transitions import dead_revival_mask
+
+        ball, pool = self.scene()
+        ball[:, 1] = 75.0  # 7 m past the touchline: this one is genuinely out
+        mask, _ = dead_revival_mask(ball, pool, [(50, 149, 1, True)], (105.0, 68.0), np.zeros(200, bool))
+        self.assertFalse(mask.any())
+
+    def test_weak_tag_without_crossing_does_not_revive(self):
+        # a celebration: zone tag over a parked-the-game scene, ball never left the grass
+        from possession_lab.fusion.transitions import dead_revival_mask
+
+        ball, pool = self.scene()
+        pool = np.tile([0.46, 0.52, 0.02], (200, 1))  # winner backs the tag, but no gap
+        mask, _ = dead_revival_mask(
+            ball, pool, [(50, 149, 1, False)], (105.0, 68.0), np.zeros(200, bool),
+            raw_ball=ball.copy(),
+        )
+        self.assertFalse(mask.any())
+
+    def test_weak_tag_revives_a_marginal_chalk_crossing(self):
+        # measured 116 791: consensus grazes 0.1 m over the chalk, pool gap is tiny,
+        # a zone tag names the winner — the out never happened
+        from possession_lab.fusion.transitions import dead_revival_mask
+
+        ball, pool = self.scene()
+        ball[:, 1] = 67.95  # consensus grazes the touchline but stays inside the pad
+        pool = np.tile([0.46, 0.52, 0.02], (200, 1))  # winner A by 0.06 only
+        raw_ball = ball.copy()
+        raw_ball[:, 1] = 68.1  # raw ball 0.1 m past the 68.0 chalk: a calibration graze
+        mask, team = dead_revival_mask(
+            ball, pool, [(50, 149, 1, False)], (105.0, 68.0), np.zeros(200, bool),
+            raw_ball=raw_ball,
+        )
+        self.assertTrue(mask[50:150].all())
+        self.assertEqual(int(team[60]), 1)
+
+    def test_weak_tag_not_guaranteed_for_full_gap_needs_no_crossing_never_opens(self):
+        # strong tags still demand the gap: no crossing, thin gap -> stays locked
+        from possession_lab.fusion.transitions import dead_revival_mask
+
+        ball, _ = self.scene()
+        pool = np.tile([0.30, 0.40, 0.02], (200, 1))  # A wins by 0.10 < gap_min
+        mask, _ = dead_revival_mask(
+            ball, pool, [(50, 149, 1, True)], (105.0, 68.0), np.zeros(200, bool),
+            raw_ball=ball.copy(),
+        )
+        self.assertFalse(mask.any())
+
+
 if __name__ == "__main__":
     unittest.main()
