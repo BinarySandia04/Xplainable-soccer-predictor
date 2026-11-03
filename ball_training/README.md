@@ -1,5 +1,15 @@
 # Ball detector retraining (YOLO11s)
 
+> **Status: side experiment — not part of the submission chain.**
+> This experiment fine-tuned on frames extracted from the provided match video (`mt__` images,
+> auto-labelled from the organisers' ATD tracking via homography). Under the organisers'
+> clarification of November 2026 — training and tuning must use **external data only** — that
+> training mix is not admissible, so this checkpoint is kept here purely as documentation of the
+> exploration. It was **not** used in the chain that generated the submission
+> (`perception_new_fixed.npz` → fusion → transitions → CSV), which runs on dedicated YOLO26x
+> weights trained exclusively on external data (see [`REPRODUCING.md`](../REPRODUCING.md)).
+> Any future retraining here must rebuild the dataset **without `--with-match`**.
+
 Problem: the pipeline's stock COCO `yolo11x.pt` (`sports ball`, class 32) misses the 6–15 px
 ball in the tactical wide view — the user sees the ball, the detector does not.
 
