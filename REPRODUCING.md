@@ -27,14 +27,52 @@ and no ground-truth possession label was used in any training.
 | `ball_yolo26x_1024_clu.pt` | ball detector (YOLO26x @ 1024) | `f69ff921f8ae32eeba75aa6dc8730eefe3b4389232e0f8b0948482ea7f412053` |
 | `players_yolo26x_1024_clu.pt` | player + keeper detector (YOLO26x @ 1024) | `03031012298e134eb13f4dd03c25651cc3ffc231c27f93f16fb38c4b2de04865` |
 
-<!-- TODO(joan): upload both files as assets of a GitHub release (each 113 MB — too large for
-     a plain git commit) and put the release URL here. Training provenance: external dataset(s)
-     used, link + license, dates, training config. Fill in before the deadline:
-     - dataset(s): <name, source, license>
-     - training config / log: <path or release asset> -->
+Both weights ship as assets of the
+[`champion-run` release](https://github.com/BinarySandia04/Xplainable-soccer-predictor/releases/tag/champion-run),
+along with the full-match perception cache and the fusion pool, so the chain can be viewed or
+reproduced without retraining anything:
+
+```bash
+gh release download champion-run --dir .     # or pick single assets with --pattern
+```
+
+**Training provenance** — both detectors are YOLO26x @ 1024, DDP on a multi-GPU server, trained
+on **external public data only** (no frame of the provided match and no possession label):
+
+- `ball_yolo26x_1024_clu.pt` — training script `ball_training/train_cluster.py` (committed):
+  - SoccerNet v3 H250 — [Zenodo 10.5281/zenodo.7808511](https://zenodo.org/records/7808511) — CC-BY-4.0
+  - infactory-ai/ball-tracking — [Hugging Face](https://huggingface.co/datasets/infactory-ai/ball-tracking) — CC-BY-NC-4.0
+  - martinjolif/football-ball-detection — [Hugging Face](https://huggingface.co/datasets/martinjolif/football-ball-detection) — CC-BY-4.0
+- `players_yolo26x_1024_clu.pt` — training script `ball_training/train_players_cluster.py` (committed; classes: player / goalkeeper / referee):
+  - SoccerNet/SN-Tracking-2023 — [Hugging Face](https://huggingface.co/datasets/SoccerNet/SN-Tracking-2023) — research terms
+  - martinjolif/football-player-detection — [Hugging Face](https://huggingface.co/datasets/martinjolif/football-player-detection) — CC-BY-4.0
+  - keremberke/football-object-detection — [Hugging Face](https://huggingface.co/datasets/keremberke/football-object-detection) — CC-BY-4.0
+  - manot/football-players — [Hugging Face](https://huggingface.co/datasets/manot/football-players) — MIT
 
 The stock COCO weights (`yolo11x.pt` etc.) are only used by the excluded side experiment in
 `ball_training/`, which is **not** part of this chain — see that README's status banner.
+
+## Viewing the real detections on any PC (no GPU, no model needed)
+
+The heavy step is perception (YOLO26x over all 199,319 frames). Its finished output is shipped
+in the release, so a personal PC can play the actual ball and player detections without running
+any model — everything after perception is pure CPU:
+
+```bash
+# requires the gated bundle unpacked under data/ (tactical video, tracking, homography, tags)
+gh release download champion-run --pattern "perception_new_fixed.npz" --dir possession_lab/outputs
+gh release download champion-run --pattern "fusion.npz"               --dir possession_lab/outputs
+gh release download champion-run --pattern "outputs_view_bundle.tar.gz" --dir /tmp
+tar xzf /tmp/outputs_view_bundle.tar.gz -C possession_lab/outputs/
+
+python -m possession_lab viewer \
+    --perception  possession_lab/outputs/perception_new_fixed.npz \
+    --fusion      possession_lab/outputs/fusion.npz \
+    --predictions possession_lab/outputs/transition_predictions.csv
+```
+
+The viewer plays the tactical video with the detected ball, every player/goalkeeper/referee box,
+the possession spell per frame and the explanation layer.
 
 ## The chain
 
@@ -48,8 +86,8 @@ P=possession_lab/outputs
 #    The homography/ATD sidecars must share the video's stem (see FARM_README.txt).
 python farm_perceive.py \
     --video data/tactical/BAR-ATH_tactical-001.mp4 \
-    --ball-weights  <release>/ball_yolo26x_1024_clu.pt \
-    --players-weights <release>/players_yolo26x_1024_clu.pt \
+    --ball-weights  ball_yolo26x_1024_clu.pt \
+    --players-weights players_yolo26x_1024_clu.pt \
     --output-dir possession_lab/outputs
 
 # 2. Fusion: multi-source evidence pool (tracking, tags, events, perception).

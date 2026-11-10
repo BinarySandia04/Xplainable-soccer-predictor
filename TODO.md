@@ -2,14 +2,15 @@
 
 ## Reproducibility
 
-- [ ] Publish the champion weights as GitHub release assets (113 MB each — over git's
+- [x] Publish the champion weights as GitHub release assets (113 MB each — over git's
       100 MB limit) and put the release URL in `REPRODUCING.md`:
-      - `weights/moncuniserver/ball_yolo26x_1024_clu.pt`
-        `f69ff921f8ae32eeba75aa6dc8730eefe3b4389232e0f8b0948482ea7f412053`
-      - `weights/players_weights/players_yolo26x_1024_clu.pt`
-        `03031012298e134eb13f4dd03c25651cc3ffc231c27f93f16fb38c4b2de04865`
-- [ ] Fill the training-provenance TODO in `REPRODUCING.md`: external dataset name(s), source
-      link + license, training config/log for both YOLO26x detectors.
+      [`champion-run` release](https://github.com/BinarySandia04/Xplainable-soccer-predictor/releases/tag/champion-run)
+      — also carries the full-match detections (`perception_new_fixed.npz`, `fusion.npz`) and
+      the small-outputs bundle so the results can be viewed on any PC without the model.
+- [x] Fill the training-provenance TODO in `REPRODUCING.md`: external dataset name(s), source
+      link + license, training config/log for both YOLO26x detectors. (Scripts
+      `ball_training/train_cluster.py` / `train_players_cluster.py` are committed; dataset
+      sources + licenses are listed in the *Model weights* section.)
 
 ## Rules & organisers
 
