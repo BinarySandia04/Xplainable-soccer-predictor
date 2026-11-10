@@ -737,6 +737,8 @@ video {
 }
 
 .transport,
+.seek-grid,
+.speed-grid,
 .nav-grid {
   display: grid;
   gap: 0.42rem;
@@ -744,7 +746,51 @@ video {
 }
 
 .transport {
-  grid-template-columns: 1.4fr repeat(4, 1fr);
+  grid-template-columns: 1fr 1fr;
+}
+
+.seek-grid {
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.35rem;
+  margin-top: 0.42rem;
+}
+
+.speed-grid {
+  grid-template-columns: repeat(6, 1fr);
+  gap: 0.35rem;
+  margin-top: 0.42rem;
+}
+
+.speed-btn {
+  padding: 0.42rem 0.2rem;
+  font-size: 0.78rem;
+  font-weight: 500;
+  text-align: center;
+}
+
+.speed-btn.active {
+  background: var(--h);
+  color: #06111d;
+  border-color: var(--h);
+  font-weight: 700;
+}
+
+.video-quick-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.mini-btn {
+  padding: 0.22rem 0.45rem;
+  font-size: 0.72rem;
+  line-height: 1.2;
+}
+
+.speed-pill-label {
+  color: var(--muted-2);
+  font-size: 0.72rem;
+  margin-left: 0.25rem;
 }
 
 .nav-grid {
@@ -752,6 +798,8 @@ video {
 }
 
 .transport button,
+.seek-grid button,
+.speed-grid button,
 .nav-grid button {
   padding: 0.5rem 0.4rem;
   font-size: 0.78rem;

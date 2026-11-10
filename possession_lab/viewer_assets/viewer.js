@@ -83,6 +83,8 @@
     utAnchor: $("#utAnchor"),
     utClear: $("#utClear"),
     playBtn: $("#playBtn"),
+    pauseBtn: $("#pauseBtn"),
+    quickPlayBtn: $("#quickPlayBtn"),
     frameInput: $("#frameInput"),
     goFrame: $("#goFrame"),
     gotoPublic: $("#gotoPublic"),
@@ -140,6 +142,7 @@
     frameDataRequest: null,
     frameCache: new Map(),
     frameDataError: false,
+    speed: 1.0,
   };
 
   const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
@@ -1588,8 +1591,8 @@
     if (updateHistory) updateURL(target);
   }
 
-  function jump(delta) {
-    seekToFrame(state.frame + delta, { pause: true });
+  function jump(delta, { pause = false } = {}) {
+    seekToFrame(state.frame + delta, { pause });
   }
 
   function jumpToValue(value) {
@@ -1753,7 +1756,29 @@
   }
 
   function setPlayButton() {
-    ui.playBtn.textContent = state.video.paused ? "Reproducir" : "Pausa";
+    const isPaused = state.video.paused;
+    ui.playBtn.textContent = isPaused ? "▶ Reproducir" : "⏸ Pausa";
+    ui.playBtn.title = isPaused ? "Reproducir video (Espacio)" : "Pausar video (Espacio)";
+    if (ui.pauseBtn) {
+      ui.pauseBtn.disabled = isPaused;
+      ui.pauseBtn.style.opacity = isPaused ? "0.5" : "1";
+    }
+    if (ui.quickPlayBtn) {
+      ui.quickPlayBtn.textContent = isPaused ? "▶" : "⏸";
+      ui.quickPlayBtn.title = isPaused ? "Reproducir (Espacio)" : "Pausar (Espacio)";
+    }
+  }
+
+  function setSpeed(speed) {
+    state.speed = speed;
+    if (state.video) {
+      state.video.playbackRate = speed;
+      state.video.defaultPlaybackRate = speed;
+    }
+    document.querySelectorAll(".speed-btn").forEach((btn) => {
+      const s = parseFloat(btn.dataset.speed);
+      btn.classList.toggle("active", Math.abs(s - speed) < 0.05);
+    });
   }
 
   function setBuffering(visible, text) {
@@ -2191,10 +2216,22 @@
       setPlayButton();
     });
 
-    state.video.addEventListener("play", setPlayButton);
+    state.video.addEventListener("play", () => {
+      if (Number.isFinite(state.speed) && state.speed > 0) {
+        state.video.playbackRate = state.speed;
+      }
+      setPlayButton();
+    });
     state.video.addEventListener("pause", () => {
       setPlayButton();
       updateBufferedLabel();
+    });
+    state.video.addEventListener("ratechange", () => {
+      const r = state.video.playbackRate;
+      document.querySelectorAll(".speed-btn").forEach((btn) => {
+        const s = parseFloat(btn.dataset.speed);
+        btn.classList.toggle("active", Math.abs(s - r) < 0.05);
+      });
     });
     state.video.addEventListener("ended", setPlayButton);
     state.video.addEventListener("timeupdate", () => renderFromTime(state.video.currentTime));
@@ -2218,6 +2255,23 @@
     }
 
     ui.playBtn.addEventListener("click", togglePlay);
+    if (ui.pauseBtn) {
+      ui.pauseBtn.addEventListener("click", () => {
+        if (!state.video.paused) {
+          state.video.pause();
+          setPlayButton();
+        }
+      });
+    }
+    if (ui.quickPlayBtn) {
+      ui.quickPlayBtn.addEventListener("click", togglePlay);
+    }
+    document.querySelectorAll(".speed-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const speed = parseFloat(btn.dataset.speed);
+        if (Number.isFinite(speed)) setSpeed(speed);
+      });
+    });
     ui.overlayToggle.checked = state.overlayEnabled;
     ui.overlayToggle.addEventListener("change", () => {
       state.overlayEnabled = ui.overlayToggle.checked;
@@ -2301,27 +2355,71 @@
     });
     renderDecisions();
 
+    document.addEventListener("click", (event) => {
+      const btn = event.target instanceof Element ? event.target.closest("button") : null;
+      if (btn) {
+        btn.blur();
+      }
+    });
+
     window.addEventListener("keydown", (event) => {
       const target = event.target;
-      const typing =
-        target instanceof Element && target.closest("textarea, select, input:not([type='number'])");
-      if (!typing && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      const isTextInput =
+        target instanceof Element &&
+        target.closest("textarea, select, input:not([type='button']):not([type='submit'])");
+
+      if (isTextInput) {
+        return;
+      }
+
+      if (event.code === "Space" || event.key === " " || event.key === "Spacebar") {
+        event.preventDefault();
+        togglePlay();
+        return;
+      }
+
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        const fps = Math.round((data && data.fps) || 25);
+        jump(-fps);
+        return;
+      }
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        const fps = Math.round((data && data.fps) || 25);
+        jump(fps);
+        return;
+      }
+
+      if (target instanceof Element && target.closest("button")) {
+        target.blur();
+      }
+
+      if (!event.ctrlKey && !event.metaKey && !event.altKey) {
         const key = event.key.length === 1 ? event.key.toUpperCase() : "";
         if (!event.repeat && ["H", "A", "D", "X"].includes(key)) {
           event.preventDefault();
           paintUserTruth(key);
           return;
         }
+        if (event.key === "1") {
+          event.preventDefault();
+          setSpeed(1.0);
+          return;
+        }
+        if (event.key === "2") {
+          event.preventDefault();
+          setSpeed(2.0);
+          return;
+        }
+        if (event.key === "3") {
+          event.preventDefault();
+          setSpeed(3.0);
+          return;
+        }
       }
-      if (target instanceof Element && target.closest("input, textarea, select, button")) return;
-      if (event.code === "Space") {
-        event.preventDefault();
-        togglePlay();
-      } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
-        event.preventDefault();
-        const delta = (event.shiftKey ? data.fps : 1) * (event.key === "ArrowLeft" ? -1 : 1);
-        jump(delta);
-      } else if (event.key === "[") {
+
+      if (event.key === "[") {
         event.preventDefault();
         jumpToValue(previousValue(data.changes, state.frame));
       } else if (event.key === "]") {

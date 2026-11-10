@@ -769,6 +769,8 @@ def out_of_bounds_mask(
     pitch: tuple[float, float],
     margin_m: float = 0.8,
     min_frames: int = 25,
+    confidence: np.ndarray | None = None,
+    conf_eps: float = 0.02,
 ) -> np.ndarray:
     """Frames with the ball centre fully past the touchline for ``min_frames`` straight.
 
@@ -777,10 +779,15 @@ def out_of_bounds_mask(
     stoppages late in scrambled sequences (measured 163 282: the ball sailed over
     the side with no stoppage tag until the goal-kick restart minutes later), and
     out of bounds nobody possesses the ball: the caller marks those frames dead.
+    When ``confidence`` is provided, frames without camera evidence (confidence <= eps)
+    are skipped so Kalman coasting does not trigger false out-of-bounds runs.
     """
     b = np.asarray(ball_pitch, dtype=np.float64)
     length, width = float(pitch[0]), float(pitch[1])
     finite = np.isfinite(b).all(axis=1)
+    if confidence is not None:
+        c = np.asarray(confidence, dtype=np.float64)
+        finite = finite & np.isfinite(c) & (c > float(conf_eps))
     out = finite & (
         (b[:, 0] < -margin_m)
         | (b[:, 0] > length + margin_m)
@@ -963,6 +970,96 @@ def possession_revival_mask(
         mask[s:e] = True
         out_team[s:e] = int(vals[int(np.argmax(counts))])
     return mask, out_team
+
+
+def stitch_keeper_saves(
+    codes: np.ndarray,
+    consensus_ball: np.ndarray,
+    players: np.ndarray,
+    keeper_defenders: np.ndarray,
+    keeper_slots: np.ndarray,
+    halves: Sequence[tuple[int, int]],
+    pitch: tuple[float, float],
+    raw_ball: np.ndarray | None = None,
+    setpiece_tags: np.ndarray | None = None,
+    max_gap_frames: int = 250,
+    min_gap_frames: int = 15,
+    keeper_near_dist: float = 7.0,
+) -> np.ndarray:
+    """Stitch goalkeeper saves/catches that were falsely broken by ball occlusion into D.
+
+    When a goalkeeper catches or parries the ball into gloves/chest, cameras lose sight of the
+    ball, tripping lost-ball or coasted out-of-bounds deadness. If the goalkeeper is inside his
+    defending penalty area, secured the ball, and releases it to his team within 10 seconds
+    (without the ball having crossed the end line out of bounds for a goal-kick restart),
+    the preceding dead spell is stitched back to the goalkeeper's team possession.
+    """
+    out_codes = np.asarray(codes, dtype=np.int8).copy()
+    length, width = float(pitch[0]), float(pitch[1])
+    b = np.asarray(consensus_ball, dtype=np.float64)
+    pl = np.asarray(players, dtype=np.float64)
+
+    for h_idx, (h_start, h_stop) in enumerate(halves):
+        h_start, h_stop = max(0, int(h_start)), min(len(out_codes), int(h_stop))
+        for g_side in (0, 1):
+            k_team = int(keeper_defenders[h_idx, g_side])
+            k_slot = (
+                int(keeper_slots[h_idx, g_side])
+                if np.ndim(keeper_slots) == 2
+                else int(keeper_slots[h_idx][g_side])
+            )
+            if k_team < 0 or k_slot < 0:
+                continue
+            k_pos = pl[:, k_slot]
+            goal_x = 0.0 if g_side == 0 else length
+
+            spells = []
+            cur_l, cur_s = None, None
+            for f in range(h_start, h_stop):
+                l = int(out_codes[f])
+                if l != cur_l:
+                    if cur_l is not None:
+                        spells.append((cur_s, f - 1, cur_l))
+                    cur_l, cur_s = l, f
+            if cur_l is not None:
+                spells.append((cur_s, h_stop - 1, cur_l))
+
+            for i, (s_start, s_end, s_lbl) in enumerate(spells):
+                if s_lbl == k_team and i > 0:
+                    p_start, p_end, p_lbl = spells[i - 1]
+                    gap_len = p_end - p_start + 1
+                    if p_lbl == D and min_gap_frames <= gap_len <= max_gap_frames:
+                        kp_end = k_pos[p_end]
+                        in_box = (
+                            np.isfinite(kp_end[0])
+                            and abs(kp_end[0] - goal_x) <= 20.0
+                            and abs(kp_end[1] - width / 2.0) <= 22.0
+                        )
+                        b_rel = b[s_start]
+                        dist_to_keeper = (
+                            float(np.linalg.norm(kp_end - b_rel))
+                            if np.isfinite(kp_end).all() and np.isfinite(b_rel).all()
+                            else 999.0
+                        )
+
+                        crossed_end = False
+                        if raw_ball is not None:
+                            lookback = max(0, p_start - 50)
+                            rb = raw_ball[lookback:p_start]
+                            if np.any(np.isfinite(rb)):
+                                if g_side == 0 and np.nanmin(rb[:, 0]) < -0.5:
+                                    crossed_end = True
+                                elif g_side == 1 and np.nanmax(rb[:, 0]) > length + 0.5:
+                                    crossed_end = True
+
+                        is_setpiece = False
+                        if setpiece_tags is not None:
+                            is_setpiece = bool(np.any(setpiece_tags[p_start : p_end + 1]))
+
+                        if in_box and dist_to_keeper <= float(keeper_near_dist) and not crossed_end and not is_setpiece:
+                            out_codes[p_start : p_end + 1] = k_team
+
+    return out_codes
 
 
 def gate_events(
