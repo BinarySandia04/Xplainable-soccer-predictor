@@ -1705,16 +1705,16 @@ def gate_pixel_events(
             continue
         if is_contact and pitch_close is not None and not is_relay:
             d = pitch_close[min(frame, pitch_close.shape[0] - 1)]
-            if (
-                np.isfinite(d).all()
-                and d[1 - team] + params.contact_opp_pitch_margin <= d[team]
-            ):
-                contradicted = True
-                if pool is not None and params.contact_opp_pool_margin > 0:
-                    pm = pool[min(frame, pool.shape[0] - 1)]
-                    contradicted = float(pm[1 - team]) - float(pm[team]) >= params.contact_opp_pool_margin
-                if contradicted:
-                    continue  # the other side stands on the ball and the voters agree
+            if np.isfinite(d).all():
+                if float(d[team]) > 4.5:
+                    continue  # depth perspective artifact: player is >4.5m from the ball on the grass
+                if d[1 - team] + params.contact_opp_pitch_margin <= d[team]:
+                    contradicted = True
+                    if pool is not None and params.contact_opp_pool_margin > 0:
+                        pm = pool[min(frame, pool.shape[0] - 1)]
+                        contradicted = float(pm[1 - team]) - float(pm[team]) >= params.contact_opp_pool_margin
+                    if contradicted:
+                        continue  # the other side stands on the ball and the voters agree
         if any(kev.team == team and abs(kev.frame - frame) < params.nms_window for kev in kept_kinematic):
             continue  # kinematics already attributes this moment
         team_bit = 1 if team == H else 2

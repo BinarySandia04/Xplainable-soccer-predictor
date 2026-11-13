@@ -787,6 +787,8 @@ def cmd_transitions(args: argparse.Namespace) -> int:
 
     # Apply manual verification adjustments for visual inspection cases
     _match_adjustments = [
+        (15357, 15366, 0),        # Interception: Barca player 11 touch (0.80m)
+        (15766, 15799, 0),        # Interception: Barca box touch
         (19674, 19700, _D_CODE),  # Case 1: throw-in release at 19700
         (21290, 21320, 0),        # Case 3: ball stayed in play along touchline
         (23920, 23940, 0),        # Case 4: keeper save
