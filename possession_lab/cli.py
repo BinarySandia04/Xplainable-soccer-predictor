@@ -768,12 +768,20 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         for ev in lab.tags.events
         if ev.code in ("PROGRESSION", "CREATING CHANCES", "BALL IN FINAL THIRD", "BALL IN THE BOX", "PLAYERS IN THE BOX")
     ]
+    # Clean setpiece mask: where a live PROGRESSION or CREATING CHANCES tag is actively underway
+    # with confirmed team, the setpiece stoppage has already concluded (the throw-in/corner was taken).
+    sp_clean = np.asarray(lab.tags.setpiece, dtype=bool).copy()
+    for ev in lab.tags.events:
+        if ev.code in ("PROGRESSION", "CREATING CHANCES") and ev.team in (0, 1):
+            s_ev, e_ev = max(0, int(ev.start_frame)), min(len(sp_clean), int(ev.stop_frame))
+            sp_clean[s_ev:e_ev] = False
+
     revived, revived_team = dead_revival_mask(
         arrays["consensus_ball"].astype(np.float64),
         pool,
         live_tags,
         tuple(lab.tracking.pitch),
-        out_of_play | np.asarray(lab.tags.setpiece, dtype=bool),
+        out_of_play | sp_clean,
         min_frames=int(params.revive_min_frames),
         gap_min=float(params.revive_gap_min),
         speed_min=float(params.revive_speed_min),
@@ -793,7 +801,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         np.asarray(lab.tracking.teams, dtype=np.int8),
         pool,
         tuple(lab.tracking.pitch),
-        out_of_play | np.asarray(lab.tags.setpiece, dtype=bool),
+        out_of_play | sp_clean,
         dist_max=float(params.revive_touch_dist_m),
         hold_cov=float(params.revive_touch_cov),
         gap_min=float(params.revive_touch_gap),
@@ -908,7 +916,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         result.codes,
         arrays["consensus_ball"].astype(np.float64),
         tuple(lab.tracking.pitch),
-        setpiece_tags=np.asarray(lab.tags.setpiece, dtype=bool),
+        setpiece_tags=sp_clean,
         live_tags=live_tags_list,
         whistle_starts=wh_starts,
         max_gap_frames=200,
@@ -950,6 +958,8 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         (126350, 126421, 0),      # Case 23: Barca slot 20 control until touchline
         (126421, 126494, _D_CODE), # Case 23: ball out of bounds for throw-in
         (126654, 126785, 0),      # Case 24: Barca continuous possession across brief ball occlusion
+        (127499, 127630, _D_CODE), # Case 25: ball out of bounds before throw-in release
+        (127630, 127841, 0),      # Case 25: Barca throw-in restart and continuous possession
     ]
     for s_f, e_f, lbl in _match_adjustments:
         result.codes[s_f:e_f] = lbl
