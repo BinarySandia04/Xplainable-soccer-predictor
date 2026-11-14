@@ -404,6 +404,16 @@ def _rule_setpiece_specific(
                 y=by,
                 team=target,
             )
+        # Free kick restart (out on the field, e.g. after offside or defensive foul)
+        if (24.0 < bx < 81.0) and (3.0 < by < 65.0):
+            return _reason(
+                "freekick_restart",
+                f"Tiro libre / fuera de juego: reanudación a balón parado para {team_name}.",
+                tag="reanudacion_tiro_libre",
+                x=bx,
+                y=by,
+                team=target,
+            )
 
     edge = float(features.edge[local]) if np.isfinite(features.edge[local]) else None
     if edge is not None and abs(edge) <= 2.5:
@@ -465,6 +475,14 @@ def assign_decision_tags(
         tags = ["saque_puerta", "reanudacion_saque"]
         justification = (
             f"Reinicio del partido mediante saque de puerta ejecutado por {target_name} desde su propia área."
+        )
+    elif "freekick_restart" in kinds:
+        primary_tag = "reanudacion_tiro_libre"
+        category = "reanudacion"
+        tags = ["reanudacion_tiro_libre", "tiro_libre", "reanudacion_saque"]
+        justification = (
+            f"Reanudación reglamentaria del juego mediante tiro libre ejecutado por {target_name} "
+            f"tras detención arbitral por fuera de juego o falta."
         )
     elif "interception" in kinds:
         primary_tag = "robo_intercepcion"
@@ -888,6 +906,14 @@ def explain_prediction(
     n = tracking.n_frames
     switches: list[dict] = []
     ball_xy = getattr(tracking, "ball", None)
+    fusion_path = OUTPUT_DIR / "fusion.npz"
+    if fusion_path.is_file():
+        try:
+            with np.load(fusion_path) as z:
+                if "consensus_ball" in z:
+                    ball_xy = np.asarray(z["consensus_ball"], dtype=np.float64)
+        except Exception:
+            pass
     for start, stop in halves:
         lo = max(0, int(start) - context)
         hi = min(n, int(stop) + context)

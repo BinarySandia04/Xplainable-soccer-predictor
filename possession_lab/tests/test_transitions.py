@@ -1758,5 +1758,63 @@ class StitchAerialExcursionsTests(unittest.TestCase):
         self.assertTrue((res[20:60] == 2).all())
 
 
+class ApplyOffsideFreekickRestartsTests(unittest.TestCase):
+    """When a stoppage occurs in/near the box (e.g. offside) and the ball is transported
+    far out of the box and placed stationary on the turf before a free kick, the ball remains
+    dead (D) during the transit and placement until the free kick is struck."""
+
+    def test_offside_freekick_delayed_until_kick(self):
+        from possession_lab.fusion.transitions import apply_offside_freekick_restarts
+
+        n = 120
+        codes = np.full(n, 2, dtype=np.int8)  # starts dead
+        codes[20:] = 1  # team 1 prematurely given possession
+        ball = np.full((n, 2), 15.0)
+        ball[:20] = [15.0, 25.0]
+        # Transported to 35.0
+        for f in range(20, 40):
+            ball[f] = [15.0 + (f - 20) * 1.0, 25.0]
+        # Stationary at (35.0, 25.0) from 40 to 65
+        ball[40:65] = [35.0, 25.0]
+        # Free kick struck at 65, moving to 45.0
+        for f in range(65, n):
+            ball[f] = [35.0 + min(15.0, (f - 65) * 1.0), 25.0]
+
+        res = apply_offside_freekick_restarts(
+            codes,
+            ball,
+            (105.0, 68.0),
+            fps=25.0,
+            min_dist_from_box=12.0,
+            min_still_frames=20,
+            still_speed_max=0.8,
+            kick_speed_min=4.5,
+        )
+        # 20..65 should remain D (2) while being transported and placed
+        self.assertTrue((res[20:66] == 2).all())
+        # 66.. should be team 1 (free kick taken)
+        self.assertTrue((res[66:] == 1).all())
+
+    def test_normal_box_action_not_delayed(self):
+        from possession_lab.fusion.transitions import apply_offside_freekick_restarts
+
+        n = 100
+        codes = np.full(n, 2, dtype=np.int8)
+        codes[20:] = 1
+        ball = np.full((n, 2), 15.0)
+        # Stays in box, no transport to field
+        ball[20:] = [16.0, 25.0]
+
+        res = apply_offside_freekick_restarts(
+            codes,
+            ball,
+            (105.0, 68.0),
+            fps=25.0,
+            min_dist_from_box=12.0,
+        )
+        # Should not be modified
+        self.assertEqual(res[20], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

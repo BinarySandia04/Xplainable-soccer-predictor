@@ -1250,6 +1250,77 @@ def stitch_aerial_excursions(
     return out_codes
 
 
+def apply_offside_freekick_restarts(
+    codes: np.ndarray,
+    consensus_ball: np.ndarray,
+    pitch: tuple[float, float],
+    fps: float = FPS,
+    min_dist_from_box: float = 12.0,
+    min_still_frames: int = 20,
+    still_speed_max: float = 0.8,
+    kick_speed_min: float = 4.5,
+    max_setup_frames: int = 600,
+) -> np.ndarray:
+    """Delay possession assignment on offside / defensive free-kick restarts until the kick is struck.
+
+    When play is stopped inside or near a defensive penalty area (e.g. goalkeeper catch / offside whistle),
+    the defending player carries or walks the ball far out of the penalty area (>= 12 m from the goal/box)
+    to the spot of the infringement (e.g. first quarter of the pitch). The ball is then placed stationary on
+    the turf (speed < 0.8 m/s for >= 20 frames) while players set up for the indirect free kick.
+    The ball remains dead (D) during this entire transit and placement phase, and only re-enters play
+    when the free kick is actually struck (speed >= 4.5 m/s with significant displacement).
+    """
+    out_codes = np.asarray(codes, dtype=np.int8).copy()
+    n = len(out_codes)
+    length, width = float(pitch[0]), float(pitch[1])
+    cb = np.asarray(consensus_ball, dtype=np.float64)
+    b_diff = np.zeros_like(cb)
+    b_diff[1:] = (cb[1:] - cb[:-1]) * fps
+    b_spd = np.linalg.norm(b_diff, axis=1)
+
+    diff = (out_codes != np.roll(out_codes, 1))
+    diff[0] = False
+
+    for s in np.flatnonzero(diff):
+        if out_codes[s - 1] != D or out_codes[s] not in (H, 1):
+            continue
+        team = out_codes[s]
+        e = s
+        while e < n and out_codes[e] == team:
+            e += 1
+
+        p_start = cb[s]
+        in_box = (p_start[0] <= 24.0) or (p_start[0] >= length - 24.0)
+        if not in_box:
+            continue
+
+        look_e = min(e, s + max_setup_frames)
+        still_run = 0
+        had_still_at_dist = False
+        restart_k = None
+
+        for k in range(s, look_e):
+            dist_from_start = np.linalg.norm(cb[k] - p_start)
+            if dist_from_start >= min_dist_from_box:
+                if b_spd[k] < still_speed_max:
+                    still_run += 1
+                    if still_run >= min_still_frames:
+                        had_still_at_dist = True
+                else:
+                    if had_still_at_dist:
+                        if b_spd[k] >= kick_speed_min and np.nanmean(b_spd[k:min(n, k + 4)]) >= 3.0:
+                            disp = float(np.linalg.norm(cb[min(n - 1, k + 25)] - cb[k]))
+                            if disp >= 4.0:
+                                restart_k = k
+                                break
+                    still_run = 0
+
+        if restart_k is not None:
+            out_codes[s:restart_k] = D
+
+    return out_codes
+
+
 def gate_events(
     kicks: Sequence[tuple[int, float, int, float]],
     onsets: Sequence[tuple[int, float, int, float]],
@@ -2483,6 +2554,7 @@ __all__ = [
     "keeper_holds",
     "KeeperHold",
     "apply_goalkeeper_restarts",
+    "apply_offside_freekick_restarts",
     "stitch_keeper_saves",
     "stitch_aerial_excursions",
     "out_of_bounds_mask",

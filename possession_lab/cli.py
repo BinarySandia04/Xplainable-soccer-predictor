@@ -868,7 +868,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                     result.codes[s_f:e_f - 25] = _D_CODE
 
     # Aerial excursion continuity: suppress spurious dead ball on high balloon kicks with return
-    from .fusion.transitions import stitch_aerial_excursions
+    from .fusion.transitions import apply_offside_freekick_restarts, stitch_aerial_excursions
 
     result.codes[:] = stitch_aerial_excursions(
         result.codes,
@@ -876,6 +876,12 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         tuple(lab.tracking.pitch),
         consensus_confidence=arrays["consensus_confidence"].astype(np.float64),
         setpiece_tags=np.asarray(lab.tags.setpiece, dtype=bool),
+        fps=float(FPS),
+    )
+    result.codes[:] = apply_offside_freekick_restarts(
+        result.codes,
+        arrays["consensus_ball"].astype(np.float64),
+        tuple(lab.tracking.pitch),
         fps=float(FPS),
     )
 
