@@ -1065,6 +1065,109 @@ def stitch_keeper_saves(
     return out_codes
 
 
+def apply_goalkeeper_restarts(
+    codes: np.ndarray,
+    consensus_ball: np.ndarray,
+    players: np.ndarray,
+    player_teams: np.ndarray,
+    player_present: np.ndarray,
+    keeper_defenders: np.ndarray,
+    keeper_slots: np.ndarray,
+    halves: Sequence[tuple[int, int]],
+    pitch: tuple[float, float],
+    fps: float = FPS,
+    speed_threshold: float = 7.0,
+    flight_lookahead: int = 120,
+) -> np.ndarray:
+    """Assign possession to the defending team on goalkeeper long restarts / goal kicks from dead balls.
+
+    When the game restarts from a stoppage or dead ball inside the defending penalty area via a long kick
+    by the goalkeeper or defender, the kick initiates possession for that defending team. During the ball's
+    aerial flight, the possession belongs to the kicking team until the ball is received, contested or
+    controlled downfield by another player, or goes out of play.
+    """
+    out_codes = np.asarray(codes, dtype=np.int8).copy()
+    length, width = float(pitch[0]), float(pitch[1])
+    b = np.asarray(consensus_ball, dtype=np.float64)
+    pl = np.asarray(players, dtype=np.float64)
+    pr = np.asarray(player_present, dtype=bool)
+    tm = np.asarray(player_teams, dtype=np.int8)
+
+    # Ball speed
+    b_diff = np.zeros_like(b)
+    b_diff[1:] = (b[1:] - b[:-1]) * fps
+    b_spd = np.linalg.norm(b_diff, axis=1)
+    b_pres = np.isfinite(b).all(axis=1)
+
+    for h_idx, (h_start, h_stop) in enumerate(halves):
+        h_start, h_stop = max(0, int(h_start)), min(len(out_codes), int(h_stop))
+        for g_side in (0, 1):
+            k_team = int(keeper_defenders[h_idx, g_side])
+            k_slot = (
+                int(keeper_slots[h_idx, g_side])
+                if np.ndim(keeper_slots) == 2
+                else int(keeper_slots[h_idx][g_side])
+            )
+            if k_team < 0 or k_slot < 0:
+                continue
+            goal_x = 0.0 if g_side == 0 else length
+
+            for f in range(h_start + 10, h_stop - 100):
+                if not b_pres[f]:
+                    continue
+                bx, by = b[f]
+                # Within defensive penalty area / goal area (length <= 26m, width centered)
+                if abs(bx - goal_x) > 26.0 or abs(by - width / 2.0) > 22.0:
+                    continue
+
+                # Follows a dead ball or unobserved ball within the last 25 frames
+                was_dead = (out_codes[f - 1] == D) or np.any(out_codes[max(0, f - 25):f] == D) or not b_pres[f - 1]
+                if not was_dead:
+                    continue
+
+                # The restart frame f must be the release point: ball accelerates into flight (speed >= 5.0 m/s)
+                # while previous frames before release were stationary/resting (must remain D)
+                if b_spd[f] < 5.0:
+                    continue
+
+                kp = pl[f, k_slot]
+                if not np.isfinite(kp).all():
+                    continue
+                # Keeper is within 2.5m of the ball at launch
+                if np.linalg.norm(kp - b[f]) > 2.5:
+                    continue
+
+                future_f = min(h_stop, f + 25)
+                if future_f - f < 10:
+                    continue
+                valid_future = b_pres[f + 1:future_f]
+                if not np.any(valid_future):
+                    continue
+                f_spd = float(np.mean(b_spd[f + 1:future_f][valid_future]))
+                dx_future = b[future_f - 1, 0] - bx if b_pres[future_f - 1] else 0.0
+                downfield = (dx_future > 8.0) if g_side == 0 else (dx_future < -8.0)
+
+                if f_spd > speed_threshold and downfield:
+                    # Trace flight until opponent control, tracking gap, or out of play
+                    flight_end = min(h_stop, f + flight_lookahead)
+                    for t in range(f + 25, flight_end):
+                        if not b_pres[t]:
+                            flight_end = t
+                            break
+                        # Opponent controls downfield (< 2.0m and ball slows)
+                        pt = pl[t]
+                        present_t = pr[t]
+                        opp_mask = present_t & (tm == (1 - k_team))
+                        if np.any(opp_mask):
+                            opp_dists = np.linalg.norm(pt[opp_mask] - b[t], axis=1)
+                            if np.min(opp_dists) <= 2.0 and b_spd[t] < 5.0:
+                                flight_end = t
+                                break
+                    out_codes[f:flight_end] = k_team
+
+    return out_codes
+
+
 def gate_events(
     kicks: Sequence[tuple[int, float, int, float]],
     onsets: Sequence[tuple[int, float, int, float]],
@@ -2297,6 +2400,8 @@ __all__ = [
     "keeper_area_catches",
     "keeper_holds",
     "KeeperHold",
+    "apply_goalkeeper_restarts",
+    "stitch_keeper_saves",
     "out_of_bounds_mask",
     "possession_revival_mask",
     "pixel_contact",

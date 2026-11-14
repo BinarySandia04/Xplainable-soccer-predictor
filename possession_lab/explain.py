@@ -394,11 +394,11 @@ def _rule_setpiece_specific(
                 y=by,
                 team=target,
             )
-        # Goal kick
-        if (bx <= 18.0 or bx >= 87.0) and (15.0 <= by <= 53.0):
+        # Goal kick / goalkeeper restart
+        if (bx <= 26.0 or bx >= 79.0) and (13.0 <= by <= 55.0):
             return _reason(
                 "goalkick_restart",
-                f"Saque de puerta: reinicio de juego desde el área pequeña por {team_name}.",
+                f"Saque de portería / reinicio en largo del portero de {team_name} desde el área.",
                 tag="saque_puerta",
                 x=bx,
                 y=by,

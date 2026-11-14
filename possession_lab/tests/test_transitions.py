@@ -1638,6 +1638,41 @@ class PossessionRevivalMaskTests(unittest.TestCase):
         )
         self.assertFalse(mask.any())
 
+    def test_apply_goalkeeper_restarts_assigns_kicking_team(self):
+        from possession_lab.fusion.transitions import apply_goalkeeper_restarts
+
+        n = 150
+        codes = np.full(n, 2, dtype=np.int8)  # all dead ball
+        ball = np.full((n, 2), np.nan)
+        ball[20] = [10.0, 34.0]
+        for f in range(21, 100):
+            ball[f] = [10.0 + (f - 20) * 0.8, 34.0]
+        players = np.full((n, 4, 2), np.nan)
+        players[:, 0] = [9.5, 34.0]
+        players[:, 1] = [80.0, 34.0]
+        present = np.ones((n, 4), dtype=bool)
+        teams = np.array([1, 0, 0, 1], dtype=np.int8)
+        keeper_defenders = np.array([[1, 0]])
+        keeper_slots = np.array([[0, 2]])
+        halves = [(0, n)]
+
+        res = apply_goalkeeper_restarts(
+            codes,
+            ball,
+            players,
+            teams,
+            present,
+            keeper_defenders,
+            keeper_slots,
+            halves,
+            (105.0, 68.0),
+            fps=25.0,
+        )
+        self.assertEqual(res[20], 1)
+        self.assertEqual(res[30], 1)
+        self.assertEqual(res[50], 1)
+        self.assertEqual(res[0], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -805,7 +805,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
 
     # Post-transition refinements: goalkeeper save stitching, setpieces, and noise absorption
     if keeper_defenders is not None and keeper_slots is not None:
-        from .fusion.transitions import stitch_keeper_saves
+        from .fusion.transitions import apply_goalkeeper_restarts, stitch_keeper_saves
 
         result.codes[:] = stitch_keeper_saves(
             result.codes,
@@ -817,6 +817,18 @@ def cmd_transitions(args: argparse.Namespace) -> int:
             tuple(lab.tracking.pitch),
             raw_ball=np.asarray(lab.tracking.ball, dtype=np.float64),
             setpiece_tags=np.asarray(lab.tags.setpiece, dtype=bool),
+        )
+        result.codes[:] = apply_goalkeeper_restarts(
+            result.codes,
+            arrays["consensus_ball"].astype(np.float64),
+            lab.tracking.players,
+            lab.tracking.teams,
+            lab.tracking.player_present,
+            keeper_defenders,
+            keeper_slots,
+            halves,
+            tuple(lab.tracking.pitch),
+            fps=float(FPS),
         )
 
     # Setpiece motion gating: set pieces (throw-ins, corners) are D until the ball is in motion
