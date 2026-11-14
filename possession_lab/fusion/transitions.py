@@ -982,9 +982,9 @@ def stitch_keeper_saves(
     pitch: tuple[float, float],
     raw_ball: np.ndarray | None = None,
     setpiece_tags: np.ndarray | None = None,
-    max_gap_frames: int = 250,
-    min_gap_frames: int = 15,
-    keeper_near_dist: float = 7.0,
+    max_gap_frames: int = 300,
+    min_gap_frames: int = 10,
+    keeper_near_dist: float = 12.0,
 ) -> np.ndarray:
     """Stitch goalkeeper saves/catches that were falsely broken by ball occlusion into D.
 
@@ -1035,12 +1035,15 @@ def stitch_keeper_saves(
                             and abs(kp_end[0] - goal_x) <= 20.0
                             and abs(kp_end[1] - width / 2.0) <= 22.0
                         )
-                        b_rel = b[s_start]
-                        dist_to_keeper = (
-                            float(np.linalg.norm(kp_end - b_rel))
-                            if np.isfinite(kp_end).all() and np.isfinite(b_rel).all()
-                            else 999.0
-                        )
+                        ball_window = b[max(0, p_start - 35) : min(len(b), p_end + 35)]
+                        fin = np.isfinite(ball_window).all(axis=1)
+                        if fin.any() and np.isfinite(kp_end).all():
+                            dist_to_keeper = float(np.min(np.linalg.norm(ball_window[fin] - kp_end, axis=1)))
+                        elif np.isfinite(kp_end).all():
+                            # Ball occluded in gloves/chest of keeper inside his penalty box
+                            dist_to_keeper = 5.0
+                        else:
+                            dist_to_keeper = 999.0
 
                         crossed_end = False
                         if raw_ball is not None:

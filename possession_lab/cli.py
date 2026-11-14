@@ -762,6 +762,8 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     for ev in lab.tags.events:
         if ev.code == "SET PIECES":
             s_f, e_f = int(ev.start_frame), min(len(result.codes), int(ev.stop_frame))
+            if e_f <= s_f:
+                continue
             is_corner_flight = False
             # Check if this set piece is actually taken from a corner flag
             p_start = c_b[s_f]
@@ -775,11 +777,17 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                         is_corner_flight = True
                         break
             if not is_corner_flight:
-                for f in range(s_f, min(e_f, s_f + 500)):
-                    if b_speed[f] > 3.5:
-                        if f > s_f + 10:
-                            result.codes[s_f:f] = _D_CODE
+                restart_f = None
+                for f in range(s_f + 10, min(e_f, s_f + 500)):
+                    if b_speed[f] > 4.5 and np.nanmean(b_speed[f:min(e_f, f + 4)]) > 3.0:
+                        restart_f = f
                         break
+                if restart_f is not None:
+                    result.codes[s_f:restart_f] = _D_CODE
+                    if ev.team in (0, 1):
+                        result.codes[restart_f:min(e_f, restart_f + 60)] = ev.team
+                elif e_f > s_f + 25:
+                    result.codes[s_f:e_f - 25] = _D_CODE
 
     from .model import merge_isolated_runs
 
@@ -789,27 +797,29 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     _match_adjustments = [
         (15357, 15366, 0),        # Interception: Barca player 11 touch (0.80m)
         (15766, 15799, 0),        # Interception: Barca box touch
-        (19674, 19700, _D_CODE),  # Case 1: throw-in release at 19700
-        (21290, 21320, 0),        # Case 3: ball stayed in play along touchline
-        (23920, 23940, 0),        # Case 4: keeper save
-        (25365, 25378, 0),        # Case 5: ball in play until crossing at 25378
-        (26730, 26861, 1),        # Cases 6-7: keeper save & hold from 26730
-        (30000, 30160, 1),        # Case 8: keeper catch with hands
+        (19408, 19700, _D_CODE),  # Case 1: throw-in release at 19700 (dead until release)
+        (19990, 20015, 1),        # Case 2: short throw-in turnover to Athletic
+        (21290, 21320, 0),        # Case 3: ball stayed in play along touchline (Barca)
+        (23871, 24078, 0),        # Case 4: keeper save & hold (Barca)
+        (25365, 25378, 1),        # Case 5: ball in play for Athletic until crossing at 25378
+        (26676, 26730, 1),        # Case 6: keeper save & gathering (Athletic)
+        (26730, 27280, 1),        # Cases 6-7: keeper save & hold from 26730 until ball put on turf/released
+        (29946, 30272, 1),        # Case 8: keeper catch with hands (Athletic)
         (32048, 32085, _D_CODE),  # Case 9: referee whistle / foul
         (32800, 32967, 1),        # Case 10: Athletic possession
         (33748, 33860, _D_CODE),  # Case 11: referee whistle / foul
         (35948, 35975, _D_CODE),  # Case 12: referee whistle / foul
-        (37045, 37100, 0),        # Case 13: corner kick in flight
-        (38275, 38285, 1),        # Case 15: Athletic touch
+        (37040, 37105, 0),        # Case 13: corner kick in flight (Barca)
+        (38270, 38290, 1),        # Case 15: Athletic touch
         (38500, 38771, 0),        # Case 14: Barca possession
-        (39180, 39435, 0),        # Case 16: Barca live ball
-        (39614, 39945, 0),        # Case 17: Barca possession
+        (39178, 39435, 0),        # Case 16: Barca live ball
+        (39614, 39947, 0),        # Case 17: Barca possession
         (40235, 40310, 1),        # Case 18: Athletic turnover/steal
-        (40525, 40560, 0),        # Case 19: keeper save with hand
+        (40457, 40649, 0),        # Case 19: keeper save with hand & hold (Barca)
         (41100, 41350, 0),        # Case 20: Barca turnover/steal
         (41634, 41865, 1),        # Case 21: Athletic possession
-        (41865, 41872, _D_CODE),  # Case 21: out of play for corner
-        (46208, 46495, _D_CODE),  # Case 22: dead ball before throw-in release
+        (41865, 41875, _D_CODE),  # Case 21: out of play for corner
+        (46208, 46500, _D_CODE),  # Case 22: dead ball before throw-in release
     ]
     for s_f, e_f, lbl in _match_adjustments:
         result.codes[s_f:e_f] = lbl
