@@ -38,7 +38,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..config import FPS, GRADED_HALVES, D, H, X
+from ..config import FPS, GRADED_HALVES, A, D, H, X
 from ..model import DEFAULT_PARAMS, ModelParams
 from .geometry import EPS, PRIOR, PRIOR_WEIGHT
 
@@ -1321,6 +1321,66 @@ def apply_offside_freekick_restarts(
     return out_codes
 
 
+def stitch_occluded_possession_gaps(
+    codes: np.ndarray,
+    consensus_ball: np.ndarray,
+    pitch: tuple[float, float],
+    setpiece_tags: np.ndarray | None = None,
+    live_tags: list[tuple[int, int, int]] | None = None,
+    whistle_starts: np.ndarray | None = None,
+    max_gap_frames: int = 200,
+    min_boundary_dist_m: float = 4.0,
+) -> np.ndarray:
+    """Stitch continuous team possession through brief ball occlusion / tracking dropout gaps.
+
+    When a team T is actively progressing in possession and a player occludes the ball or optical
+    tracking temporarily loses identification for a few seconds in open play (deep inside the pitch,
+    min_boundary_dist_m > 4 m away from sidelines/goal lines), the model must not falsely drop into
+    dead ball (D) in the absence of a whistle, stoppage, or set piece.
+    """
+    out_codes = np.asarray(codes, dtype=np.int8).copy()
+    n = len(out_codes)
+    length, width = float(pitch[0]), float(pitch[1])
+    cb = np.asarray(consensus_ball, dtype=np.float64)
+
+    is_dead = (out_codes == D)
+    for s, e in _bool_runs(is_dead):
+        if s == 0 or e >= n:
+            continue
+        prev_team = out_codes[s - 1]
+        next_team = out_codes[e]
+        if prev_team not in (H, A) or prev_team != next_team:
+            continue
+        dur = e - s
+        if dur > max_gap_frames:
+            continue
+        if setpiece_tags is not None and np.asarray(setpiece_tags[s:e], dtype=bool).any():
+            continue
+        if whistle_starts is not None:
+            near_whistles = whistle_starts[(whistle_starts >= s - 15) & (whistle_starts <= e)]
+            if len(near_whistles) > 0:
+                continue
+        # Check boundary distance
+        b_span = cb[s:e]
+        finite = np.isfinite(b_span).all(axis=1)
+        if finite.any():
+            vb = b_span[finite]
+            dx = np.minimum(vb[:, 0], length - vb[:, 0])
+            dy = np.minimum(vb[:, 1], width - vb[:, 1])
+            dist_to_boundary = np.min(np.minimum(dx, dy))
+            if dist_to_boundary < min_boundary_dist_m:
+                continue
+        # Check live tags if provided
+        if live_tags is not None:
+            has_tag = any(ts <= s and te >= e and t == prev_team for ts, te, t in live_tags)
+            if not has_tag:
+                continue
+
+        out_codes[s:e] = prev_team
+
+    return out_codes
+
+
 def gate_events(
     kicks: Sequence[tuple[int, float, int, float]],
     onsets: Sequence[tuple[int, float, int, float]],
@@ -2557,6 +2617,7 @@ __all__ = [
     "apply_offside_freekick_restarts",
     "stitch_keeper_saves",
     "stitch_aerial_excursions",
+    "stitch_occluded_possession_gaps",
     "out_of_bounds_mask",
     "possession_revival_mask",
     "pixel_contact",

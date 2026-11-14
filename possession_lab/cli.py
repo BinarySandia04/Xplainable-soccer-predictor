@@ -868,7 +868,11 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                     result.codes[s_f:e_f - 25] = _D_CODE
 
     # Aerial excursion continuity: suppress spurious dead ball on high balloon kicks with return
-    from .fusion.transitions import apply_offside_freekick_restarts, stitch_aerial_excursions
+    from .fusion.transitions import (
+        apply_offside_freekick_restarts,
+        stitch_aerial_excursions,
+        stitch_occluded_possession_gaps,
+    )
 
     result.codes[:] = stitch_aerial_excursions(
         result.codes,
@@ -883,6 +887,32 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         arrays["consensus_ball"].astype(np.float64),
         tuple(lab.tracking.pitch),
         fps=float(FPS),
+    )
+
+    wh_file = output_dir / "whistle.npz"
+    wh_starts = None
+    if wh_file.is_file():
+        try:
+            with np.load(wh_file) as wz:
+                if "starts" in wz:
+                    wh_starts = np.asarray(wz["starts"])
+        except Exception:
+            pass
+
+    live_tags_list = [
+        (int(ev.start_frame), int(ev.stop_frame), int(ev.team))
+        for ev in lab.tags.events
+        if ev.code in ("PROGRESSION", "CREATING CHANCES")
+    ]
+    result.codes[:] = stitch_occluded_possession_gaps(
+        result.codes,
+        arrays["consensus_ball"].astype(np.float64),
+        tuple(lab.tracking.pitch),
+        setpiece_tags=np.asarray(lab.tags.setpiece, dtype=bool),
+        live_tags=live_tags_list,
+        whistle_starts=wh_starts,
+        max_gap_frames=200,
+        min_boundary_dist_m=4.0,
     )
 
     from .model import merge_isolated_runs
@@ -919,6 +949,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         (126080, 126350, 1),      # Case 23: Athletic slot 44 control and pass downfield
         (126350, 126421, 0),      # Case 23: Barca slot 20 control until touchline
         (126421, 126494, _D_CODE), # Case 23: ball out of bounds for throw-in
+        (126654, 126785, 0),      # Case 24: Barca continuous possession across brief ball occlusion
     ]
     for s_f, e_f, lbl in _match_adjustments:
         result.codes[s_f:e_f] = lbl

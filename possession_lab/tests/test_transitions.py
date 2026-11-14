@@ -1816,5 +1816,66 @@ class ApplyOffsideFreekickRestartsTests(unittest.TestCase):
         self.assertEqual(res[20], 1)
 
 
+class StitchOccludedPossessionGapsTests(unittest.TestCase):
+    """When a team is actively progressing in possession deep on the pitch and a brief tracking
+    gap or player occlusion occurs (no whistle, no out-of-bounds, no setpiece), the dead ball gap
+    is stitched back into continuous possession."""
+
+    def test_occluded_gap_stitched(self):
+        from possession_lab.fusion.transitions import stitch_occluded_possession_gaps
+
+        n = 200
+        codes = np.full(n, 0, dtype=np.int8)  # team 0 (Barca)
+        codes[50:110] = 2  # 60 frames of spurious dead ball from occlusion
+        ball = np.full((n, 2), [50.0, 30.0])  # middle of pitch (dist to boundary >= 30m)
+
+        res = stitch_occluded_possession_gaps(
+            codes,
+            ball,
+            (105.0, 68.0),
+            setpiece_tags=np.zeros(n, dtype=bool),
+            live_tags=[(0, n, 0)],
+            max_gap_frames=100,
+            min_boundary_dist_m=4.0,
+        )
+        self.assertTrue((res == 0).all())
+
+    def test_setpiece_gap_not_stitched(self):
+        from possession_lab.fusion.transitions import stitch_occluded_possession_gaps
+
+        n = 150
+        codes = np.full(n, 0, dtype=np.int8)
+        codes[40:80] = 2
+        ball = np.full((n, 2), [50.0, 30.0])
+        sp = np.zeros(n, dtype=bool)
+        sp[50:60] = True  # set piece during gap
+
+        res = stitch_occluded_possession_gaps(
+            codes,
+            ball,
+            (105.0, 68.0),
+            setpiece_tags=sp,
+            live_tags=[(0, n, 0)],
+        )
+        self.assertTrue((res[40:80] == 2).all())
+
+    def test_near_boundary_gap_not_stitched(self):
+        from possession_lab.fusion.transitions import stitch_occluded_possession_gaps
+
+        n = 150
+        codes = np.full(n, 0, dtype=np.int8)
+        codes[40:80] = 2
+        ball = np.full((n, 2), [50.0, 1.0])  # 1m from boundary (touchline out of play)
+
+        res = stitch_occluded_possession_gaps(
+            codes,
+            ball,
+            (105.0, 68.0),
+            min_boundary_dist_m=4.0,
+            live_tags=[(0, n, 0)],
+        )
+        self.assertTrue((res[40:80] == 2).all())
+
+
 if __name__ == "__main__":
     unittest.main()
