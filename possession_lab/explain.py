@@ -320,16 +320,22 @@ def _rule_turnover_interception(
 
     # Check 2: Geometry & margin around switch
     hi = min(features.present.size, local + int(1.5 * FPS))
-    span = features.present[local:hi]
-    if span.any() and features.near_distance.size > local:
-        idx = local + int(np.argmax(span))
-        near_d = float(features.near_distance[idx]) if np.isfinite(features.near_distance[idx]) else None
-        near_t = int(features.near_team[idx]) if features.near_team.size > idx else -1
-        margin = float(features.margin[idx]) if features.margin.size > idx and np.isfinite(features.margin[idx]) else None
-        team_name = TEAM_NAMES.get(target, "equipo rival")
-        source_name = TEAM_NAMES.get(source, "rival")
-        if near_t == target and near_d is not None:
-            if near_d <= 1.8 and (margin is not None and margin >= 0.8):
+    if features.present.size > local and features.near_distance.size > local:
+        candidate_indices = [
+            i
+            for i in range(local, hi)
+            if features.present[i]
+            and features.near_team.size > i
+            and int(features.near_team[i]) == target
+            and np.isfinite(features.near_distance[i])
+        ]
+        if candidate_indices:
+            idx = min(candidate_indices, key=lambda i: features.near_distance[i])
+            near_d = float(features.near_distance[idx])
+            margin = float(features.margin[idx]) if features.margin.size > idx and np.isfinite(features.margin[idx]) else None
+            team_name = TEAM_NAMES.get(target, "equipo rival")
+            source_name = TEAM_NAMES.get(source, "rival")
+            if near_d <= 1.8 and (margin is not None and margin >= 0.3):
                 return _reason(
                     "interception",
                     f"Robo / intercepción: {team_name} anticipa y toma control del balón a {near_d:.1f} m de {source_name}.",
@@ -798,8 +804,8 @@ def build_switch_records(
         setpiece_r = _rule_setpiece_specific(features, local, features_offset, source, target, ball_xy)
 
         # Base geometric and kinetic rules
-        oob_r = _rule_out_of_bounds(features, lo, hi, features_offset)
-        parked_r = _rule_parked(features, local)
+        oob_r = _rule_out_of_bounds(features, lo, hi, features_offset) if target == D else None
+        parked_r = _rule_parked(features, local) if target == D else None
         restart_r = _rule_restart(features, local, features_offset) if target != D else None
         slow_r = _rule_teams_slow(features, local, live_median)
         tag_r = _rule_tag(tag_index, frame)

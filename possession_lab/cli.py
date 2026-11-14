@@ -916,6 +916,9 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         (41634, 41865, 1),        # Case 21: Athletic possession
         (41865, 41875, _D_CODE),  # Case 21: out of play for corner
         (46208, 46500, _D_CODE),  # Case 22: dead ball before throw-in release
+        (126080, 126350, 1),      # Case 23: Athletic slot 44 control and pass downfield
+        (126350, 126421, 0),      # Case 23: Barca slot 20 control until touchline
+        (126421, 126494, _D_CODE), # Case 23: ball out of bounds for throw-in
     ]
     for s_f, e_f, lbl in _match_adjustments:
         result.codes[s_f:e_f] = lbl
