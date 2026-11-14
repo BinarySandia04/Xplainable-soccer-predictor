@@ -867,6 +867,18 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                 elif e_f > s_f + 25:
                     result.codes[s_f:e_f - 25] = _D_CODE
 
+    # Aerial excursion continuity: suppress spurious dead ball on high balloon kicks with return
+    from .fusion.transitions import stitch_aerial_excursions
+
+    result.codes[:] = stitch_aerial_excursions(
+        result.codes,
+        arrays["consensus_ball"].astype(np.float64),
+        tuple(lab.tracking.pitch),
+        consensus_confidence=arrays["consensus_confidence"].astype(np.float64),
+        setpiece_tags=np.asarray(lab.tags.setpiece, dtype=bool),
+        fps=float(FPS),
+    )
+
     from .model import merge_isolated_runs
 
     result.codes[:] = merge_isolated_runs(result.codes, min_frames=5)

@@ -1168,6 +1168,88 @@ def apply_goalkeeper_restarts(
     return out_codes
 
 
+def stitch_aerial_excursions(
+    codes: np.ndarray,
+    consensus_ball: np.ndarray,
+    pitch: tuple[float, float],
+    consensus_confidence: np.ndarray | None = None,
+    setpiece_tags: np.ndarray | None = None,
+    max_excursion_frames: int = 175,
+    max_return_dist_m: float = 25.0,
+    max_speed_ms: float = 12.0,
+    fps: float = FPS,
+) -> np.ndarray:
+    """Stitch continuous possession across high aerial / vertical balloon kicks (balón alto/globo).
+
+    In soccer, high aerial clearances or vertical balloons cause planar homography projections
+    (assuming Z=0) to project the ball outside the pitch touchline (e.g. y < 0 or y > width)
+    or cause camera pan/zoom to temporarily lose the ball from the field of view.
+    When a ball was in play under possession of team T and undergoes an apparent dead-ball or
+    out-of-bounds excursion, but returns back onto the pitch within a short window (<= max_excursion_frames)
+    near the same vicinity (<= max_return_dist_m) with no active set-piece stoppage (SET PIECES)
+    or referee whistle, the ball never actually left the field of play.
+    This function bridges possession for team T through the aerial excursion up to the start
+    of any subsequent genuine set-piece stoppage.
+    """
+    out_codes = np.asarray(codes, dtype=np.int8).copy()
+    n = len(out_codes)
+    length, width = float(pitch[0]), float(pitch[1])
+    cb = np.asarray(consensus_ball, dtype=np.float64)
+    conf = np.asarray(consensus_confidence, dtype=np.float64) if consensus_confidence is not None else None
+
+    in_pitch = (cb[:, 0] >= -0.5) & (cb[:, 0] <= length + 0.5) & (cb[:, 1] >= -0.5) & (cb[:, 1] <= width + 0.5)
+    valid_ball = np.isfinite(cb).all(axis=1) & in_pitch
+    if conf is not None:
+        valid_ball = valid_ball & (conf > 0.05)
+
+    is_dead = (out_codes == D)
+    for s, e in _bool_runs(is_dead):
+        if s == 0:
+            continue
+        prev_team = out_codes[s - 1]
+        if prev_team not in (H, 1):
+            continue
+
+        sp_start = None
+        if setpiece_tags is not None:
+            sp_slice = np.asarray(setpiece_tags[s:e], dtype=bool)
+            if sp_slice.any():
+                sp_start = s + int(np.argmax(sp_slice))
+
+        check_e = sp_start if sp_start is not None else e
+        if check_e <= s:
+            continue
+
+        p_start = None
+        for k in range(s - 1, max(-1, s - 50), -1):
+            if valid_ball[k]:
+                p_start = cb[k]
+                break
+        if p_start is None:
+            continue
+
+        p_end = None
+        return_frame = None
+        for k in range(s, min(n, check_e + 75)):
+            if valid_ball[k]:
+                p_end = cb[k]
+                return_frame = k
+                break
+        if p_end is None:
+            continue
+
+        dist = float(np.linalg.norm(p_end - p_start))
+        flight_dur = return_frame - s
+        if flight_dur <= 0:
+            continue
+        speed = dist / (flight_dur / fps)
+
+        if flight_dur <= max_excursion_frames and (dist <= max_return_dist_m or speed <= max_speed_ms):
+            out_codes[s:check_e] = prev_team
+
+    return out_codes
+
+
 def gate_events(
     kicks: Sequence[tuple[int, float, int, float]],
     onsets: Sequence[tuple[int, float, int, float]],
@@ -2402,6 +2484,7 @@ __all__ = [
     "KeeperHold",
     "apply_goalkeeper_restarts",
     "stitch_keeper_saves",
+    "stitch_aerial_excursions",
     "out_of_bounds_mask",
     "possession_revival_mask",
     "pixel_contact",

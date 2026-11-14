@@ -1674,5 +1674,89 @@ class PossessionRevivalMaskTests(unittest.TestCase):
         self.assertEqual(res[0], 2)
 
 
+class StitchAerialExcursionsTests(unittest.TestCase):
+    """Vertical balloon / high aerial clearances project out-of-bounds due to planar homography
+    or cause brief camera loss, but land back in the same sector during open play without setpiece."""
+
+    def test_aerial_excursion_stitched_to_launch_team(self):
+        from possession_lab.fusion.transitions import stitch_aerial_excursions
+
+        n = 100
+        codes = np.full(n, 0, dtype=np.int8)
+        codes[20:60] = 2  # dead ball excursion
+        ball = np.full((n, 2), 50.0)
+        ball[:20] = [80.0, 10.0]
+        ball[20:60] = [75.0, -3.0]  # high ball projected past sideline
+        ball[60:] = [79.0, 9.0]     # lands back in same area (dist ~ 1.4m)
+        conf = np.ones(n, dtype=np.float64)
+        conf[20:60] = 0.0           # lost/untracked while high in the air
+
+        res = stitch_aerial_excursions(
+            codes,
+            ball,
+            (105.0, 68.0),
+            consensus_confidence=conf,
+            setpiece_tags=np.zeros(n, dtype=bool),
+            fps=25.0,
+        )
+        # Excursion should be stitched back to launching team H (0)
+        self.assertTrue((res[20:60] == 0).all())
+        self.assertEqual(res[0], 0)
+        self.assertEqual(res[65], 0)
+
+    def test_aerial_excursion_stops_at_setpiece(self):
+        from possession_lab.fusion.transitions import stitch_aerial_excursions
+
+        n = 100
+        codes = np.full(n, 0, dtype=np.int8)
+        codes[20:70] = 2
+        ball = np.full((n, 2), 50.0)
+        ball[:20] = [80.0, 10.0]
+        ball[20:70] = [75.0, -3.0]
+        ball[70:] = [79.0, 9.0]
+        conf = np.ones(n, dtype=np.float64)
+        conf[20:70] = 0.0
+
+        sp = np.zeros(n, dtype=bool)
+        sp[50:80] = True  # throw-in tag starts at 50
+
+        res = stitch_aerial_excursions(
+            codes,
+            ball,
+            (105.0, 68.0),
+            consensus_confidence=conf,
+            setpiece_tags=sp,
+            fps=25.0,
+        )
+        # Pre-setpiece aerial flight stitched to 0
+        self.assertTrue((res[20:50] == 0).all())
+        # Setpiece frames remain D (2)
+        self.assertTrue((res[50:70] == 2).all())
+
+    def test_distant_ball_not_stitched(self):
+        from possession_lab.fusion.transitions import stitch_aerial_excursions
+
+        n = 100
+        codes = np.full(n, 0, dtype=np.int8)
+        codes[20:60] = 2
+        ball = np.full((n, 2), 50.0)
+        ball[:20] = [10.0, 10.0]
+        ball[20:60] = [50.0, -5.0]
+        ball[60:] = [90.0, 60.0]  # returns far away (> 25m)
+        conf = np.ones(n, dtype=np.float64)
+        conf[20:60] = 0.0
+
+        res = stitch_aerial_excursions(
+            codes,
+            ball,
+            (105.0, 68.0),
+            consensus_confidence=conf,
+            setpiece_tags=np.zeros(n, dtype=bool),
+            fps=25.0,
+        )
+        # Should NOT be stitched because dist is ~94m
+        self.assertTrue((res[20:60] == 2).all())
+
+
 if __name__ == "__main__":
     unittest.main()
