@@ -352,9 +352,14 @@ def cmd_viewer(args: argparse.Namespace) -> int:
         perception_path = Path(args.perception)
     else:
         perception_path = output_dir / "perception.npz"
-        public_cache = output_dir / "perception_public.npz"
-        if not perception_path.is_file() and public_cache.is_file():
-            perception_path = public_cache
+        for candidate in (
+            output_dir / "perception.npz",
+            output_dir / "perception_new_fixed.npz",
+            output_dir / "perception_public.npz",
+        ):
+            if candidate.is_file():
+                perception_path = candidate
+                break
     fusion_path = Path(args.fusion) if args.fusion else output_dir / "fusion.npz"
 
     try:
@@ -445,7 +450,18 @@ def cmd_fusion(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir or OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
     lab = load_lab(args.data_dir)
-    perception_path = Path(args.perception) if args.perception else output_dir / "perception.npz"
+    if args.perception:
+        perception_path = Path(args.perception)
+    else:
+        perception_path = output_dir / "perception.npz"
+        for candidate in (
+            output_dir / "perception.npz",
+            output_dir / "perception_new_fixed.npz",
+            output_dir / "perception_public.npz",
+        ):
+            if candidate.is_file():
+                perception_path = candidate
+                break
     perception = None if args.no_perception else load_perception(perception_path)
     if perception is None:
         print(f"fusion: no perception cache at {perception_path}; using non-video ballots only")
@@ -574,7 +590,18 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     ]
     box_evidence = None
     if not args.no_perception:
-        perception_path = Path(args.perception) if args.perception else output_dir / "perception.npz"
+        if args.perception:
+            perception_path = Path(args.perception)
+        else:
+            perception_path = output_dir / "perception.npz"
+            for candidate in (
+                output_dir / "perception.npz",
+                output_dir / "perception_new_fixed.npz",
+                output_dir / "perception_public.npz",
+            ):
+                if candidate.is_file():
+                    perception_path = candidate
+                    break
         if perception_path.is_file():
             with np.load(perception_path, allow_pickle=False) as z:
                 vpitch = np.asarray(z["players_pitch"])
@@ -947,7 +974,18 @@ def cmd_perception_fix(args: argparse.Namespace) -> int:
 
     output_dir = Path(args.output_dir or OUTPUT_DIR)
     lab = load_lab(args.data_dir)
-    perception_path = Path(args.perception) if args.perception else output_dir / "perception.npz"
+    if args.perception:
+        perception_path = Path(args.perception)
+    else:
+        perception_path = output_dir / "perception.npz"
+        for candidate in (
+            output_dir / "perception.npz",
+            output_dir / "perception_new_fixed.npz",
+            output_dir / "perception_public.npz",
+        ):
+            if candidate.is_file():
+                perception_path = candidate
+                break
     with np.load(perception_path, allow_pickle=False) as z:
         arrays = {key: np.asarray(z[key]) for key in z.files}
     keepers = derive_keeper_slots(lab.tracking.players, lab.tracking.teams, PITCH, GRADED_HALVES)
