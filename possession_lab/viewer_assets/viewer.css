@@ -1178,6 +1178,31 @@ canvas {
   border: 1px solid color-mix(in srgb, var(--chip, var(--x)) 55%, transparent);
 }
 
+.reason-chip.primary-chip {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 9px;
+  margin-left: 6px;
+  box-shadow: 0 0 8px color-mix(in srgb, var(--chip, var(--x)) 30%, transparent);
+}
+
+.reason-chip.mini-chip {
+  font-size: 9px;
+  padding: 1px 6px;
+  margin: 0 6px 0 2px;
+}
+
+.switch-justification {
+  margin: 8px 0 10px;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--chip, #4ea8ff) 8%, rgba(255, 255, 255, 0.03));
+  border-left: 3px solid var(--chip, #4ea8ff);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #e2e8f0;
+}
+
 .reason-text {
   min-width: 0;
 }

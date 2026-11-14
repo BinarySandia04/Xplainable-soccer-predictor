@@ -1894,6 +1894,39 @@
     tag: "etiqueta",
     geometry: "geometría",
     prior: "prior",
+    // New domain tags
+    keeper_save: "parada portero",
+    parada_portero: "parada portero",
+    control_portero: "control portero",
+    foul: "falta arbitral",
+    falta_arbitral: "falta arbitral",
+    silbato_arbitro: "silbato",
+    touchline_out: "fuera banda",
+    fuera_de_banda: "fuera banda",
+    goalline_out: "fuera fondo",
+    fuera_de_fondo: "fuera fondo",
+    fuera_campo: "fuera campo",
+    interception: "robo / intercepción",
+    robo_intercepcion: "robo / intercepción",
+    duel: "disputa / duelo",
+    contacto_disputa: "disputa / duelo",
+    throwin_restart: "saque banda",
+    saque_banda: "saque banda",
+    corner_restart: "córner",
+    saque_esquina: "córner",
+    goalkick_restart: "saque puerta",
+    saque_puerta: "saque puerta",
+    freekick_restart: "tiro libre",
+    saque_falta: "tiro libre",
+    reanudacion_saque: "reanudación",
+    preparacion_saque: "preparación saque",
+    paron_colectivo: "parón colectivo",
+    balon_muerto: "balón muerto",
+    control_juego: "control juego",
+    control_balon: "control balón",
+    pase_en_juego: "pase en juego",
+    etiqueta_inteligente: "etiqueta inteligente",
+    prior_hmm: "prior HMM",
   };
   const KIND_COLORS = {
     out_of_bounds: "#ff6b5f",
@@ -1904,6 +1937,39 @@
     tag: "#4ea8ff",
     geometry: "#c8d6e5",
     prior: "#8ca0b4",
+    // New domain colors
+    keeper_save: "#38bdf8",
+    parada_portero: "#38bdf8",
+    control_portero: "#0284c7",
+    foul: "#fbbf24",
+    falta_arbitral: "#fbbf24",
+    silbato_arbitro: "#f59e0b",
+    touchline_out: "#f87171",
+    fuera_de_banda: "#f87171",
+    goalline_out: "#ef4444",
+    fuera_de_fondo: "#ef4444",
+    fuera_campo: "#f87171",
+    interception: "#34d399",
+    robo_intercepcion: "#34d399",
+    duel: "#a78bfa",
+    contacto_disputa: "#a78bfa",
+    throwin_restart: "#10b981",
+    saque_banda: "#10b981",
+    corner_restart: "#06b6d4",
+    saque_esquina: "#06b6d4",
+    goalkick_restart: "#6366f1",
+    saque_puerta: "#6366f1",
+    freekick_restart: "#14b8a6",
+    saque_falta: "#14b8a6",
+    reanudacion_saque: "#4ee68b",
+    preparacion_saque: "#c084fc",
+    paron_colectivo: "#9ad0ff",
+    balon_muerto: "#facc15",
+    control_juego: "#60a5fa",
+    control_balon: "#93c5fd",
+    pase_en_juego: "#4ade80",
+    etiqueta_inteligente: "#818cf8",
+    prior_hmm: "#8ca0b4",
   };
   const SWITCH_PLACEHOLDER =
     '<p class="muted small">Sin cambio seleccionado. Haz clic en una marca <strong>│</strong> de la línea temporal o en la lista de abajo.</p>';
@@ -1957,6 +2023,11 @@
     const sw = state.selectedSwitch >= 0 ? switchListData()[state.selectedSwitch] : null;
     if (sw) {
       const confPct = Math.round((Number(sw.confidence) || 0) * 100);
+      const primaryTag = sw.primary_tag || "";
+      const primaryColor = KIND_COLORS[primaryTag] || "#8ca0b4";
+      const primaryLabel = KIND_LABELS[primaryTag] || primaryTag;
+      const tagChip = primaryTag ? `<span class="reason-chip primary-chip" style="--chip:${primaryColor}">${escapeHtml(primaryLabel)}</span>` : "";
+      const justificationBox = sw.justification ? `<div class="switch-justification" style="--chip:${primaryColor}">${escapeHtml(sw.justification)}</div>` : "";
       const reasons = (sw.reasons || [])
         .map((r) => {
           const color = KIND_COLORS[r.kind] || "#8ca0b4";
@@ -1976,7 +2047,9 @@
           <span class="badge badge-${sw.to}">${sw.to}</span>
           <button type="button" class="mini-seek stamp-btn" data-seek-frame="${sw.frame}" title="Ir a este frame">${stamp(sw.t_s)}</button>
           <span class="mono muted">f ${formatFrame(sw.frame)}</span>
+          ${tagChip}
         </div>
+        ${justificationBox}
         <div class="conf-row" title="Probabilidad de emisión del estado entrante en el frame del cambio (antes del suavizado temporal)">
           <div class="conf-bar"><i style="width:${confPct}%"></i></div><span class="mono muted">${confPct}%</span>
         </div>
@@ -2012,10 +2085,15 @@
     if (from > 0) rows.push(`<li class="muted small">… ${from} cambios anteriores ocultos</li>`);
     for (let i = from; i < to; i += 1) {
       const { sw, idx } = entries[i];
+      const pTag = sw.primary_tag || "";
+      const pColor = KIND_COLORS[pTag] || "#8ca0b4";
+      const pLabel = KIND_LABELS[pTag] || pTag;
+      const chipHtml = pTag ? `<span class="reason-chip mini-chip" style="--chip:${pColor}">${escapeHtml(pLabel)}</span>` : "";
       rows.push(`
-        <li class="switch-row${idx === state.selectedSwitch ? " selected" : ""}" data-idx="${idx}" title="${escapeHtml(sw.summary)}">
+        <li class="switch-row${idx === state.selectedSwitch ? " selected" : ""}" data-idx="${idx}" title="${escapeHtml(sw.justification || sw.summary)}">
           <span class="stamp">${stamp(sw.t_s)}</span>
           <span class="sw-label"><span class="badge badge-${sw.from}">${sw.from}</span>→<span class="badge badge-${sw.to}">${sw.to}</span></span>
+          ${chipHtml}
           <span class="sw-summary">${escapeHtml(sw.summary)}</span>
         </li>`);
     }

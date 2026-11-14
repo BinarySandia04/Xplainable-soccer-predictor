@@ -69,17 +69,54 @@ def _build_explanations(lab, pred) -> dict:
 
 
 def _explain_and_write(args: argparse.Namespace, lab, pred) -> None:
-    """Generate ``outputs/explanations.json``.  Never fatal: annotations must not break a run."""
-    from .config import EXPLANATIONS_PATH
+    """Generate ``outputs/explanations.json`` and ``outputs/transition_decisions.csv``. Never fatal."""
+    from .config import EXPLANATIONS_PATH, OUTPUT_DIR
+    import json
+    import pandas as pd
 
     try:
         payload = _build_explanations(lab, pred)
     except Exception as exc:
         print(f"explanations: omitido ({exc})")
         return
-    path = Path(args.output_dir) / EXPLANATIONS_PATH.name
+    out_dir = Path(args.output_dir) if getattr(args, "output_dir", None) else OUTPUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / EXPLANATIONS_PATH.name
     _json(path, payload)
     print(f"explanations: {len(payload['switches'])} switches anotados -> {path}")
+
+    # Export tabular transition decisions CSV
+    try:
+        switches = payload.get("switches", [])
+        if switches:
+            csv_rows = []
+            for i, sw in enumerate(switches, 1):
+                evidence_dict = {}
+                for r in sw.get("reasons", []):
+                    if "evidence" in r and r["evidence"]:
+                        evidence_dict.update({f"{r['kind']}_{k}": v for k, v in r["evidence"].items()})
+                csv_rows.append(
+                    {
+                        "switch_id": i,
+                        "frame": sw["frame"],
+                        "timecode": sw.get("timecode", ""),
+                        "seconds": sw["t_s"],
+                        "from_state": sw["from"],
+                        "to_state": sw["to"],
+                        "confidence": sw["confidence"],
+                        "primary_tag": sw.get("primary_tag", ""),
+                        "tags": ";".join(sw.get("tags", [])),
+                        "category": sw.get("category", ""),
+                        "summary": sw["summary"],
+                        "justification": sw.get("justification", ""),
+                        "evidence": json.dumps(evidence_dict, ensure_ascii=False),
+                    }
+                )
+            csv_path = out_dir / "transition_decisions.csv"
+            pd.DataFrame(csv_rows).to_csv(csv_path, index=False, encoding="utf-8-sig")
+            print(f"decisions: {len(csv_rows)} decisiones exportadas -> {csv_path}")
+    except Exception as exc:
+        print(f"decisions CSV: omitido ({exc})")
 
 
 def cmd_all(args: argparse.Namespace) -> int:
@@ -194,6 +231,8 @@ def cmd_explain(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions = Path(args.predictions) if args.predictions else output_dir / "predictions.csv"
+    if not predictions.is_file() and (output_dir / "transition_predictions.csv").is_file():
+        predictions = output_dir / "transition_predictions.csv"
     if not predictions.is_file():
         print(f"explain: no existe {predictions}; ejecuta antes `predict`", file=sys.stderr)
         return 2

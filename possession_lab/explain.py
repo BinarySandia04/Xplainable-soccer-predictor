@@ -24,6 +24,7 @@ Nothing here feeds back into the model: explanations are built from an existing 
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -33,6 +34,8 @@ from .config import (
     CONTEXT,
     FPS,
     GRADED_HALVES,
+    OUTPUT_DIR,
+    PITCH,
     STOP_CONTROL_R,
     STOP_IN_RUN_BALL_SPEED,
     STOP_TEAM_SPEED,
@@ -52,6 +55,43 @@ WINDOW_AFTER_S = 2.5
 SWITCH_DEDUPE_FRAMES = int(0.5 * FPS)
 
 TEAM_NAMES = {H: "Barcelona", A: "Athletic Club", D: "balón muerto", X: "sin evaluar"}
+
+TAG_LABELS = {
+    "parada_portero": "Parada de portero",
+    "control_portero": "Control del portero",
+    "falta_arbitral": "Falta arbitral",
+    "silbato_arbitro": "Silbato del árbitro",
+    "fuera_de_banda": "Fuera de banda",
+    "fuera_de_fondo": "Línea de fondo / Córner",
+    "fuera_campo": "Balón fuera del campo",
+    "preparacion_saque": "Preparación de saque",
+    "paron_colectivo": "Parón colectivo",
+    "balon_muerto": "Balón muerto",
+    "reanudacion_saque": "Reanudación",
+    "saque_banda": "Saque de banda",
+    "saque_esquina": "Córner",
+    "saque_puerta": "Saque de puerta",
+    "saque_falta": "Tiro libre",
+    "robo_intercepcion": "Robo / Intercepción",
+    "contacto_disputa": "Duelo / Disputa",
+    "perdida_posesion": "Pérdida de posesión",
+    "control_balon": "Control de balón",
+    "pase_en_juego": "Pase en juego",
+    "etiqueta_inteligente": "Etiqueta inteligente",
+    "prior_hmm": "Inferencia HMM",
+}
+
+CATEGORY_LABELS = {
+    "portero": "Intervención de portero",
+    "arbitro_falta": "Decisión arbitral / Falta",
+    "balon_fuera": "Fuera de límites",
+    "balon_parado": "Balón parado",
+    "reanudacion": "Reanudación del juego",
+    "cambio_posesion": "Disputa / Recuperación",
+    "control_juego": "Posesión activa",
+    "evento_oficial": "Evento de partido",
+    "prior": "Continuidad del modelo",
+}
 
 
 def timecode(seconds: float) -> str:
@@ -107,8 +147,410 @@ def _json_num(v: Any) -> Any:
     return v
 
 
-def _reason(kind: str, text: str, **evidence: Any) -> dict:
-    return {"kind": kind, "text": text, "evidence": {k: _json_num(v) for k, v in evidence.items()}}
+def _reason(kind: str, text: str, tag: str | None = None, **evidence: Any) -> dict:
+    d = {"kind": kind, "text": text, "evidence": {k: _json_num(v) for k, v in evidence.items()}}
+    if tag is not None:
+        d["tag"] = tag
+    return d
+
+
+def _rule_keeper_save(
+    features: Features,
+    local: int,
+    offset: int,
+    target: int,
+    events_df: Any = None,
+    ball_xy: np.ndarray | None = None,
+) -> dict | None:
+    """Detect goalkeeper save / catch / hold in the defending penalty area."""
+    if target not in (H, A):
+        return None
+    frame = local + offset
+    target_label = CODE_TO_LABEL.get(target, "")
+
+    # Check 1: transition_events table hold / area event within window
+    if events_df is not None and hasattr(events_df, "empty") and not events_df.empty:
+        lo_f, hi_f = frame - int(2.5 * FPS), frame + int(2.5 * FPS)
+        subset = events_df[
+            (events_df["event_frame"] >= lo_f)
+            & (events_df["start_frame"] <= hi_f)
+            & (events_df["kind"].isin(["hold", "area"]))
+            & (events_df["team"] == target_label)
+        ]
+        if not subset.empty:
+            row = subset.iloc[0]
+            team_name = TEAM_NAMES.get(target, "equipo")
+            ev_desc = "parada y retención" if str(row["kind"]) == "hold" else "bloqueo en el área"
+            return _reason(
+                "keeper_save",
+                f"Parada del portero: {ev_desc} del balón ({team_name}).",
+                tag="parada_portero",
+                event_kind=str(row["kind"]),
+                event_frame=int(row["event_frame"]),
+                team=target,
+            )
+
+    # Check 2: ball position inside penalty area and near target team
+    if 0 <= local < features.present.size:
+        xy = None
+        if ball_xy is not None and local < len(ball_xy):
+            xy = ball_xy[local]
+        elif hasattr(features, "ball_est") and features.ball_est.shape[0] > local:
+            xy = features.ball_est[local]
+        if xy is not None and np.isfinite(xy[0]) and np.isfinite(xy[1]):
+            bx, by = float(xy[0]), float(xy[1])
+            # Penalty boxes: length is ~105.3, width is 68.0
+            in_box = (bx <= 18.0 or bx >= 87.0) and (12.0 <= by <= 56.0)
+            if in_box:
+                near_d = float(features.near_distance[local]) if np.isfinite(features.near_distance[local]) else 99.0
+                near_t = int(features.near_team[local]) if features.near_team.size > local else -1
+                if near_t == target and near_d <= 4.0:
+                    team_name = TEAM_NAMES.get(target, "portero")
+                    return _reason(
+                        "keeper_save",
+                        f"Intervención del portero: balón controlado dentro del área de penalti ({team_name}, a {near_d:.1f} m).",
+                        tag="parada_portero",
+                        box_x=bx,
+                        box_y=by,
+                        near_distance_m=near_d,
+                        team=target,
+                    )
+    return None
+
+
+def _rule_foul(
+    features: Features,
+    local: int,
+    offset: int,
+    target: int,
+    whistle_data: Any = None,
+) -> dict | None:
+    """Detect referee whistle / foul leading to dead ball."""
+    if target != D:
+        return None
+    frame = local + offset
+
+    # Check 1: whistle_data (e.g. from whistle.npz)
+    if whistle_data is not None:
+        starts = whistle_data.get("starts") if isinstance(whistle_data, dict) else getattr(whistle_data, "starts", None)
+        if starts is None and hasattr(whistle_data, "__getitem__"):
+            try:
+                starts = whistle_data["starts"]
+            except Exception:
+                starts = None
+        if starts is not None and len(starts) > 0:
+            window_f = int(2.0 * FPS)
+            near_whistles = starts[(starts >= frame - window_f) & (starts <= frame + window_f)]
+            if len(near_whistles) > 0:
+                wf = int(near_whistles[0])
+                diff_s = (wf - frame) / FPS
+                return _reason(
+                    "foul",
+                    f"Falta / silbato arbitral: el árbitro interrumpe el juego (silbato en frame {wf}, {diff_s:+.1f} s).",
+                    tag="falta_arbitral",
+                    whistle_frame=wf,
+                    offset_s=diff_s,
+                )
+
+    # Check 2: features.whistle_score
+    if 0 <= local < features.present.size and hasattr(features, "whistle_score") and features.whistle_score.size > local:
+        w_lo = max(0, local - int(1.5 * FPS))
+        w_hi = min(features.whistle_score.size, local + int(1.5 * FPS))
+        w_scores = features.whistle_score[w_lo:w_hi]
+        if w_scores.size and np.nanmax(w_scores) > 0.4:
+            max_idx = w_lo + int(np.nanargmax(w_scores))
+            return _reason(
+                "foul",
+                f"Falta / silbato arbitral: señal acústica de silbato detectada ({float(np.nanmax(w_scores)):.2f} confianza).",
+                tag="falta_arbitral",
+                frame=max_idx + offset,
+                score=float(np.nanmax(w_scores)),
+            )
+
+    return None
+
+
+def _rule_turnover_interception(
+    features: Features,
+    local: int,
+    offset: int,
+    source: int,
+    target: int,
+    events_df: Any = None,
+) -> dict | None:
+    """Detect interception, steal, or duel when possession changes directly between H and A."""
+    if source not in (H, A) or target not in (H, A):
+        return None
+    if not (0 <= local < features.present.size):
+        return None
+
+    frame = local + offset
+    target_label = CODE_TO_LABEL.get(target, "")
+
+    # Check 1: transition_events contact/kicker
+    if events_df is not None and hasattr(events_df, "empty") and not events_df.empty:
+        lo_f, hi_f = frame - int(1.5 * FPS), frame + int(1.5 * FPS)
+        subset = events_df[
+            (events_df["event_frame"] >= lo_f)
+            & (events_df["start_frame"] <= hi_f)
+            & (events_df["team"] == target_label)
+        ]
+        if not subset.empty:
+            ev = subset.iloc[0]
+            team_name = TEAM_NAMES.get(target, "equipo rival")
+            source_name = TEAM_NAMES.get(source, "rival")
+            if str(ev["kind"]) in ("contact", "kick"):
+                return _reason(
+                    "interception",
+                    f"Robo / intercepción: toque directo de {team_name} que arrebata la posesión a {source_name}.",
+                    tag="robo_intercepcion",
+                    event_kind=str(ev["kind"]),
+                    event_frame=int(ev["event_frame"]),
+                    team=target,
+                )
+            elif str(ev["kind"]) == "kicker":
+                return _reason(
+                    "interception",
+                    f"Recuperación y despeje: {team_name} gana la disputa y juega el esférico.",
+                    tag="robo_intercepcion",
+                    event_kind=str(ev["kind"]),
+                    event_frame=int(ev["event_frame"]),
+                    team=target,
+                )
+
+    # Check 2: Geometry & margin around switch
+    hi = min(features.present.size, local + int(1.5 * FPS))
+    span = features.present[local:hi]
+    if span.any() and features.near_distance.size > local:
+        idx = local + int(np.argmax(span))
+        near_d = float(features.near_distance[idx]) if np.isfinite(features.near_distance[idx]) else None
+        near_t = int(features.near_team[idx]) if features.near_team.size > idx else -1
+        margin = float(features.margin[idx]) if features.margin.size > idx and np.isfinite(features.margin[idx]) else None
+        team_name = TEAM_NAMES.get(target, "equipo rival")
+        source_name = TEAM_NAMES.get(source, "rival")
+        if near_t == target and near_d is not None:
+            if near_d <= 1.8 and (margin is not None and margin >= 0.8):
+                return _reason(
+                    "interception",
+                    f"Robo / intercepción: {team_name} anticipa y toma control del balón a {near_d:.1f} m de {source_name}.",
+                    tag="robo_intercepcion",
+                    near_distance_m=near_d,
+                    margin_m=margin,
+                    team=target,
+                )
+            elif near_d <= 2.5:
+                return _reason(
+                    "duel",
+                    f"Duelo / disputa dividida: pugna cuerpo a cuerpo resuelta para {team_name} a {near_d:.1f} m.",
+                    tag="contacto_disputa",
+                    near_distance_m=near_d,
+                    margin_m=margin,
+                    team=target,
+                )
+    return None
+
+
+def _rule_setpiece_specific(
+    features: Features,
+    local: int,
+    offset: int,
+    source: int,
+    target: int,
+    ball_xy: np.ndarray | None = None,
+) -> dict | None:
+    """Classify set-piece restart subtype (throw-in, corner, goal kick)."""
+    if source != D or target not in (H, A):
+        return None
+    if not (0 <= local < features.present.size):
+        return None
+
+    xy = None
+    if ball_xy is not None and local < len(ball_xy):
+        xy = ball_xy[local]
+    elif hasattr(features, "ball_est") and features.ball_est.shape[0] > local:
+        xy = features.ball_est[local]
+
+    team_name = TEAM_NAMES.get(target, "equipo atacante")
+
+    if xy is not None and np.isfinite(xy[0]) and np.isfinite(xy[1]):
+        bx, by = float(xy[0]), float(xy[1])
+        # Corner arcs
+        if (bx <= 4.0 or bx >= 101.3) and (by <= 4.0 or by >= 64.0):
+            return _reason(
+                "corner_restart",
+                f"Saque de esquina: córner ejecutado por {team_name} al área.",
+                tag="saque_esquina",
+                x=bx,
+                y=by,
+                team=target,
+            )
+        # Touchline throw-in
+        if (4.0 < bx < 101.3) and (by <= 3.0 or by >= 65.0):
+            return _reason(
+                "throwin_restart",
+                f"Saque de banda: reanudación de banda ejecutada para {team_name}.",
+                tag="saque_banda",
+                x=bx,
+                y=by,
+                team=target,
+            )
+        # Goal kick
+        if (bx <= 18.0 or bx >= 87.0) and (15.0 <= by <= 53.0):
+            return _reason(
+                "goalkick_restart",
+                f"Saque de puerta: reinicio de juego desde el área pequeña por {team_name}.",
+                tag="saque_puerta",
+                x=bx,
+                y=by,
+                team=target,
+            )
+
+    edge = float(features.edge[local]) if np.isfinite(features.edge[local]) else None
+    if edge is not None and abs(edge) <= 2.5:
+        return _reason(
+            "throwin_restart",
+            f"Saque de banda: balón reanudado desde la línea ({edge:.1f} m) para {team_name}.",
+            tag="saque_banda",
+            edge_m=edge,
+            team=target,
+        )
+
+    return None
+
+
+def assign_decision_tags(
+    source: int,
+    target: int,
+    reasons: list[dict],
+    confidence: float,
+) -> tuple[str, list[str], str, str]:
+    """Map the collected reason signals into (primary_tag, tags, category, justification)."""
+    kinds = [r["kind"] for r in reasons]
+    source_name = TEAM_NAMES.get(source, "equipo")
+    target_name = TEAM_NAMES.get(target, "equipo")
+
+    if "keeper_save" in kinds:
+        primary_tag = "parada_portero"
+        category = "portero"
+        tags = ["parada_portero", "control_portero"]
+        justification = (
+            f"El guardameta de {target_name} asegura o bloquea el esférico dentro del área de penalti "
+            f"tras una aproximación rival, garantizando la posesión directa para su equipo."
+        )
+    elif "foul" in kinds:
+        primary_tag = "falta_arbitral"
+        category = "arbitro_falta"
+        tags = ["falta_arbitral", "balon_muerto"]
+        justification = (
+            f"Infracción o detención señalada con silbato por el árbitro, "
+            f"interrumpiendo la jugada activa de {source_name} y pasando el estado a balón muerto."
+        )
+    elif "corner_restart" in kinds:
+        primary_tag = "saque_esquina"
+        category = "reanudacion"
+        tags = ["saque_esquina", "reanudacion_saque"]
+        justification = (
+            f"Reanudación del juego mediante saque de esquina botado por {target_name} hacia el área."
+        )
+    elif "throwin_restart" in kinds:
+        primary_tag = "saque_banda"
+        category = "reanudacion"
+        tags = ["saque_banda", "reanudacion_saque"]
+        justification = (
+            f"Reanudación del partido mediante saque de banda ejecutado a favor de {target_name}."
+        )
+    elif "goalkick_restart" in kinds:
+        primary_tag = "saque_puerta"
+        category = "reanudacion"
+        tags = ["saque_puerta", "reanudacion_saque"]
+        justification = (
+            f"Reinicio del partido mediante saque de puerta ejecutado por {target_name} desde su propia área."
+        )
+    elif "interception" in kinds:
+        primary_tag = "robo_intercepcion"
+        category = "cambio_posesion"
+        tags = ["robo_intercepcion", "recuperacion"]
+        justification = (
+            f"Cambio de posesión por anticipación o robo defensivo: jugador de {target_name} "
+            f"intercepta la trayectoria del esférico y toma el control frente a {source_name}."
+        )
+    elif "duel" in kinds:
+        primary_tag = "contacto_disputa"
+        category = "cambio_posesion"
+        tags = ["contacto_disputa", "duelo_ganado"]
+        justification = (
+            f"Duelo o disputa dividida en balón dividido entre jugadores de ambos conjuntos, "
+            f"resuelto con posesión efectiva para {target_name}."
+        )
+    elif "out_of_bounds" in kinds:
+        primary_tag = "fuera_de_banda"
+        category = "balon_fuera"
+        tags = ["fuera_de_banda", "balon_muerto"]
+        justification = (
+            f"El esférico rebasa los límites del terreno de juego reglamentario tras la acción de {source_name}, "
+            f"deteniendo el partido en balón muerto."
+        )
+    elif "parked" in kinds:
+        primary_tag = "preparacion_saque"
+        category = "balon_parado"
+        tags = ["preparacion_saque", "balon_muerto"]
+        justification = (
+            f"Balón detenido junto a la línea mientras los jugadores se ubican para el saque correspondiente."
+        )
+    elif "restart" in kinds:
+        primary_tag = "reanudacion_saque"
+        category = "reanudacion"
+        tags = ["reanudacion_saque", "pase_en_juego"]
+        justification = (
+            f"El balón acelera con fuerza desde una posición estática, reanudando la posesión en juego activo para {target_name}."
+        )
+    elif "stopped_field" in kinds or "teams_slow" in kinds:
+        if target == D:
+            primary_tag = "paron_colectivo"
+            category = "balon_parado"
+            tags = ["paron_colectivo", "balon_muerto"]
+            justification = (
+                f"Caída drástica y generalizada de la velocidad media del grupo de jugadores, "
+                f"certificando el cese de juego en balón muerto."
+            )
+        else:
+            primary_tag = "control_juego"
+            category = "control_juego"
+            tags = ["control_juego"]
+            justification = (
+                f"Posesión activa y pausada de {target_name} con circulación del balón."
+            )
+    elif "geometry" in kinds:
+        if source == D:
+            primary_tag = "reanudacion_saque"
+            category = "reanudacion"
+            tags = ["reanudacion_saque", "control_balon"]
+            justification = (
+                f"Reanudación del juego bajo control inmediato del jugador más cercano de {target_name}."
+            )
+        else:
+            primary_tag = "robo_intercepcion"
+            category = "cambio_posesion"
+            tags = ["robo_intercepcion", "control_balon"]
+            justification = (
+                f"Toma de posesión de {target_name} al encontrarse su jugador en proximidad y control directo del balón."
+            )
+    elif "tag" in kinds:
+        primary_tag = "etiqueta_inteligente"
+        category = "evento_oficial"
+        tags = ["etiqueta_inteligente"]
+        justification = (
+            f"Cambio alineado con etiqueta oficial de evento registrada en los metadatos del partido."
+        )
+    else:
+        primary_tag = "prior_hmm"
+        category = "prior"
+        tags = ["prior_hmm"]
+        justification = (
+            f"Transición inferida por el prior de continuidad secuencial y emisión probabilística del modelo."
+        )
+
+    return primary_tag, tags, category, justification
 
 
 def _rule_out_of_bounds(features: Features, lo: int, hi: int, offset: int) -> dict | None:
@@ -117,7 +559,13 @@ def _rule_out_of_bounds(features: Features, lo: int, hi: int, offset: int) -> di
         return None
     idx = lo + int(np.argmax(oop))
     depth = float(abs(features.edge[idx])) if np.isfinite(features.edge[idx]) else 0.0
-    return _reason("out_of_bounds", f"El balón sale del campo: {depth:.1f} m más allá de la línea (frame {idx + offset}).", frame=idx + offset, depth_m=depth)
+    return _reason(
+        "out_of_bounds",
+        f"El balón sale del campo: {depth:.1f} m más allá de la línea (frame {idx + offset}).",
+        tag="fuera_de_banda",
+        frame=idx + offset,
+        depth_m=depth,
+    )
 
 
 def _rule_parked(features: Features, frame: int) -> dict | None:
@@ -127,8 +575,6 @@ def _rule_parked(features: Features, frame: int) -> dict | None:
     if not mask.any() or _coverage(mask.astype(float)) < 0.2:
         return None
     run = _longest_run(mask)
-    # A parked run often contains frames where the ATD loses the ball: prefer a frame whose
-    # geometry is actually measured, so the evidence carries real numbers, not nulls.
     measured = mask & np.isfinite(features.edge[lo:hi]) & np.isfinite(features.ball_speed[lo:hi])
     idx = lo + int(np.argmax(measured)) if measured.any() else lo + int(np.argmax(mask.astype(np.int8)))
     edge = float(features.edge[idx]) if np.isfinite(features.edge[idx]) else None
@@ -138,6 +584,7 @@ def _rule_parked(features: Features, frame: int) -> dict | None:
     return _reason(
         "parked",
         f"Balón parado junto a la línea {run / FPS:.1f} s a {edge_txt} {speed_txt}: pinta a saque de banda/esquina.",
+        tag="preparacion_saque",
         frames=run,
         seconds=run / FPS,
         edge_m=edge,
@@ -169,6 +616,7 @@ def _rule_restart(features: Features, local: int, offset: int) -> dict | None:
     return _reason(
         "restart",
         f"Reanudación: el balón acelera de {med:.1f} a {peak:.1f} m/s ({elapsed:.1f} s tras el cambio).",
+        tag="reanudacion_saque",
         frame=crossing + offset,
         speed_from=med,
         speed_to=peak,
@@ -189,20 +637,13 @@ def _rule_teams_slow(features: Features, frame: int, live_median: float) -> dict
     return _reason(
         "teams_slow",
         f"El grupo se mueve a {median:.1f} m/s (mediana de la ventana {live_median:.1f}): todo el mundo andando.",
+        tag="paron_colectivo",
         team_speed_mps=median,
         live_median_mps=live_median,
     )
 
 
 def _rule_stopped_field(features: Features, frame: int) -> dict | None:
-    """The field itself is at a walk and the ball is not in play: the game is stopped.
-
-    :func:`_rule_teams_slow` measures the window *against the match median*, so it goes silent
-    exactly when the window is the stoppage - which is the case for a dead state the stop-event
-    override wrote.  This rule measures the stretch instead of comparing it: the whole pitch
-    walking for seconds, with a ball nobody is playing (untracked, or standing, or nobody within
-    a metre and a half of it).
-    """
     half = int(1.0 * FPS)
     ahead = int(6.0 * FPS)
     lo = max(0, frame - half)
@@ -228,6 +669,7 @@ def _rule_stopped_field(features: Features, frame: int) -> dict | None:
         "stopped_field",
         f"Balón parado: el grupo lleva {run / FPS:.0f} s a {median:.1f} m/s y el balón no está "
         f"en juego en el {idle * 100:.0f} % del tramo.",
+        tag="balon_muerto",
         walking_seconds=run / FPS,
         team_speed_mps=median,
         idle_fraction=idle,
@@ -243,13 +685,12 @@ def _rule_ball_missing(features: Features, frame: int) -> dict | None:
     return _reason(
         "ball_missing",
         f"El tracker pierde el balón {run / FPS:.1f} s alrededor del cambio.",
+        tag="balon_perdido",
         seconds=run / FPS,
     )
 
 
 def _rule_tag(index: tuple[np.ndarray, np.ndarray, list] | None, frame: int) -> dict | None:
-    """Set-piece smart tag covering or nearest ``frame`` (±3 s).  Only ``SET PIECES`` intervals
-    annotate a switch: ``BALL IN FINAL THIRD`` runs for minutes and explains nothing."""
     if index is None:
         return None
     starts, stops, meta = index
@@ -268,6 +709,7 @@ def _rule_tag(index: tuple[np.ndarray, np.ndarray, list] | None, frame: int) -> 
     return _reason(
         "tag",
         label,
+        tag="etiqueta_inteligente",
         start=event["start"],
         stop=event["stop"],
         code=event["code"],
@@ -288,6 +730,7 @@ def _rule_geometry(features: Features, frame: int) -> dict | None:
     return _reason(
         "geometry",
         f"Jugador más cercano al balón: {team} a {features.near_distance[idx]:.1f} m.",
+        tag="control_balon",
         near_team=int(features.near_team[idx]),
         near_distance_m=float(features.near_distance[idx]),
     )
@@ -300,6 +743,9 @@ def build_switch_records(
     tags: TagTable | None,
     log_emission: np.ndarray,
     halves: tuple[tuple[int, int], ...] = GRADED_HALVES,
+    events: Any | None = None,
+    whistle: Any | None = None,
+    ball_xy: np.ndarray | None = None,
 ) -> list[dict]:
     """Explain every switch inside ``features``' window (absolute frame addressing throughout)."""
     tag_index = None
@@ -313,6 +759,10 @@ def build_switch_records(
             np.array([m["stop"] for m in ev_meta], dtype=np.int64),
             ev_meta,
         )
+
+    events_df = events
+    whistle_data = whistle
+
     team_speed = features.team_speed
     live_median = float(np.median(team_speed[np.isfinite(team_speed)])) if np.isfinite(team_speed).any() else float("nan")
     records: list[dict] = []
@@ -322,35 +772,61 @@ def build_switch_records(
             continue
         lo = max(0, local - int(WINDOW_BEFORE_S * FPS))
         hi = min(features.present.size, local + int(WINDOW_AFTER_S * FPS))
-        # A switch is explained by what the match did, not by what the tracker could not see: the
-        # ball gap is context that goes last, and only beside evidence that carries the change.
+
+        # Specialized domain rules
+        keeper_r = _rule_keeper_save(features, local, features_offset, target, events_df, ball_xy)
+        foul_r = _rule_foul(features, local, features_offset, target, whistle_data)
+        turnover_r = _rule_turnover_interception(features, local, features_offset, source, target, events_df)
+        setpiece_r = _rule_setpiece_specific(features, local, features_offset, source, target, ball_xy)
+
+        # Base geometric and kinetic rules
+        oob_r = _rule_out_of_bounds(features, lo, hi, features_offset)
+        parked_r = _rule_parked(features, local)
+        restart_r = _rule_restart(features, local, features_offset) if target != D else None
+        slow_r = _rule_teams_slow(features, local, live_median)
+        tag_r = _rule_tag(tag_index, frame)
+        stopped_r = _rule_stopped_field(features, local) if target == D else None
+        geom_r = _rule_geometry(features, local) if target in (H, A) else None
         context = _rule_ball_missing(features, local)
-        reasons = [r for r in (
-            _rule_out_of_bounds(features, lo, hi, features_offset),
-            _rule_parked(features, local),
-            _rule_restart(features, local, features_offset) if target != D else None,
-            _rule_teams_slow(features, local, live_median),
-            _rule_tag(tag_index, frame),
-            _rule_stopped_field(features, local) if target == D else None,
-            _rule_geometry(features, local) if target in (H, A) else None,
-        ) if r]
+
+        primary_signals = [r for r in (keeper_r, foul_r, turnover_r, setpiece_r) if r]
+        base_signals = [r for r in (oob_r, parked_r, restart_r, slow_r, tag_r, stopped_r, geom_r) if r]
+
+        seen_kinds = set()
+        reasons = []
+        for r in primary_signals + base_signals:
+            if r["kind"] not in seen_kinds:
+                seen_kinds.add(r["kind"])
+                reasons.append(r)
+
         if reasons and context:
             reasons.append(context)
         if not reasons:
-            reasons = [_reason("prior", f"Sin señal local fuerte: el prior de transición del HMM mantiene «{TEAM_NAMES[target]}».", prior=True)]
+            reasons = [_reason("prior", f"Sin señal local fuerte: el prior de transición del HMM mantiene «{TEAM_NAMES[target]}».", tag="prior_hmm", prior=True)]
+
         band = log_emission[max(0, local - FPS // 2): local + FPS // 2 + 1]
         finite = np.where(np.isfinite(band), band, -1e9)
         softmax = np.exp(finite - finite.max(axis=1, keepdims=True))
         row_prob = softmax[:, target] / softmax.sum(axis=1, keepdims=True)
         confidence = float(np.nan_to_num(row_prob).max()) if row_prob.size else 0.0
+
+        primary_tag, tags_list, category, justification = assign_decision_tags(
+            source, target, reasons, confidence
+        )
+
         records.append(
             {
                 "frame": int(frame),
                 "t_s": round(frame / FPS, 3),
+                "timecode": timecode(frame / FPS),
                 "from": CODE_TO_LABEL[source],
                 "to": CODE_TO_LABEL[target],
                 "confidence": round(confidence, 3),
+                "primary_tag": primary_tag,
+                "tags": tags_list,
+                "category": category,
                 "summary": reasons[0]["text"],
+                "justification": justification,
                 "reasons": reasons[:4],
             }
         )
@@ -364,12 +840,17 @@ def build_explanations(
     tags: TagTable | None,
     params: ModelParams = DEFAULT_PARAMS,
     halves: tuple[tuple[int, int], ...] = GRADED_HALVES,
+    events: Any | None = None,
+    whistle: Any | None = None,
+    ball_xy: np.ndarray | None = None,
 ) -> dict:
     """Payload for the viewer: per-switch "why" records over one feature window."""
     log_emission = emission_log_probs(features, params)
     return {
         "fps": FPS,
-        "switches": build_switch_records(pred, features, features_offset, tags, log_emission, halves),
+        "switches": build_switch_records(
+            pred, features, features_offset, tags, log_emission, halves, events=events, whistle=whistle, ball_xy=ball_xy
+        ),
     }
 
 
@@ -380,21 +861,48 @@ def explain_prediction(
     params: ModelParams = DEFAULT_PARAMS,
     halves: tuple[tuple[int, int], ...] = GRADED_HALVES,
     context: int = CONTEXT,
+    events: Any | None = None,
+    whistle: Any | None = None,
 ) -> dict:
     """Explain every switch over the full match, one features window per graded half.
 
     Each half is explained with the same context-padded feature window the decode used, so the
     annotations describe the evidence the model actually saw.
     """
+    if events is None:
+        ev_file = OUTPUT_DIR / "transition_events.csv"
+        if ev_file.is_file():
+            try:
+                import pandas as pd
+                events = pd.read_csv(ev_file)
+            except Exception:
+                events = None
+    if whistle is None:
+        wh_file = OUTPUT_DIR / "whistle.npz"
+        if wh_file.is_file():
+            try:
+                whistle = np.load(wh_file)
+            except Exception:
+                whistle = None
+
     n = tracking.n_frames
     switches: list[dict] = []
+    ball_xy = getattr(tracking, "ball", None)
     for start, stop in halves:
         lo = max(0, int(start) - context)
         hi = min(n, int(stop) + context)
         features = extract_features(tracking, tags, start=lo, stop=hi)
         switches.extend(
             build_switch_records(
-                pred, features, lo, tags, emission_log_probs(features, params), halves=[(int(start), int(stop))]
+                pred,
+                features,
+                lo,
+                tags,
+                emission_log_probs(features, params),
+                halves=[(int(start), int(stop))],
+                events=events,
+                whistle=whistle,
+                ball_xy=ball_xy[lo:hi] if ball_xy is not None else None,
             )
         )
     switches.sort(key=lambda record: record["frame"])
