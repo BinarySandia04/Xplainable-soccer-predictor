@@ -3,7 +3,8 @@
 > **Our submission:** deep video perception with two dedicated YOLO26x detectors (ball, players),
 > fused with the provided tracking, smart tagging and whistle audio into a per-frame evidence pool
 > (`fusion`), then a transition layer that turns the pool into possession spells — dead-ball locks,
-> tag-based revival, possession-based revival — and an interactive explainability viewer.
+> tag-based revival, possession-based revival, keeper-identity and no-touch consistency — and an
+> interactive explainability viewer.
 >
 > * **Initialize it:** quick start with the two execution paths (no-GPU re-run from the release,
 >   full GPU regeneration) is in **[Initialize the system](#initialize-the-system)** below; the
@@ -12,7 +13,7 @@
 >   match and no possession label — in **[How the models were trained](#how-the-models-were-trained)** below.
 > * **Performance:** **0.7600 spellF1** and **0.9691 macroF1** on the public 5-minute window
 >   (best published baseline: 0.4242 spellF1 / 0.6207 macroF1).
-> * **Verification:** 315 passing tests (`pytest`), clean linter (`ruff check .`), official format
+> * **Verification:** 329 passing tests (`pytest`), clean linter (`ruff check .`), official format
 >   validation, and every artefact of the champion run SHA-256-pinned.
 > * **Docs:** **[possession_lab/README.md](possession_lab/README.md)** (implementation + CLI),
 >   **[PROPOSAL.md](PROPOSAL.md)** (original design), **[TODO.md](TODO.md)** (open items).
@@ -137,7 +138,7 @@ in this repository — see *Getting the data* and unpack the bundle under `data/
 python3.12 -m venv .venv
 .venv/bin/python -m pip install -r requirements-possession.txt   # CPU chain (fusion, transitions, viewer)
 .venv/bin/python -m pip install -r requirements-perception.txt   # + YOLO (only for the GPU perception path)
-.venv/bin/python -m pytest -q possession_lab/tests               # 315 passed (+4 subtests)
+.venv/bin/python -m pytest -q possession_lab/tests               # 329 passed (+4 subtests)
 ```
 
 ### Path A — no GPU: regenerate the submission CSV from the released artefacts

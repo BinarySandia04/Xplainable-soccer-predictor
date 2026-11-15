@@ -549,6 +549,33 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     player_sets: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = [
         (lab.tracking.players, lab.tracking.teams, lab.tracking.player_present)
     ]
+    # a keeper's roster team follows the goal he defends: the ATD slot that teleports
+    # onto the other keeper carries the wrong shirt (measured 115 421: slot 23 sits at
+    # the left goal, which Athletic defends in the second half), and a "touch" at the
+    # ball from that slot is not evidence for the team it nominally wears
+    from .keepers import derive_keeper_slots
+
+    keeper_slots = derive_keeper_slots(
+        lab.tracking.players, lab.tracking.teams, tuple(lab.tracking.pitch), GRADED_HALVES
+    )
+    atd_players = np.asarray(lab.tracking.players, dtype=np.float64)
+    length = float(lab.tracking.pitch[0])
+    atd_teams = np.tile(
+        np.asarray(lab.tracking.teams, dtype=np.int8), (int(atd_players.shape[0]), 1)
+    )
+    for h_idx, (start_h, stop_h) in enumerate(GRADED_HALVES):
+        for goal in range(keeper_slots.slot.shape[1]):
+            slot = int(keeper_slots.slot[h_idx, goal])
+            if slot < 0:
+                continue
+            x = atd_players[start_h:stop_h, slot, 0]
+            side = (np.nan_to_num(x, nan=0.0) > length / 2.0).astype(int)
+            right = np.asarray(keeper_slots.team[h_idx], dtype=np.int8)[side]
+            near = np.isfinite(x) & (np.minimum(np.abs(x), np.abs(x - length)) <= 25.0)
+            atd_teams[start_h:stop_h, slot] = np.where(
+                near, right, atd_teams[start_h:stop_h, slot]
+            )
+    player_sets[0] = (lab.tracking.players, atd_teams, lab.tracking.player_present)
     box_evidence = None
     if not args.no_perception:
         perception_path = Path(args.perception) if args.perception else output_dir / "perception.npz"
@@ -574,6 +601,28 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                     np.asarray(lab.tracking.player_present, dtype=bool),
                     tuple(lab.tracking.pitch),
                 )
+                # ... except for the keeper slot that teleports onto the other keeper,
+                # whose roster team is then a lie (measured 115 421): the goal-side
+                # rescue must be the last word on a keeper's team, after the relabel
+                from .keepers import derive_keeper_slots, rescue_keeper_teams
+
+                vteam, _keeper_flips = rescue_keeper_teams(
+                    np.asarray(z["players_pixel"]),
+                    vpitch,
+                    vpresent,
+                    vteam,
+                    lab.tracking.players,
+                    lab.homography.matrices,
+                    derive_keeper_slots(
+                        lab.tracking.players, lab.tracking.teams, tuple(lab.tracking.pitch), GRADED_HALVES
+                    ),
+                    GRADED_HALVES,
+                    tuple(lab.tracking.pitch),
+                    players_track=(
+                        np.asarray(z["players_track"]) if "players_track" in z else None
+                    ),
+                )
+                vteam = vteam.astype(np.int8)
                 box_evidence = None
                 if not args.no_box and "players_box" in z:
                     yolo_all = np.asarray(z["yolo_ball_pixel"])
@@ -665,11 +714,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     # defends each goal; the hold itself is detected in pixel evidence (see keeper_holds)
     keeper_defenders = None
     if int(args.keeper_hold_min_frames) > 0 and box_evidence is not None:
-        from .keepers import derive_keeper_slots
-
-        keeper_defenders = derive_keeper_slots(
-            lab.tracking.players, lab.tracking.teams, tuple(lab.tracking.pitch), GRADED_HALVES
-        ).team
+        keeper_defenders = keeper_slots.team
         params = replace(params, keeper_hold_min_frames=int(args.keeper_hold_min_frames))
     pool = raw_evidence_pool(probabilities, weights)
     result = apply_transition_layer(
@@ -745,6 +790,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         f"transitions: {result.n_kicks} kicks + {result.n_onsets} onsets detected, "
         f"{result.n_contact} contacts + {result.n_kicker} win-and-clear kicks + {result.n_hold} keeper holds "
         f"+ {result.n_area} area catches from boxes, {result.n_control} spell expiries, "
+        f"{result.n_flight} flight holds, "
         f"{result.n_gated_out} gated out -> {len(result.events)} transition events; "
         f"{int(out_of_play.sum()):,} frames of lost/out-of-bounds ball marked D; "
         f"{int(revived.sum()):,} frames revived by live tags, {int(touched.sum()):,} by a player at the ball"
@@ -838,6 +884,7 @@ def cmd_perception_fix(args: argparse.Namespace) -> int:
         keepers,
         GRADED_HALVES,
         PITCH,
+        players_track=arrays["players_track"],
     )
     officials = rescue_officials(
         arrays["players_pixel"],

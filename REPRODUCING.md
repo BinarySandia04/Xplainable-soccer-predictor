@@ -11,7 +11,7 @@ labels `H` / `A` / `D` / `X`. Upload it named `<team_name>.csv`.
 ```bash
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt        # CPU inference for fusion/transitions
-.venv/bin/python -m pytest possession_lab -q     # 315 passed (+4 subtests)
+.venv/bin/python -m pytest possession_lab -q     # 329 passed (+4 subtests)
 ```
 
 The match data lives in `data/` (tactical video, tracking, homography, ATD, smart tags).
@@ -81,7 +81,7 @@ Only step 1 needs a GPU; everything after it is deterministic CPU code (no RNG i
 ```bash
 P=possession_lab/outputs
 
-# 1. Perception (GPU): ball + players over the tactical video, keeper rescue included.
+# 1. Perception (GPU): ball + players over the tactical video.
 #    Run farm_perceive.py (SLURM wrapper: farm_perceive.sbatch) against the two weights above.
 #    The homography/ATD sidecars must share the video's stem (see FARM_README.txt).
 python farm_perceive.py \
@@ -90,19 +90,26 @@ python farm_perceive.py \
     --players-weights players_yolo26x_1024_clu.pt \
     --output-dir possession_lab/outputs
 
-# 2. Fusion: multi-source evidence pool (tracking, tags, events, perception).
+# 2. Cache rescue (CPU): keeper teams by the goal each keeper defends, duplicated
+#    keeper boxes merged, officials flagged.  Writes <cache>_fixed.npz.
+#    (Rename the merged cache to perception_new.npz first, as used below.)
+.venv/bin/python -m possession_lab perception-fix \
+    --perception $P/perception_new.npz --out $P/perception_new_fixed.npz
+
+# 3. Fusion: multi-source evidence pool (tracking, tags, events, perception).
 .venv/bin/python -m possession_lab fusion --perception $P/perception_new_fixed.npz
 
-# 3. Transition layer: possession spells, dead-ball locks, tag/possession revival.
+# 4. Transition layer: possession spells, dead-ball locks, tag/possession revival,
+#    no-possession-change-without-a-touch.
 .venv/bin/python -m possession_lab transitions \
     --perception $P/perception_new_fixed.npz --fusion $P/fusion.npz
 
-# 4. Explanations (viewer/report artefacts; not needed for the CSV).
+# 5. Explanations (viewer/report artefacts; not needed for the CSV).
 .venv/bin/python -m possession_lab explain \
     --perception $P/perception_new_fixed.npz \
     --predictions $P/transition_predictions.csv
 
-# 5. Validate the exact file you will upload.
+# 6. Validate the exact file you will upload.
 cp $P/transition_predictions.csv <team_name>.csv
 python evaluation/validate_submission.py <team_name>.csv
 ```
@@ -113,10 +120,10 @@ python evaluation/validate_submission.py <team_name>.csv
 
 | artefact | SHA-256 |
 |---|---|
-| `possession_lab/outputs/perception_new_fixed.npz` | `9dddaa128dc9eb39eae8419958e4252bb5ed65a423418f33a08ac835ff855f1b` |
-| `possession_lab/outputs/fusion.npz` | `e7ea998b74b963af25413d1938bf5659e56efec1f155e0a668c4dbf4dcae0369` |
-| `possession_lab/outputs/transition_predictions.csv` | `3c0694272da36a648061d72e9931422e66bed80ba96b7e465b19c261b366e59e` |
-| `possession_lab/outputs/explanations.json` | `25023e5b1702613030f20ae6af61af97c51907e8bcc9c294f5e0e09130072b64` |
+| `possession_lab/outputs/perception_new_fixed.npz` | `9d63f358c035fba6e80ca959f913ce90d3cae34f5e8115e221158dd2d7465bf1` |
+| `possession_lab/outputs/fusion.npz` | `fb11ccb7f8e91d5dc79c2bf23f4f7445af4bf846b61c787e682576d2c9354117` |
+| `possession_lab/outputs/transition_predictions.csv` | `0bb5500b69850e6d36f2e477078772a9010d6ce1449d2d6a6db81ebbb5b86ba6` |
+| `possession_lab/outputs/explanations.json` | `f0a455a80a369eed7453c58c736d7684b45554ddd5c0417c10d3bbcc0fed59b1` |
 
 If your perception cache matches the checksum above, steps 2–4 are pure CPU and reproduce the
 CSV exactly. Perception itself is deterministic given the same weights, `imgsz` (1024), device
