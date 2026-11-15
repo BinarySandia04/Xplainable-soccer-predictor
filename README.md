@@ -1,12 +1,21 @@
 # Xplainable Soccer Predictor — More than a Hack 2027
 
-> **Our Proposal:** A gap-aware hybrid Hidden Markov Model with causal ball trajectory filtering, acoustic referee whistle detection, domain event rules, deep video perception with physical continuity gating, multi-source consensus fusion, and an interactive explainability studio.
-> 
-> * **Technical Proposal:** Full documentation in **[PROPOSAL.md](PROPOSAL.md)**.
-> * **Possession Lab:** Implementation details, CLI commands, and reviewer guide in **[possession_lab/README.md](possession_lab/README.md)**.
-> * **Ball Detector:** A dedicated YOLO11s trained on a merged four-source dataset — match-frame recall 0.55→0.70 and precision 0.36→0.72 over the COCO baseline — wired into perception with `--ball-model` (see **[ball_training/README.md](ball_training/README.md)**).
-> * **Performance:** **0.6519 spellF1** (vs 0.4242 best baseline) and **0.9466 macroF1** (vs 0.5812 best baseline).
-> * **Verification:** 169 passing tests (`pytest`), clean linter (`ruff check .`), and official format validation.
+> **Our submission:** deep video perception with two dedicated YOLO26x detectors (ball, players),
+> fused with the provided tracking, smart tagging and whistle audio into a per-frame evidence pool
+> (`fusion`), then a transition layer that turns the pool into possession spells — dead-ball locks,
+> tag-based revival, possession-based revival — and an interactive explainability viewer.
+>
+> * **Initialize it:** quick start with the two execution paths (no-GPU re-run from the release,
+>   full GPU regeneration) is in **[Initialize the system](#initialize-the-system)** below; the
+>   exact commands, checksums and the full chain are in **[REPRODUCING.md](REPRODUCING.md)**.
+> * **How the models were trained:** external public datasets only — no frame of the provided
+>   match and no possession label — in **[How the models were trained](#how-the-models-were-trained)** below.
+> * **Performance:** **0.7600 spellF1** and **0.9691 macroF1** on the public 5-minute window
+>   (best published baseline: 0.4242 spellF1 / 0.6207 macroF1).
+> * **Verification:** 315 passing tests (`pytest`), clean linter (`ruff check .`), official format
+>   validation, and every artefact of the champion run SHA-256-pinned.
+> * **Docs:** **[possession_lab/README.md](possession_lab/README.md)** (implementation + CLI),
+>   **[PROPOSAL.md](PROPOSAL.md)** (original design), **[TODO.md](TODO.md)** (open items).
 
 ---
 
@@ -115,24 +124,116 @@ The match assets are released to enrolled participants who have accepted the ter
 3. You receive a download link.
 4. Unpack it into `./data`, or point `MTAH_DATA_DIR` at wherever you put it.
 
-Full description of every asset and how the frames line up: **[DATA.md](DATA.md)**.
+Full description of every asset and its format, and the frame alignment: **[DATA.md](DATA.md)**.
 
-## Reproduce the possession lab
+---
 
-The BAR-ATH solution, pinned dependencies, tests, and commands to regenerate the report are
-documented in [possession_lab/README.md](possession_lab/README.md). It needs the tactical ATD,
-ATD metadata, smart-tag XML, and homography CSV from the gated bundle; the video is not needed
-for inference. Do not commit the gated data or generated full-match predictions.
+## Initialize the system
 
-From the repository root, after obtaining the bundle:
+Python 3.12 (the validated run uses 3.12.3), one venv, nothing else. The match assets are **not**
+in this repository — see *Getting the data* and unpack the bundle under `data/`.
 
 ```bash
 python3.12 -m venv .venv
-.venv/bin/python -m pip install -r requirements-possession.txt
+.venv/bin/python -m pip install -r requirements-possession.txt   # CPU chain (fusion, transitions, viewer)
+.venv/bin/python -m pip install -r requirements-perception.txt   # + YOLO (only for the GPU perception path)
+.venv/bin/python -m pytest -q possession_lab/tests               # 315 passed (+4 subtests)
+```
+
+### Path A — no GPU: regenerate the submission CSV from the released artefacts
+
+The only GPU step is perception (YOLO over all 199,319 frames). Its finished output — and the
+fusion pool — ship in the [`champion-run` release](https://github.com/BinarySandia04/Xplainable-soccer-predictor/releases/tag/champion-run),
+so the exact submission CSV can be regenerated on a laptop:
+
+```bash
+gh release download champion-run --pattern "perception_new_fixed.npz" --dir possession_lab/outputs
+gh release download champion-run --pattern "fusion.npz"               --dir possession_lab/outputs
+
+.venv/bin/python -m possession_lab transitions \
+    --perception possession_lab/outputs/perception_new_fixed.npz \
+    --fusion possession_lab/outputs/fusion.npz
+.venv/bin/python -m possession_lab explain \
+    --perception possession_lab/outputs/perception_new_fixed.npz \
+    --predictions possession_lab/outputs/transition_predictions.csv
+.venv/bin/python evaluation/validate_submission.py possession_lab/outputs/transition_predictions.csv
+```
+
+`sha256sum` of the produced files must match the table in [REPRODUCING.md](REPRODUCING.md) —
+that is the definition of "reproduced" for this repository.
+
+To **watch the real detections** on the tactical video without running any model, add the viewer
+bundle from the same release and:
+
+```bash
+gh release download champion-run --pattern "outputs_view_bundle.tar.gz" --dir /tmp
+tar xzf /tmp/outputs_view_bundle.tar.gz -C possession_lab/outputs/
+.venv/bin/python -m possession_lab viewer \
+    --perception  possession_lab/outputs/perception_new_fixed.npz \
+    --fusion      possession_lab/outputs/fusion.npz \
+    --predictions possession_lab/outputs/transition_predictions.csv
+```
+
+then open `http://localhost:8765` (or `--port N` to change it).
+
+### Path B — full regeneration from raw data (GPU)
+
+```bash
+# 1. Trained weights (external data only; SHA-256 in REPRODUCING.md)
+gh release download champion-run --pattern "*.pt" --dir .
+
+# 2. Perception: ball + players over the tactical video, keeper rescue included.
+#    A SLURM wrapper for GPU clusters is provided: farm_perceive.sbatch (see FARM_README.txt).
+python farm_perceive.py \
+    --video data/tactical/BAR-ATH_tactical-001.mp4 \
+    --ball-weights ball_yolo26x_1024_clu.pt \
+    --players-weights players_yolo26x_1024_clu.pt \
+    --output-dir possession_lab/outputs
+
+# 3. Evidence pool, transition layer, explanations, validation.
+.venv/bin/python -m possession_lab fusion \
+    --perception possession_lab/outputs/perception_new_fixed.npz
+# then the same two commands as Path A: transitions, explain, validate.
+```
+
+### Path C — data-only HMM (no video, no YOLO)
+
+The original gap-aware HMM over tracking + tags + whistle audio, before video perception was
+added:
+
+```bash
 .venv/bin/python -m possession_lab all --bootstrap-n 2000
-.venv/bin/python -m unittest discover -s possession_lab/tests -v
 .venv/bin/python evaluation/validate_submission.py possession_lab/outputs/predictions.csv
 ```
+
+---
+
+## How the models were trained
+
+The only learned components in the submission are two YOLO26x @ 1024 px detectors. Both were
+trained with DDP on a multi-GPU server, on **external public data only**: no frame of the provided
+match and no possession ground-truth label entered any training or tuning step (per the challenge
+rules and the organisers' clarification of November 2026).
+
+| weight | external training data | training script |
+|---|---|---|
+| `ball_yolo26x_1024_clu.pt` | SoccerNet v3 H250 ([Zenodo](https://zenodo.org/records/7808511), CC-BY-4.0) · infactory-ai/ball-tracking ([HF](https://huggingface.co/datasets/infactory-ai/ball-tracking), CC-BY-NC-4.0) · martinjolif/football-ball-detection ([HF](https://huggingface.co/datasets/martinjolif/football-ball-detection), CC-BY-4.0) | `ball_training/train_cluster.py` |
+| `players_yolo26x_1024_clu.pt` | SoccerNet/SN-Tracking-2023 ([HF](https://huggingface.co/datasets/SoccerNet/SN-Tracking-2023), research terms) · martinjolif/football-player-detection ([HF](https://huggingface.co/datasets/martinjolif/football-player-detection), CC-BY-4.0) · keremberke/football-object-detection ([HF](https://huggingface.co/datasets/keremberke/football-object-detection), CC-BY-4.0) · manot/football-players ([HF](https://huggingface.co/datasets/manot/football-players), MIT) | `ball_training/train_players_cluster.py` |
+
+The player model covers classes *player / goalkeeper / referee*. All training code is committed;
+the trained weights are in the `champion-run` release with SHA-256 pinned in
+[REPRODUCING.md](REPRODUCING.md). The YOLO11s experiment in `ball_training/` mixed frames of the
+provided match into its training set; it is **not** part of this chain and is documented as
+excluded (see its README's status banner).
+
+---
+
+## Reproduce the possession lab
+
+Everything the champion run consumes and produces, the exact commands, the model weights with
+SHA-256, and the expected checksums of every intermediate artefact are documented in
+[**REPRODUCING.md**](REPRODUCING.md). Do not commit the gated data or generated full-match
+predictions; the repository must regenerate them, not ship them.
 
 ---
 
@@ -145,6 +246,7 @@ python3.12 -m venv .venv
 | **[EVALUATION.md](EVALUATION.md)** | how you are scored, and why — read before optimising anything |
 | **[SUBMISSION.md](SUBMISSION.md)** | the file contract, the three deliverables, how to submit |
 | **[RULES.md](RULES.md)** | what you may and may not do |
+| **[REPRODUCING.md](REPRODUCING.md)** | the champion chain: commands, weights, checksums |
 | **[FAQ.md](FAQ.md)** | |
 | **[OVERVIEW.md](OVERVIEW.md)** | the competition as a whole — context, why the 2027 format changed, the calendar |
 
@@ -155,6 +257,13 @@ python3.12 -m venv .venv
 
 ```
 games.py                    per-match constants, asset paths and the frame alignment
+farm_perceive.py            GPU perception driver (two-stage inference + keeper rescue)
+farm_perceive.sbatch        SLURM wrapper for the perception step
+FARM_README.txt             how the farm bundle is built and run
+REPRODUCING.md              how to regenerate the exact submission CSV — weights, commands, checksums
+TODO.md                     open items before the deadline
+ball_training/              detector training scripts + the excluded YOLO11s experiment
+weights/                    local copies of the trained detectors (git-ignored; published in the champion-run release)
 evaluation/
   possession_metrics.py     the metric library — every number on the board is defined here
   run_evaluation.py         the scorer. This exact file produces the official result
