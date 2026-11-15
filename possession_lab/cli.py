@@ -30,6 +30,25 @@ def _json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(to_jsonable(value), indent=2), encoding="utf-8")
 
 
+def _default_perception_path(output_dir: Path) -> Path:
+    candidates = [
+        output_dir / "perception.npz",
+        output_dir / "perception_new.npz",
+        output_dir / "perception_public.npz",
+    ]
+    for path in candidates:
+        metadata_path = path.with_suffix(path.suffix + ".json")
+        if not path.is_file() or not metadata_path.is_file():
+            continue
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        n_frames = int(metadata.get("n_frames", 0))
+        if int(metadata.get("start", -1)) == 0 and n_frames > 0 and int(
+            metadata.get("stop", -1)
+        ) >= n_frames:
+            return path
+    return next((path for path in candidates if path.is_file()), candidates[0])
+
+
 def _gpu_note(load_seconds: float, predict_seconds: float, stress_seconds: float) -> str:
     return (
         "GPU: not used. The model is a 3-state Viterbi pass over 199,319 frames plus a handful of "
@@ -312,10 +331,7 @@ def cmd_viewer(args: argparse.Namespace) -> int:
     if args.perception:
         perception_path = Path(args.perception)
     else:
-        perception_path = output_dir / "perception.npz"
-        public_cache = output_dir / "perception_public.npz"
-        if not perception_path.is_file() and public_cache.is_file():
-            perception_path = public_cache
+        perception_path = _default_perception_path(output_dir)
     fusion_path = Path(args.fusion) if args.fusion else output_dir / "fusion.npz"
 
     try:
@@ -348,14 +364,14 @@ def cmd_viewer(args: argparse.Namespace) -> int:
 
 def cmd_perceive(args: argparse.Namespace) -> int:
     """Run YOLO player/ball perception and write a reusable video cache."""
-    from .config import OUTPUT_DIR, PUBLIC_START, PUBLIC_STOP, VIDEO_PATH
+    from .config import N_FRAMES, OUTPUT_DIR, VIDEO_PATH
     from .perception import perceive_video, save_perception
     from .pipeline import load_lab
 
     output_dir = Path(args.output_dir or OUTPUT_DIR)
     lab = load_lab(args.data_dir, load_gt=False)
-    start = int(args.start if args.start is not None else PUBLIC_START)
-    stop = int(args.stop if args.stop is not None else PUBLIC_STOP)
+    start = int(args.start if args.start is not None else 0)
+    stop = int(args.stop if args.stop is not None else N_FRAMES)
     path = Path(args.perception) if args.perception else output_dir / "perception.npz"
     print(
         f"perception: {start:,}..{stop:,} step {args.step}, stage {args.stage}, model {args.model}"

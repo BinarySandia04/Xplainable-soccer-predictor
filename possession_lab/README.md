@@ -51,7 +51,10 @@ public ground truth.
 # One-time: CPU/GPU perception dependencies.  The base requirements still reproduce predictions.
 .venv/bin/python -m pip install -r requirements-perception.txt
 
-# Public 5-minute window (about 13-15 min on an RTX 5070 Ti at step 1).
+# Full match (frames 0 through 199,318); this is also the default range.
+.venv/bin/python -m possession_lab perceive --step 1
+
+# Public 5-minute evaluation window:
 .venv/bin/python -m possession_lab perceive \
   --start 11185 --stop 18685 --step 1 \
   --perception possession_lab/outputs/perception_public.npz
@@ -60,7 +63,7 @@ public ground truth.
 .venv/bin/python -m possession_lab fusion \
   --perception possession_lab/outputs/perception_public.npz
 
-# The viewer auto-loads perception.npz/perception_public.npz and fusion.npz.
+# The viewer prefers a full-match perception cache, then a public-window cache.
 .venv/bin/python -m possession_lab viewer
 ```
 
@@ -133,7 +136,7 @@ The default URL is `http://127.0.0.1:8765/`; the page opens at the first public 
 | `--metrics PATH` | public metrics JSON (default `possession_lab/outputs/metrics_public.json`) |
 | `--user-truth PATH` | UT JSON (default `possession_lab/outputs/user_truth.json`) |
 | `--explanations PATH` | switch annotations JSON (default `outputs/explanations.json`) |
-| `--perception PATH` | YOLO perception cache (default `outputs/perception.npz`, else `perception_public.npz`) |
+| `--perception PATH` | YOLO perception cache (default prefers a full-match cache, then `perception_public.npz`) |
 | `--fusion PATH` | multi-source fusion cache (default `outputs/fusion.npz`) |
 | `--no-explanations` | start without the annotation layer |
 | `--start-frame N` | initial frame; URL `?frame=N` overrides it |
