@@ -148,6 +148,54 @@ class RescueKeeperTeamsTest(unittest.TestCase):
         self.assertEqual(len(flips), 10)
         self.assertTrue((fixed[:, 0] == 0).all())  # other box keeps its team
 
+    def test_track_claimed_at_the_goal_keeps_its_team_through_the_radius_miss(self):
+        # measured 115 421: the keeper drifts 18.1 px from the slot projection while
+        # standing in his goal, so the per-frame radius misses him and the same track
+        # flickers 0/1.  A track claimed often enough inside the goal zone is the
+        # keeper of that goal for the whole half.
+        n = 90
+        pixel = np.zeros((n, 1, 2), dtype=np.float64)
+        pitch_xy = np.zeros((n, 1, 2), dtype=np.float64)
+        present = np.ones((n, 1), dtype=bool)
+        teams = np.ones((n, 1), dtype=np.int8)  # mislabelled as the attacking team
+        pixel[:, 0] = (1.5 * 10, WIDTH / 2 * 10)
+        pixel[20:60, 0, 0] += 20.0  # outside claim_radius_px, still in the goal zone
+        pixel[60:, 0] = (5000.0, 5000.0)  # walks out to midfield, far from any slot
+        pitch_xy[:, 0] = (1.5, WIDTH / 2)
+        pitch_xy[60:, 0] = (50.0, WIDTH / 2)
+        tracks = np.full((n, 1), 77, dtype=np.int64)
+        fixed, flips = rescue_keeper_teams(
+            pixel, pitch_xy, present, teams, self.atd,
+            np.repeat(self.matrix[None], n, axis=0), self.keepers, ((0, 1000),), PITCH,
+            players_track=tracks,
+        )
+        self.assertTrue((fixed[:60, 0] == 0).all())  # goal 0's defender throughout the zone
+        self.assertTrue((fixed[60:, 0] == 1).all())  # untouched away from the goal
+        self.assertEqual(len(flips), 60)
+
+    def test_duplicate_box_on_the_keeper_inherits_his_team(self):
+        # measured 115 384: the same keeper box came out twice (two tracks, 0.0 m
+        # apart); the duplicate kept the roster's nominal shirt and its box at the
+        # ball counted as a touch by the attacking team.
+        n, p = 40, 2
+        pixel = np.zeros((n, p, 2), dtype=np.float64)
+        pitch_xy = np.zeros((n, p, 2), dtype=np.float64)
+        present = np.ones((n, p), dtype=bool)
+        teams = np.stack([np.full(n, 0), np.full(n, 1)], axis=1).astype(np.int8)
+        pixel[:, 0] = (1.5 * 10, WIDTH / 2 * 10)
+        pixel[:, 1] = (1.6 * 10, WIDTH / 2 * 10)
+        pitch_xy[:, 0] = (1.5, WIDTH / 2)
+        pitch_xy[:, 1] = (1.6, WIDTH / 2)
+        tracks = np.stack([np.full(n, 5), np.full(n, 6)], axis=1)
+        fixed, flips = rescue_keeper_teams(
+            pixel, pitch_xy, present, teams, self.atd,
+            np.repeat(self.matrix[None], n, axis=0), self.keepers, ((0, 1000),), PITCH,
+            players_track=tracks,
+        )
+        self.assertTrue((fixed[:, 0] == 0).all())
+        self.assertTrue((fixed[:, 1] == 0).all())  # duplicate wears the keeper's team
+        self.assertEqual(len(flips), n)
+
     def test_frames_outside_halves_are_skipped(self):
         pixel, pitch_xy, present, teams = self._store([1])
         pixel[:, 0] = (1.5 * 10, WIDTH / 2 * 10)

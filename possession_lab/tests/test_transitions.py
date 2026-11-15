@@ -31,12 +31,14 @@ from possession_lab.fusion.transitions import (
     expire_owned_spells,
     gate_events,
     gate_pixel_events,
+    hold_through_flight,
     hold_touch_through,
     keeper_area_catches,
     keeper_holds,
     pixel_contact,
     raw_evidence_pool,
     relay_contacts,
+    team_distances,
 )
 
 N = 120
@@ -310,6 +312,100 @@ class HoldTouchThroughTests(unittest.TestCase):
         out = hold_touch_through(self.codes, [self.event, later], np.zeros(self.n, bool), support)
         self.assertTrue((out[170:200] == H).all())
         self.assertTrue((out[200:220] == D).all())  # the next event owns the boundary, not the hold
+
+
+class HoldThroughFlightTests(unittest.TestCase):
+    """A change of owner needs a touch: a spell its team never touched goes back."""
+
+    def setUp(self):
+        self.n = 300
+        self.codes = np.full(self.n, H, dtype=np.int8)
+        self.codes[100:200] = A
+        self.dist = np.full((self.n, 2), 10.0)  # ball ten metres from everyone
+        self.valid = np.ones(self.n, dtype=bool)
+        self.dist[150:160, A] = 1.0  # the away spell is received at 150
+
+    def runs(self, codes):
+        out, s = [], 0
+        for i in range(1, len(codes)):
+            if codes[i] != codes[s]:
+                out.append((s, i, int(codes[s])))
+                s = i
+        out.append((s, len(codes), int(codes[s])))
+        return out
+
+    def test_untouched_spell_goes_back_to_the_previous_owner(self):
+        out, rolled = hold_through_flight(self.codes, self.dist, self.valid)
+        self.assertEqual(rolled, 1)
+        self.assertEqual(self.runs(out), [(0, 100, H), (100, 300, A)])
+
+    def test_touch_inside_the_spell_keeps_it(self):
+        self.dist[210:215, H] = 1.5
+        out, rolled = hold_through_flight(self.codes, self.dist, self.valid)
+        self.assertEqual(rolled, 0)
+        self.assertEqual(self.runs(out), [(0, 100, H), (100, 200, A), (200, 300, H)])
+
+    def test_touch_just_before_the_boundary_keeps_it(self):
+        self.dist[180:190, H] = 2.0
+        out, rolled = hold_through_flight(self.codes, self.dist, self.valid)
+        self.assertEqual(rolled, 0)
+        self.assertTrue((out[200:] == H).all())
+
+    def test_witnessed_event_keeps_the_spell(self):
+        event = TransitionEvent(start=205, frame=205, kind="kick", team=H, distance=1.0, support=0.2)
+        _out, rolled = hold_through_flight(self.codes, self.dist, self.valid, [event])
+        self.assertEqual(rolled, 0)
+
+    def test_unseen_ball_is_not_judged(self):
+        self.valid[200:] = False
+        _out, rolled = hold_through_flight(self.codes, self.dist, self.valid)
+        self.assertEqual(rolled, 0)
+
+    def test_long_spells_are_not_rewritten(self):
+        params = replace(DEFAULT_TRANSITION_PARAMS, flight_max_rollback_frames=50)
+        _out, rolled = hold_through_flight(self.codes, self.dist, self.valid, params=params)
+        self.assertEqual(rolled, 0)
+
+    def test_rule_can_be_disabled(self):
+        params = replace(DEFAULT_TRANSITION_PARAMS, flight_touch_radius_m=0.0)
+        out, rolled = hold_through_flight(self.codes, self.dist, self.valid, params=params)
+        self.assertEqual(rolled, 0)
+        self.assertTrue((out == self.codes).all())
+
+    def test_a_spell_after_deadness_is_left_alone(self):
+        codes = self.codes.copy()
+        codes[100:200] = D
+        out, rolled = hold_through_flight(codes, self.dist, self.valid)
+        self.assertEqual(rolled, 0)
+        self.assertTrue((out == codes).all())
+
+
+class TeamDistancesTests(unittest.TestCase):
+    def test_per_team_minimum_distance(self):
+        n = 4
+        ball = np.zeros((n, 2))
+        ball[:, 0] = np.arange(n)
+        pitch = np.full((n, 2, 2), 100.0)
+        pitch[:, 0] = (0.0, 0.0)  # home player on every frame
+        pitch[:, 1] = (0.5, 0.0)
+        teams = np.array([H, A], dtype=np.int8)
+        present = np.ones((n, 2), dtype=bool)
+        d = team_distances(ball, [(pitch, teams, present)])
+        self.assertTrue(np.allclose(d[:, H], ball[:, 0]))
+        self.assertTrue(np.allclose(d[:, A], np.abs(ball[:, 0] - 0.5)))
+
+    def test_unseen_ball_and_absent_team_are_infinite(self):
+        ball = np.array([[np.nan, np.nan], [1.0, 1.0]])
+        pitch = np.full((2, 1, 2), 5.0)
+        teams = np.array([A], dtype=np.int8)
+        present = np.array([[True], [True]])
+        d = team_distances(ball, [(pitch, teams, present)])
+        self.assertTrue(np.isinf(d[0]).all())  # the ball is unseen
+        self.assertTrue(np.isinf(d[:, H]).all())  # no home player at all
+        self.assertTrue(np.isfinite(d[1, A]))
+        present[1] = False
+        d = team_distances(ball, [(pitch, teams, present)])
+        self.assertTrue(np.isinf(d[1, A]))  # the only away player is gone
 
 
 class PulseAndDecodeTests(unittest.TestCase):

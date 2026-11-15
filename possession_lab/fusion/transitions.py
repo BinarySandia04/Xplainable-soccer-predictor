@@ -227,6 +227,16 @@ class TransitionParams:
     revive_touch_dist_m: float = 2.0  # how close a player must be to own the ball
     revive_touch_cov: float = 0.7  # share of each second's frame holding that glue
     revive_touch_gap: float = 0.1  # raw pool margin the gluing player's team needs
+    # -- a change of owner needs a touch: while the ball is in flight it still belongs
+    # to whoever played it.  A spell whose team never brings a player within reach of
+    # the ball — and owns no witnessed event there — is the decoder outrunning the
+    # play and is handed back to the team that had it (measured 115 330: A->H with
+    # the ball 7.7 m from every player, the back-pass still in the air, and H held
+    # for 121 frames until the receiver touched it).
+    flight_touch_radius_m: float = 2.5  # m: a player this close to the ball has touched it
+    flight_touch_lookback_frames: int = 25  # 1 s: a touch just before the boundary counts
+    flight_min_ball_frames: float = 0.6  # share of the spell with a seen ball, or no verdict
+    flight_max_rollback_frames: int = 750  # 30 s: longer spells are not rewritten blindly
 
 
 DEFAULT_TRANSITION_PARAMS = TransitionParams()
@@ -265,6 +275,7 @@ class TransitionLayerResult:
     n_hold: int = 0
     n_control: int = 0
     n_area: int = 0
+    n_flight: int = 0
 
 
 # --------------------------------------------------------------------------- ball kinematics
@@ -318,6 +329,39 @@ def control_map(
         ok = valid[s:e] & np.isfinite(b).all(axis=1)
         nearest[s:e] = np.where(ok & (best_d <= control_radius), best_t, -1).astype(np.int8)
     return nearest
+
+
+def team_distances(
+    consensus: np.ndarray,
+    player_sets: Sequence[tuple[np.ndarray, np.ndarray, np.ndarray]],
+) -> np.ndarray:
+    """Per-frame minimum ball distance (m) to a present player of each team.
+
+    Column 0 is home and column 1 away; ``inf`` where the ball is unseen or that
+    team has nobody on the pitch.  Unlike :func:`control_map` there is no radius:
+    the caller decides what "within reach" means.
+    """
+    consensus = np.asarray(consensus, dtype=np.float64)
+    n = consensus.shape[0]
+    out = np.full((n, 2), np.inf)
+    for s in range(0, n, CHUNK):
+        e = min(n, s + CHUNK)
+        m = e - s
+        b = consensus[s:e]
+        ok = np.isfinite(b).all(axis=1)
+        best = np.full((m, 2), np.inf)
+        for pitch, teams, present in player_sets:
+            pitch = np.asarray(pitch, dtype=np.float64)[s:e]
+            teams = np.asarray(teams)
+            present = np.asarray(present, dtype=bool)[s:e]
+            t = teams[s:e] if teams.ndim == 2 else np.broadcast_to(teams, present.shape)
+            with np.errstate(invalid="ignore"):
+                dist = np.linalg.norm(pitch - b[:, None, :], axis=2)
+            for team in (H, 1):
+                mask = present & (t == team)
+                best[:, team] = np.minimum(best[:, team], np.where(mask, dist, np.inf).min(axis=1))
+        out[s:e] = np.where(ok[:, None], best, np.inf)
+    return out
 
 
 # --------------------------------------------------------------------------- pixel contact evidence
@@ -1993,6 +2037,67 @@ def hold_touch_through(
     return out
 
 
+def hold_through_flight(
+    codes: np.ndarray,
+    distances: np.ndarray,
+    ball_valid: np.ndarray,
+    events: Sequence[TransitionEvent] = (),
+    halves: tuple[tuple[int, int], ...] | None = None,
+    params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
+) -> tuple[np.ndarray, int]:
+    """A change of owner needs a touch: a spell its team never touched goes back.
+
+    ``distances`` is :func:`team_distances` (min ball distance per team, ``inf``
+    where unseen).  An H<->A spell is kept when its team brings a player within
+    ``flight_touch_radius_m`` of the ball inside the spell (or ``lookback`` frames
+    before its start), or owns a witnessed event there — a pass received, a
+    dribble, a kick.  Otherwise the decoder has changed hands while the ball was
+    still travelling, and the spell is handed back to the team that had it.  The
+    rule is one-sided: it only ever *removes* unsupported changes, and it refuses
+    to judge spells where the ball was not seen for ``flight_min_ball_frames`` of
+    the time or that last longer than ``flight_max_rollback_frames``.
+    """
+    out = np.asarray(codes).copy()
+    n = out.size
+    if params.flight_touch_radius_m <= 0 or params.flight_max_rollback_frames <= 0:
+        return out, 0
+    radius = float(params.flight_touch_radius_m)
+    starts = np.flatnonzero(np.r_[True, out[1:] != out[:-1]])
+    ends = np.r_[starts[1:], n]
+    valid = np.asarray(ball_valid, dtype=bool)
+    rolled = 0
+    for a, b in zip(starts.tolist(), ends.tolist()):
+        team = int(out[a])
+        if a == 0 or team not in (H, 1):
+            continue
+        prev = int(out[a - 1])
+        if prev not in (H, 1) or prev == team:
+            continue
+        if b - a > int(params.flight_max_rollback_frames):
+            continue
+        if float(valid[a:b].mean()) < float(params.flight_min_ball_frames):
+            continue
+        lo = a - int(params.flight_touch_lookback_frames)
+        hi = b
+        if halves is not None:
+            for start_h, stop_h in halves:
+                if start_h <= a < stop_h:
+                    lo = max(lo, start_h)
+                    hi = min(hi, stop_h)
+                    break
+        lo = max(0, lo)
+        if bool((np.asarray(distances[lo:hi, team]) <= radius).any()):
+            continue
+        if any(
+            int(e.team) == team and (lo <= int(e.start) < b or lo <= int(e.frame) < b)
+            for e in events
+        ):
+            continue
+        out[a:b] = prev
+        rolled += 1
+    return out, rolled
+
+
 def apply_transition_layer(
     *,
     codes_pooled: np.ndarray,
@@ -2142,6 +2247,18 @@ def apply_transition_layer(
             np.asarray(dead_support if dead_support is not None else event_dead, dtype=bool),
             params,
         )
+    n_flight = 0
+    if params.flight_touch_radius_m > 0:
+        # nobody wins the ball while it is in the air: a change without a touch is
+        # handed back until the receiving side actually plays it
+        codes, n_flight = hold_through_flight(
+            codes,
+            team_distances(consensus, sets64),
+            valid,
+            events,
+            halves if halves is not None else GRADED_HALVES,
+            params,
+        )
     from ..pipeline import fill_match_breaks
 
     codes = fill_match_breaks(codes, halves if halves is not None else GRADED_HALVES)
@@ -2156,6 +2273,7 @@ def apply_transition_layer(
         n_hold=n_hold,
         n_control=n_control,
         n_area=n_area,
+        n_flight=n_flight,
     )
 
 
@@ -2194,6 +2312,7 @@ __all__ = [
     "gate_events",
     "gate_pixel_events",
     "hold_touch_through",
+    "hold_through_flight",
     "keeper_area_catches",
     "keeper_holds",
     "KeeperHold",
@@ -2201,4 +2320,5 @@ __all__ = [
     "possession_revival_mask",
     "pixel_contact",
     "raw_evidence_pool",
+    "team_distances",
 ]
