@@ -39,6 +39,7 @@ from possession_lab.fusion.transitions import (
     pixel_contact,
     raw_evidence_pool,
     relay_contacts,
+    restart_ownership,
     rest_ownership,
     team_distances,
 )
@@ -1939,6 +1940,156 @@ class PossessionRevivalMaskTests(unittest.TestCase):
             ball, players, present, teams, pool, (105.0, 68.0), np.zeros(len(ball), bool)
         )
         self.assertFalse(mask.any())
+
+
+class RestartOwnershipTests(unittest.TestCase):
+    """A smart-tagged restart paints only when the ball's own streams witness it
+    and a player stands at the ball; it may only fill D/X gaps."""
+
+    PITCH = (105.0, 68.0)
+    N = 100
+
+    def rule(self, codes, consensus, speed, yconf, players, oop, windows):
+        return restart_ownership(
+            codes, consensus, speed, yconf, players, oop, windows, self.PITCH
+        )
+
+    def standing(self, h_xy, a_xy):
+        """One H player at ``h_xy``, one A player at ``a_xy``, present everywhere."""
+        pitch = np.zeros((self.N, 2, 2))
+        pitch[:, 0] = h_xy
+        pitch[:, 1] = a_xy
+        return (
+            pitch,
+            np.tile(np.array([H, A], dtype=np.int8), (self.N, 1)),
+            np.ones((self.N, 2), dtype=bool),
+        )
+
+    def thrown_ball(self, cross=50):
+        """The ball rides past the touchline until ``cross``, then is back in bounds."""
+        ball = np.full((self.N, 2), 50.0)
+        ball[:, 1] = 70.0  # two metres out
+        ball[cross:, 1] = 67.0  # in bounds from the crossing
+        return ball
+
+    def throw_scene(self, cross=50, h_xy=(50.0, 68.0), a_xy=(70.0, 68.0), speed_peak=7.0):
+        """A throw-in: crossing at ``cross``, the ball at throw speed just after."""
+        speed = np.zeros(self.N)
+        if speed_peak > 0:
+            speed[cross : cross + 6] = speed_peak
+        players = self.standing(h_xy, a_xy)
+        return self.thrown_ball(cross), speed, players
+
+    def test_witnessed_throw_in_gives_play_to_the_thrower(self):
+        codes = np.full(self.N, D, dtype=np.int8)
+        ball, speed, players = self.throw_scene()
+        oop = np.zeros(self.N, dtype=bool)
+        out, events, painted = self.rule(codes, ball, speed, None, players, oop, [(30, 80, "Throw-in")])
+        self.assertTrue((out[30:50] == D).all())
+        self.assertTrue((out[50:81] == H).all())  # the thrower's team owns play from the crossing
+        self.assertEqual(painted, 31)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "restart")
+        self.assertEqual(events[0].frame, 50)
+        self.assertEqual(events[0].team, H)
+        self.assertAlmostEqual(events[0].distance, 2.0)
+
+    def test_crossing_below_throw_speed_is_not_a_throw(self):
+        codes = np.full(self.N, D, dtype=np.int8)
+        ball, speed, players = self.throw_scene(speed_peak=0.0)  # a slow drift back in
+        out, events, painted = self.rule(codes, ball, speed, None, players, np.zeros(self.N, bool), [(30, 80, "Throw-in")])
+        self.assertEqual(painted, 0)
+        self.assertEqual(events, ())
+
+    def test_contested_throw_is_not_attributed(self):
+        codes = np.full(self.N, D, dtype=np.int8)
+        # H 2.1 m from the ball, A 2.24 m: nobody a clear metre ahead
+        ball, speed, players = self.throw_scene(h_xy=(50.0, 67.9), a_xy=(51.0, 68.0))
+        out, events, painted = self.rule(codes, ball, speed, None, players, np.zeros(self.N, bool), [(30, 80, "Throw-in")])
+        self.assertEqual(painted, 0)
+        self.assertEqual(events, ())
+        self.assertTrue((out == D).all())
+
+    def test_no_thrower_in_reach_is_not_a_restart(self):
+        codes = np.full(self.N, D, dtype=np.int8)
+        ball, speed, players = self.throw_scene(h_xy=(50.0, 60.0), a_xy=(70.0, 68.0))  # H 8 m away
+        out, events, painted = self.rule(codes, ball, speed, None, players, np.zeros(self.N, bool), [(30, 80, "Throw-in")])
+        self.assertEqual(painted, 0)
+        self.assertEqual(events, ())
+
+    def test_witnessed_kickoff_deadens_the_pre_kick_frames(self):
+        codes = np.full(self.N, D, dtype=np.int8)
+        codes[45:50] = H  # the decode's memory of the last spell, before the kick
+        ball = np.full((self.N, 2), 50.0)
+        ball[:, 1] = 30.0
+        yconf = np.full(self.N, 0.3)
+        yconf[50:53] = 0.6  # the detector locks the kicked ball for three frames
+        speed = np.zeros(self.N)
+        players = self.standing((50.0, 30.0), (55.0, 30.0))
+        out, events, painted = self.rule(
+            codes, ball, speed, yconf, players, np.zeros(self.N, bool),
+            [(30, 80, "Kick Off (Start)")],
+        )
+        self.assertTrue((out[45:50] == D).all())  # pre-kick memory is dead
+        self.assertTrue((out[50:81] == H).all())  # the kicker's team from the lock
+        self.assertEqual(painted, 5 + 31)
+        self.assertEqual(events[0].frame, 50)
+        self.assertEqual(events[0].team, H)
+        self.assertAlmostEqual(events[0].distance, 0.0)
+
+    def test_unlocked_kickoff_is_not_a_restart(self):
+        codes = np.full(self.N, D, dtype=np.int8)
+        codes[45:50] = H
+        ball = np.full((self.N, 2), 50.0)
+        ball[:, 1] = 30.0
+        yconf = np.full(self.N, 0.4)  # the detector never locks
+        players = self.standing((50.0, 30.0), (55.0, 30.0))
+        out, events, painted = self.rule(
+            codes, ball, np.zeros(self.N), yconf, players, np.zeros(self.N, bool),
+            [(30, 80, "Kick Off (Start)")],
+        )
+        self.assertEqual(painted, 0)
+        self.assertEqual(events, ())
+        self.assertTrue((out[45:50] == H).all())  # untouched: no witnessed restart
+
+    def test_fill_never_overpaints_a_decoded_possession(self):
+        codes = np.full(self.N, D, dtype=np.int8)
+        codes[60:80] = A  # the decode already moved play to Athletic
+        ball, speed, players = self.throw_scene()
+        out, events, painted = self.rule(codes, ball, speed, None, players, np.zeros(self.N, bool), [(30, 80, "Throw-in")])
+        self.assertTrue((out[50:60] == H).all())
+        self.assertTrue((out[60:80] == A).all())  # the decode's change stands
+        self.assertEqual(painted, 10)
+
+    def test_fill_stops_where_the_ball_is_lost(self):
+        codes = np.full(self.N, D, dtype=np.int8)
+        ball, speed, players = self.throw_scene()
+        oop = np.zeros(self.N, dtype=bool)
+        oop[65] = True  # the camera loses the ball again
+        out, events, painted = self.rule(codes, ball, speed, None, players, oop, [(30, 80, "Throw-in")])
+        self.assertTrue((out[50:65] == H).all())
+        self.assertEqual(out[65], D)
+        self.assertEqual(painted, 15)
+
+    def test_a_short_fill_is_not_painted_but_the_restart_is_witnessed(self):
+        codes = np.full(self.N, D, dtype=np.int8)
+        ball, speed, players = self.throw_scene()
+        out, events, painted = self.rule(codes, ball, speed, None, players, np.zeros(self.N, bool), [(30, 51, "Throw-in")])
+        self.assertEqual(painted, 0)  # a two-frame spell is not paintable
+        self.assertEqual(len(events), 1)  # the restart itself is still logged
+        self.assertTrue((out == D).all())
+
+    def test_absent_players_are_not_attributed(self):
+        codes = np.full(self.N, D, dtype=np.int8)
+        ball, speed, players = self.throw_scene()
+        present = np.zeros((self.N, 2), dtype=bool)
+        out, events, painted = self.rule(codes, ball, speed, None, (players[0], players[1], present), np.zeros(self.N, bool), [(30, 80, "Throw-in")])
+        self.assertEqual(painted, 0)
+        self.assertEqual(events, ())
+
+    def test_restart_kind_code_is_eight(self):
+        row = TransitionEvent(start=50, frame=50, kind="restart", team=H, distance=2.0, support=0.0).as_row()
+        self.assertEqual(row[2], 8)
 
 
 if __name__ == "__main__":

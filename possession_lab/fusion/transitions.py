@@ -282,6 +282,32 @@ class TransitionParams:
     rest_margin_m: float = 8.0  # m: clear-stop clause: the other team must be this much further
     rest_min_frames: int = 10  # 0.4 s: a sustained setup, not a player passing by
     rest_gap_frames: int = 3  # speed blips up to this long inside a rest run are bridged
+    # -- witnessed restarts: a smart tag names the stoppage (a Kick Off / Throw-in
+    # window), but a restart is only painted when the ball's own streams witness it
+    # and a player stands at the ball — a kickoff without a visible kicker, or a
+    # throw with no thrower, is a stoppage we can see, not a play we can cite.
+    # Kick Off: the kick is the first thing the dedicated ball detector locks on
+    # after the stoppage (measured 113 744: conf 0.583 tracking the kicked ball).
+    restart_conf_min: float = 0.5  # YOLO ball confidence that locks the kick
+    restart_conf_run: int = 3  # held this many consecutive frames: stable, not a flicker
+    restart_kick_radius_m: float = 1.5  # the kicker this close to the ball at the lock
+    # (the strike is from the feet; the probe also reads the two frames before the
+    # lock, where the foot is still on the ball)
+    # Throw-in: the thrown ball crosses the line at throw speed (measured 115 084:
+    # crossing at 4.8 m/s, 6.4 m/s two frames later — the arm is still following
+    # through), so the speed is allowed to build over a short run after the crossing.
+    restart_throw_speed_m: float = 6.0  # m/s the ball must reach after the crossing
+    restart_throw_run_frames: int = 6  # ... within this many frames (240 ms of follow-through)
+    restart_throw_radius_m: float = 2.5  # the thrower this close at the frame before
+    # the crossing: the release is overhead, so more horizontal offset than a kick
+    # the two clauses share: the restart player must be clearly ahead of the nearest
+    # opponent (a thrower shadowed by a marker is a duel, not an attribution)
+    restart_attr_margin_m: float = 1.0  # metres of clearance over the nearest opponent
+    # and the paint: frames before the witnessed restart are dead (the ball is not
+    # in play yet), and from the restart the attributed team owns play across D/X
+    # frames until the decode's own evidence reasserts itself — a team label, or the
+    # ball lost / off the pitch.  Never over a decoded possession.
+    restart_min_fill_frames: int = 3  # a restart spell under 120 ms is not paintable
 
 
 DEFAULT_TRANSITION_PARAMS = TransitionParams()
@@ -302,7 +328,10 @@ class TransitionEvent:
     hold_through: bool = False
 
     def as_row(self) -> tuple[int, int, int, int, float, float]:
-        kind_code = {"kick": 0, "onset": 1, "contact": 2, "kicker": 3, "hold": 4, "control": 5, "area": 6, "touch": 7}[self.kind]
+        kind_code = {
+            "kick": 0, "onset": 1, "contact": 2, "kicker": 3, "hold": 4,
+            "control": 5, "area": 6, "touch": 7, "restart": 8,
+        }[self.kind]
         return (self.start, self.frame, kind_code, self.team, self.distance, self.support)
 
 
@@ -325,6 +354,7 @@ class TransitionLayerResult:
     n_rest: int = 0
     n_revived: int = 0
     n_touched: int = 0
+    n_restart: int = 0
 
 
 # --------------------------------------------------------------------------- ball kinematics
@@ -434,6 +464,7 @@ class BoxEvidence:
     pitch: np.ndarray | None = None  # (n, p, 2) float metres, keeper-ness for the hold channel
     track: np.ndarray | None = None  # (n, p) int detector track ids (identity across occlusion)
     ball_pitch: np.ndarray | None = None  # (n, 2) float metres, video ball for the pass extension
+    ball_yolo_conf: np.ndarray | None = None  # (n,) float, confidence of the chosen detection
 
 
 def _contact_bits(
@@ -2384,6 +2415,132 @@ def rest_ownership(
     return out, changed
 
 
+def restart_ownership(
+    codes: np.ndarray,
+    consensus: np.ndarray,
+    speed: np.ndarray,
+    yolo_best_conf: np.ndarray | None,
+    players: tuple[np.ndarray, np.ndarray, np.ndarray],
+    out_of_play: np.ndarray,
+    windows: Sequence[tuple[int, int, str]],
+    pitch: tuple[float, float],
+    params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
+) -> tuple[np.ndarray, tuple[TransitionEvent, ...], int]:
+    """Witnessed restarts inside smart-tagged Kick Off / Throw-in windows.
+
+    The tag says *where* the stoppage is; the ball's own streams say *when* it
+    ended; a player at the ball says *whose* restart it was.  A Kick Off
+    restart is the first window frame the dedicated ball detector locks on at
+    or above ``restart_conf_min`` for ``restart_conf_run`` consecutive frames —
+    the kicked ball is the first thing the detector sees after the stoppage.
+    A Throw-in restart is the first window frame the consensus ball crosses
+    back into bounds (out on the previous frame) while reaching
+    ``restart_throw_speed_m`` within ``restart_throw_run_frames`` frames — a
+    throw leaves the line at throw speed, and the speed is allowed to build
+    over the thrower's follow-through.  The restart team is the nearest
+    present H/A player to the ball at the restart (kicker: also the two
+    frames before the lock, within ``restart_kick_radius_m``; thrower: the
+    frame before the crossing, within ``restart_throw_radius_m``), clearly
+    ahead of the nearest opponent by ``restart_attr_margin_m``.
+
+    A restart neither witnessed nor attributed paints nothing: the tag is a
+    stoppage, not a play.  When it is both, the frames before the restart are
+    dead — the ball is not in play yet, whatever the decode remembered of the
+    last spell — and from the restart frame the attributed team owns play
+    across ``D``/``X`` frames until the decode's own evidence reasserts
+    itself: a team label (whose change is never painted over) or the ball
+    lost / off the pitch.  A fill shorter than ``restart_min_fill_frames`` is
+    skipped.  ``players`` is a ``(pitch (n, p, 2), teams (n, p), present
+    (n, p))`` set; returns the painted codes, the witnessed restart events
+    (``kind="restart"``, ``frame`` = the restart frame) and the count of
+    frames changed.
+    """
+    codes = np.asarray(codes)
+    n = int(codes.shape[0])
+    consensus = np.asarray(consensus, dtype=np.float64)
+    speed = np.nan_to_num(np.asarray(speed, dtype=np.float64), nan=0.0)
+    oop = np.zeros(n, dtype=bool) if out_of_play is None else np.asarray(out_of_play, dtype=bool)
+    p = np.asarray(players[0], dtype=np.float64)
+    t = np.asarray(players[1])
+    pr = np.asarray(players[2], dtype=bool)
+    length, width = float(pitch[0]), float(pitch[1])
+    inside = (
+        np.isfinite(consensus).all(axis=1)
+        & (consensus[:, 0] >= 0.0)
+        & (consensus[:, 0] <= length)
+        & (consensus[:, 1] >= 0.0)
+        & (consensus[:, 1] <= width)
+    )
+    outb = ~inside
+    yconf = None if yolo_best_conf is None else np.asarray(yolo_best_conf, dtype=np.float64)
+
+    def nearest(probe: Sequence[int], radius: float) -> tuple[int, float] | None:
+        """The present H/A player nearest the ball over ``probe``, within
+        ``radius`` and at least ``restart_attr_margin_m`` ahead of the opponent."""
+        best: tuple[float, int, int] | None = None  # (distance, frame, team)
+        for f in probe:
+            if not 0 <= f < n:
+                continue
+            b = consensus[f]
+            if not np.isfinite(b).all():
+                continue
+            d = np.hypot(p[f, :, 0] - b[0], p[f, :, 1] - b[1])
+            d = np.where(pr[f] & ((t[f] == H) | (t[f] == 1)), d, np.inf)
+            j = int(np.argmin(d))
+            if np.isfinite(d[j]) and (best is None or d[j] < best[0]):
+                best = (float(d[j]), f, int(t[f, j]))
+        if best is None or best[0] > radius:
+            return None
+        _, f, team = best
+        b = consensus[f]
+        d = np.hypot(p[f, :, 0] - b[0], p[f, :, 1] - b[1])
+        opp = np.where(pr[f] & ((t[f] == H) | (t[f] == 1)) & (t[f] != team), d, np.inf)
+        opp_d = float(np.min(opp))
+        if not np.isfinite(opp_d) or opp_d - best[0] < params.restart_attr_margin_m:
+            return None
+        return team, best[0]
+
+    restarts: list[TransitionEvent] = []
+    painted = 0
+    for ws, we, kind in windows:
+        ws, we = max(0, int(ws)), min(n - 1, int(we))
+        if ws > we:
+            continue
+        fr = None
+        if kind.startswith("Kick Off"):
+            if yconf is not None:
+                ok = yconf >= params.restart_conf_min
+                for i in range(ws, min(we, n - params.restart_conf_run) + 1):
+                    if all(ok[i + k] for k in range(params.restart_conf_run)):
+                        fr = i
+                        break
+            attr = nearest((fr - 2, fr - 1, fr), params.restart_kick_radius_m) if fr is not None else None
+        else:  # Throw-in
+            for i in range(ws, min(we, n - 2) + 1):
+                if not (outb[i - 1] and inside[i] and inside[i + 1]):
+                    continue
+                if speed[i : i + params.restart_throw_run_frames].max() >= params.restart_throw_speed_m:
+                    fr = i
+                    break
+            attr = nearest((max(ws, fr - 1),), params.restart_throw_radius_m) if fr is not None else None
+        if fr is None or attr is None:
+            continue  # a restart nobody witnessed is not a restart
+        team, dist = attr
+        pre = codes[ws:fr]
+        painted += int((pre != D).sum())
+        codes[ws:fr] = D  # the ball is not in play before the restart
+        i = fr
+        while i <= we and codes[i] in (D, X) and not oop[i]:
+            i += 1
+        if i - fr >= params.restart_min_fill_frames:
+            codes[fr:i] = team
+            painted += i - fr
+        restarts.append(
+            TransitionEvent(start=fr, frame=fr, kind="restart", team=team, distance=dist, support=0.0)
+        )
+    return codes, tuple(restarts), painted
+
+
 def apply_transition_layer(
     *,
     codes_pooled: np.ndarray,
@@ -2409,6 +2566,7 @@ def apply_transition_layer(
     setpiece: np.ndarray | None = None,
     raw_ball: np.ndarray | None = None,
     atd_players: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    restart_windows: Sequence[tuple[int, int, str]] | None = None,
 ) -> TransitionLayerResult:
     """Detect, gate, and decode ball-control transitions on top of the fused poll.
 
@@ -2434,7 +2592,12 @@ def apply_transition_layer(
     ``blocked`` mask, ``raw_ball`` the pitch stream's own ball for the marginal-crossing
     test) reopens a dead lock it contradicts, and a player at a rolling ball (the
     ``atd_players`` tracking set) does the same — each only into ``D`` frames, never
-    over a live label.  The physical rules then judge the reopened frames.
+    over a live label.  The physical rules then judge the reopened frames.  With
+    ``restart_windows`` (smart-tagged ``Kick Off (Start)`` / ``Kick Off (After Goal)``
+    / ``Throw-in`` windows as ``(start, stop, type)``) the witnessed-restart rule
+    (``restart_ownership``) runs last: a restart only paints when the ball's own
+    streams witness it and a player stands at the ball, and it may only fill the
+    ``D``/``X`` gaps the earlier rules left, never a decoded possession.
     """
     consensus = np.asarray(consensus_ball, dtype=np.float64)
     sets64 = [(np.asarray(p, dtype=np.float64), np.asarray(t), np.asarray(pr, dtype=bool)) for p, t, pr in player_sets]
@@ -2567,9 +2730,10 @@ def apply_transition_layer(
     n_revived = n_touched = 0
     if out_of_play is not None and keeper_pitch is not None:
         codes[np.asarray(out_of_play, dtype=bool)] = D  # nobody possesses a ball off the pitch
+        # a fresh union: |= would mutate the caller's out_of_play array in place
         blocked = np.asarray(out_of_play, dtype=bool)
         if setpiece is not None:
-            blocked |= np.asarray(setpiece, dtype=bool)
+            blocked = blocked | np.asarray(setpiece, dtype=bool)
         if live_tags is not None and evidence_pool is not None:
             revived, revived_team = dead_revival_mask(
                 consensus,
@@ -2634,6 +2798,25 @@ def apply_transition_layer(
             keeper_pitch,
             params,
         )
+    n_restart = 0
+    if restart_windows and sets64 and keeper_pitch is not None:
+        # a witnessed restart (kickoff lock, throw-in crossing) and a player at
+        # the ball: the stoppage's dead frames end where the restart begins.
+        # It runs last, so it may only fill the gaps every earlier rule left.
+        yolo_conf = None if box_evidence is None else box_evidence.ball_yolo_conf
+        codes, restart_events, n_restart = restart_ownership(
+            codes,
+            consensus,
+            speed,
+            yolo_conf,
+            sets64[0],
+            out_of_play,
+            tuple(restart_windows),
+            tuple(keeper_pitch),
+            params,
+        )
+        if restart_events:
+            events = tuple(sorted(events + tuple(restart_events), key=lambda e: (e.start, e.frame)))
     return TransitionLayerResult(
         codes=codes,
         events=events,
@@ -2650,12 +2833,13 @@ def apply_transition_layer(
         n_rest=n_rest,
         n_revived=n_revived,
         n_touched=n_touched,
+        n_restart=n_restart,
     )
 
 
 def events_to_rows(events: Sequence[TransitionEvent]) -> np.ndarray:
     """Events as an ``(m, 6)`` array: start, frame, kind (0=kick, 1=onset, 2=contact,
-    3=kicker, 4=hold, 5=control, 6=area, 7=touch), team, distance, support."""
+    3=kicker, 4=hold, 5=control, 6=area, 7=touch, 8=restart), team, distance, support."""
     if not events:
         return np.zeros((0, 6), dtype=np.float64)
     return np.asarray([e.as_row() for e in events], dtype=np.float64)
@@ -2697,6 +2881,7 @@ __all__ = [
     "possession_revival_mask",
     "pixel_contact",
     "raw_evidence_pool",
+    "restart_ownership",
     "rest_ownership",
     "team_distances",
 ]

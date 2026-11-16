@@ -637,6 +637,9 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                     rows = np.arange(safe.shape[0])
                     yolo_ball = yolo_all[rows, best]
                     yolo_seen = np.isfinite(yolo_ball).all(axis=1)
+                    yolo_conf_best = np.where(
+                        np.isfinite(safe).any(axis=1), yolo_conf_all[rows, best], 0.0
+                    )
                     box_evidence = BoxEvidence(
                         boxes=np.asarray(z["players_box"]),
                         team=vteam,
@@ -647,6 +650,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                         pitch=vpitch,
                         track=np.asarray(z["players_track"]) if "players_track" in z else None,
                         ball_pitch=np.asarray(z["ball_pitch"]) if "ball_pitch" in z else None,
+                        ball_yolo_conf=yolo_conf_best,
                     )
             if vpitch.shape[0] != n:
                 print(
@@ -721,6 +725,14 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         for ev in lab.tags.events
         if ev.code in ("PROGRESSION", "CREATING CHANCES", "BALL IN FINAL THIRD", "BALL IN THE BOX", "PLAYERS IN THE BOX")
     ]
+    # the witnessed-restart rule reads the set-piece windows the smart tags name:
+    # kickoffs and throw-ins (window = [start, stop - 1], the tag's own convention)
+    restart_windows = [
+        (int(ev.start_frame), int(ev.stop_frame) - 1, ev.type)
+        for ev in lab.tags.events
+        if ev.code == "SET PIECES"
+        and ev.type in ("Kick Off (Start)", "Kick Off (After Goal)", "Throw-in")
+    ]
     result = apply_transition_layer(
         codes_pooled=arrays["codes"].astype(np.int8),
         fused_probability=arrays["fused_probability"].astype(np.float64),
@@ -751,6 +763,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
             np.asarray(lab.tracking.player_present, dtype=bool),
             np.asarray(lab.tracking.teams, dtype=np.int8),
         ),
+        restart_windows=restart_windows,
     )
     print(
         f"transitions: {result.n_kicks} kicks + {result.n_onsets} onsets detected, "
@@ -760,11 +773,12 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         f"{result.n_flight} flight ownership fixes, "
         f"{result.n_gated_out} gated out -> {len(result.events)} transition events; "
         f"{int(out_of_play.sum()):,} frames of lost/out-of-bounds ball marked D; "
-        f"{result.n_revived:,} frames revived by live tags, {result.n_touched:,} by a player at the ball"
+        f"{result.n_revived:,} frames revived by live tags, {result.n_touched:,} by a player at the ball, "
+        f"{result.n_restart:,} owned by witnessed restarts"
     )
     events_path = output_dir / "transition_events.csv"
     rows = events_to_rows(result.events)
-    kind_names = np.array(["kick", "onset", "contact", "kicker", "hold", "control", "area", "touch"])
+    kind_names = np.array(["kick", "onset", "contact", "kicker", "hold", "control", "area", "touch", "restart"])
     pd.DataFrame(
         {
             "start_frame": rows[:, 0].astype(int),
