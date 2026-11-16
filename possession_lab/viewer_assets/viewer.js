@@ -38,6 +38,7 @@
     overlay: $("#overlay"),
     overlayToggle: $("#overlayToggle"),
     yoloPlayersToggle: $("#yoloPlayersToggle"),
+    yoloPlayerBoxesToggle: $("#yoloPlayerBoxesToggle"),
     yoloCandidatesToggle: $("#yoloCandidatesToggle"),
     layerToggles: Array.from(document.querySelectorAll("[data-layer]")),
     pitchMap: $("#pitchMap"),
@@ -135,6 +136,7 @@
     overlayEnabled: true,
     layers: { raw: true, yolo: true, consensus: true },
     yoloPlayersEnabled: true,
+    yoloPlayerBoxesEnabled: true,
     yoloCandidatesEnabled: true,
     frameData: null,
     frameDataRequest: null,
@@ -634,6 +636,31 @@
     ctx.restore();
   }
 
+  // Bounding boxes (x1,y1,x2,y2 in video pixels) of the YOLO-detected players.  Drawn only in
+  // video coordinates: the box is a detector artefact in image space, so a pitch map has no box
+  // to place.  Officials (referees) keep the same exclusion as the foot markers.
+  function drawYoloPlayerBoxes(ctx, players, xOf, yOf) {
+    if (!state.yoloPlayerBoxesEnabled || !Array.isArray(players) || players.length === 0) return;
+    ctx.save();
+    ctx.lineWidth = 1.2;
+    for (const player of players) {
+      if (player.official) continue; // referees are not players: no boxes around them
+      const b = player.box;
+      if (!Array.isArray(b) || b.length !== 4) continue;
+      const [x1, y1, x2, y2] = b.map(Number);
+      if (![x1, y1, x2, y2].every(Number.isFinite)) continue;
+      const left = xOf(x1);
+      const top = yOf(y1);
+      const width = xOf(x2) - left;
+      const height = yOf(y2) - top;
+      if (width <= 1 || height <= 1) continue;
+      ctx.strokeStyle = player.team === 0 ? COLORS.H : player.team === 1 ? COLORS.A : "#c8d6e5";
+      ctx.globalAlpha = 0.85;
+      ctx.strokeRect(left, top, width, height);
+    }
+    ctx.restore();
+  }
+
   // Decision codes mirror BALL_CAND_* in possession_lab/perception.py.  The accepted winner is drawn
   // by drawLayerBall, so this overlay only draws the *other* candidates to make the physical gate
   // visible: what YOLO saw, and why the tracker kept or discarded each one.
@@ -890,6 +917,7 @@
       "video",
       4.4,
     );
+    drawYoloPlayerBoxes(ctx, frameData.video_players, xOf, yOf);
 
     for (const layer of visibleBallLayers()) {
       const layerInfo = layerData(frameData, layer);
@@ -2227,6 +2255,13 @@
       ui.yoloPlayersToggle.checked = state.yoloPlayersEnabled;
       ui.yoloPlayersToggle.addEventListener("change", () => {
         state.yoloPlayersEnabled = ui.yoloPlayersToggle.checked;
+        drawOverlay();
+      });
+    }
+    if (ui.yoloPlayerBoxesToggle) {
+      ui.yoloPlayerBoxesToggle.checked = state.yoloPlayerBoxesEnabled;
+      ui.yoloPlayerBoxesToggle.addEventListener("change", () => {
+        state.yoloPlayerBoxesEnabled = ui.yoloPlayerBoxesToggle.checked;
         drawOverlay();
       });
     }
