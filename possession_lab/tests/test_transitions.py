@@ -42,6 +42,7 @@ from possession_lab.fusion.transitions import (
     relay_contacts,
     restart_ownership,
     rest_ownership,
+    snap_blind_handovers,
     team_distances,
 )
 
@@ -2282,6 +2283,108 @@ class RestartOwnershipTests(unittest.TestCase):
     def test_restart_kind_code_is_eight(self):
         row = TransitionEvent(start=50, frame=50, kind="restart", team=H, distance=2.0, support=0.0).as_row()
         self.assertEqual(row[2], 8)
+
+
+class BlindHandoverTests(unittest.TestCase):
+    """A team-to-team change with nobody from the incoming side at the ball is not a play."""
+
+    N = 120
+    # the rule ships off (it costs the public gate); the experiment runs it at 250
+    ON = replace(DEFAULT_TRANSITION_PARAMS, blind_handover_max_shift_frames=250)
+
+    def scene(self, change=40, control=100, control_dist=0.8, speed_at_control=4.0):
+        codes = np.full(self.N, H, dtype=np.int8)
+        codes[change:] = A
+        dist = np.full((self.N, 2), 20.0)
+        dist[:, 0] = 6.0
+        dist[change:, 1] = 6.5  # the incoming side is far from the ball at the change
+        dist[control:, 1] = control_dist
+        speed = np.full(self.N, 16.0)
+        speed[control:] = speed_at_control
+        valid = np.ones(self.N, dtype=bool)
+        return codes, dist, speed, valid
+
+    def test_blind_change_moves_to_the_first_control(self):
+        codes, dist, speed, valid = self.scene(change=40, control=100)
+        out, changed = snap_blind_handovers(codes, dist, valid, speed, params=self.ON)
+        self.assertEqual(int(out[40]), H)
+        self.assertEqual(int(out[99]), H)
+        self.assertEqual(int(out[100]), A)
+        self.assertEqual(changed, 60)
+
+    def test_change_at_the_incoming_feet_is_a_play(self):
+        codes, dist, speed, valid = self.scene(change=40, control=100)
+        dist[40:, 1] = 0.9  # an Athletic player is on the ball at the change
+        out, changed = snap_blind_handovers(codes, dist, valid, speed, params=self.ON)
+        self.assertTrue(np.array_equal(out, codes))
+        self.assertEqual(changed, 0)
+
+    def test_no_witnessed_control_leaves_the_decode_alone(self):
+        codes, dist, speed, valid = self.scene(change=40, control=119)
+        dist[:, 1] = 6.5  # nobody ever reaches the ball
+        out, changed = snap_blind_handovers(codes, dist, valid, speed, params=self.ON)
+        self.assertTrue(np.array_equal(out, codes))
+        self.assertEqual(changed, 0)
+
+    def test_fast_ball_past_a_player_is_not_control(self):
+        codes, dist, speed, valid = self.scene(change=40, control=100, speed_at_control=14.0)
+        out, changed = snap_blind_handovers(codes, dist, valid, speed, params=self.ON)
+        # no controllable touch inside the spell: the decode stands
+        self.assertTrue(np.array_equal(out, codes))
+        self.assertEqual(changed, 0)
+
+    def test_unseen_ball_at_the_boundary_is_not_judged(self):
+        codes, dist, speed, valid = self.scene(change=40, control=100)
+        valid[40] = False
+        out, changed = snap_blind_handovers(codes, dist, valid, speed, params=self.ON)
+        self.assertTrue(np.array_equal(out, codes))
+        self.assertEqual(changed, 0)
+
+    def test_dead_frames_are_never_rewritten(self):
+        codes, dist, speed, valid = self.scene(change=40, control=100)
+        dead = np.zeros(self.N, dtype=bool)
+        dead[38:42] = True  # a stoppage straddles the change: not a flight
+        out, changed = snap_blind_handovers(codes, dist, valid, speed, event_dead=dead, params=self.ON)
+        self.assertTrue(np.array_equal(out, codes))
+        self.assertEqual(changed, 0)
+
+    def test_deadness_transitions_are_not_touched(self):
+        codes = np.full(self.N, H, dtype=np.int8)
+        codes[40:70] = D
+        codes[70:] = A
+        dist = np.full((self.N, 2), 20.0)
+        dist[:, 0] = 6.0
+        dist[:, 1] = 6.5
+        dist[100:, 1] = 0.8
+        speed = np.full(self.N, 16.0)
+        speed[100:] = 4.0
+        out, changed = snap_blind_handovers(codes, dist, np.ones(self.N, bool), speed, params=self.ON)
+        self.assertTrue(np.array_equal(out, codes))
+        self.assertEqual(changed, 0)
+
+    def test_shift_is_capped(self):
+        codes, dist, speed, valid = self.scene(change=20, control=20 + 251)
+        out, changed = snap_blind_handovers(codes, dist, valid, speed, params=self.ON)
+        self.assertTrue(np.array_equal(out, codes))
+        self.assertEqual(changed, 0)
+
+    def test_halves_bound_the_search(self):
+        codes, dist, speed, valid = self.scene(change=40, control=100)
+        out, changed = snap_blind_handovers(codes, dist, valid, speed, halves=((0, 80),), params=self.ON)
+        self.assertTrue(np.array_equal(out, codes))
+        self.assertEqual(changed, 0)
+
+    def test_rejects_misshaped_distances(self):
+        codes, dist, speed, valid = self.scene()
+        with self.assertRaises(ValueError):
+            snap_blind_handovers(codes, dist[:, :1], valid, speed)
+
+    def test_rule_is_off_by_default(self):
+        codes, dist, speed, valid = self.scene(change=40, control=100)
+        self.assertEqual(DEFAULT_TRANSITION_PARAMS.blind_handover_max_shift_frames, 0)
+        out, changed = snap_blind_handovers(codes, dist, valid, speed)
+        self.assertTrue(np.array_equal(out, codes))  # the shipped pipeline is untouched
+        self.assertEqual(changed, 0)
 
 
 if __name__ == "__main__":
