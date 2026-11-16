@@ -733,6 +733,13 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         if ev.code == "SET PIECES"
         and ev.type in ("Kick Off (Start)", "Kick Off (After Goal)", "Throw-in")
     ]
+    # the blind keeper clearance must never fire inside a tagged goal sequence:
+    # the GOALS span is the organisers' authoritative window around the goal
+    goals_windows = [
+        (int(ev.start_frame), int(ev.stop_frame))
+        for ev in lab.tags.events
+        if ev.code.upper() == "GOALS"
+    ]
     result = apply_transition_layer(
         codes_pooled=arrays["codes"].astype(np.int8),
         fused_probability=arrays["fused_probability"].astype(np.float64),
@@ -764,11 +771,14 @@ def cmd_transitions(args: argparse.Namespace) -> int:
             np.asarray(lab.tracking.teams, dtype=np.int8),
         ),
         restart_windows=restart_windows,
+        consensus_confidence=arrays["consensus_confidence"].astype(np.float64),
+        goals_windows=goals_windows,
     )
     print(
         f"transitions: {result.n_kicks} kicks + {result.n_onsets} onsets detected, "
         f"{result.n_contact} contacts + {result.n_kicker} win-and-clear kicks + {result.n_hold} keeper holds "
-        f"+ {result.n_area} area catches from boxes, {result.n_control} spell expiries, "
+        f"+ {result.n_area} area catches from boxes + {result.n_clearance} blind keeper clearances, "
+        f"{result.n_control} spell expiries, "
         f"{result.n_touch} touch takeovers + {result.n_rest} rest balls owned, "
         f"{result.n_flight} flight ownership fixes, "
         f"{result.n_gated_out} gated out -> {len(result.events)} transition events; "
@@ -778,7 +788,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     )
     events_path = output_dir / "transition_events.csv"
     rows = events_to_rows(result.events)
-    kind_names = np.array(["kick", "onset", "contact", "kicker", "hold", "control", "area", "touch", "restart"])
+    kind_names = np.array(["kick", "onset", "contact", "kicker", "hold", "control", "area", "touch", "restart", "clearance"])
     pd.DataFrame(
         {
             "start_frame": rows[:, 0].astype(int),

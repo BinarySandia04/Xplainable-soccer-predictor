@@ -18,6 +18,7 @@ from possession_lab.fusion.transitions import (
     ball_release_mask,
     ball_speed,
     ball_stale_mask,
+    blind_keeper_clearances,
     build_pulse,
     carry_dead_through_blind,
     control_map,
@@ -1553,6 +1554,169 @@ class KeeperAreaCatchTests(unittest.TestCase):
         )
 
 
+class AreaCatchArrivalTests(unittest.TestCase):
+    """The arrival into the area must be a pass, not a tracker spike.
+
+    One frame at flight speed inside the 40-frame arrival window is the tracker
+    hiccuping over a slow roll into the box (measured 129 415: the ball rolled in
+    at 7.3 m/s with a single 8.0 m/s frame); a real pass is at least two frames
+    at or above ``area_catch_in_min_speed`` (``area_catch_in_frames``).
+    """
+
+    def arriving_world(self, fast_frames, n=240):
+        # the ball parks, is fed in with `fast_frames` frames at 12 m/s, then
+        # rolls and stops at (9.6, 34) in the defended left area
+        delta = np.zeros(n)
+        for t in range(60, 60 + fast_frames):
+            delta[t] = 0.48  # 12 m/s
+        for t in range(60 + fast_frames, 96):
+            delta[t] = 0.06  # 1.5 m/s
+        for t in range(96, 99):
+            delta[t] = 0.02  # 0.5 m/s
+        x = np.full(n, np.nan)
+        x[0] = 9.6 + delta.sum()
+        for t in range(1, n):
+            x[t] = x[t - 1] - delta[t]
+        ball = np.stack([x, np.full(n, 34.0)], axis=1)
+        pitch = np.zeros((n, 2, 2))
+        pitch[:, 0] = [9.0, 34.4]  # the keeper of the side that defends goal 0
+        pitch[:, 1] = [45.0, 34.0]
+        teams = np.asarray([1, H], dtype=np.int8)
+        sets = [(pitch, teams, np.ones((n, 2), dtype=bool))]
+        defenders = np.array([[1, H]], dtype=np.int8)  # this half: A defends goal 0
+        ev_dead = np.zeros(n, dtype=bool)
+        return ball, sets, defenders, ev_dead
+
+    def test_single_fast_frame_is_not_a_pass_in(self):
+        ball, sets, defenders, ev_dead = self.arriving_world(1)
+        speed, valid = ball_speed(ball)
+        # the old gate (one fast frame) read this as a catch...
+        old = replace(DEFAULT_TRANSITION_PARAMS, area_catch_in_frames=1)
+        legacy = keeper_area_catches(
+            ball, speed, valid, ev_dead, sets, defenders, (105.0, 68.0), ((0, 240),), params=old
+        )
+        self.assertEqual(legacy, [(60, 61, 1)])  # anchored on the 12 m/s kick frame
+        # ...the arrival gate rejects it: a slow roll with a one-frame hiccup
+        self.assertEqual(
+            keeper_area_catches(ball, speed, valid, ev_dead, sets, defenders, (105.0, 68.0), ((0, 240),)),
+            [],
+        )
+
+    def test_two_fast_frames_are_the_pass_in(self):
+        ball, sets, defenders, ev_dead = self.arriving_world(2)
+        speed, valid = ball_speed(ball)
+        catches = keeper_area_catches(
+            ball, speed, valid, ev_dead, sets, defenders, (105.0, 68.0), ((0, 240),)
+        )
+        self.assertEqual(len(catches), 1)
+        start, frame, team = catches[0]
+        self.assertEqual(team, 1)
+        self.assertEqual(frame, 62)
+        self.assertEqual(start, 60)  # anchored on the kick that fed the keeper
+
+
+class BlindKeeperClearanceTests(unittest.TestCase):
+    """The blind twin of the area catch: the fused ball goes dark for a second or
+    more while the keeper holds the ball, then returns as a downfield punt.
+
+    Measured 69 405: blind 69 116-69 404 (confidence below 0.5), the ball back in
+    the defended area at (7.4, 35.3) with the keeper 0.4 m from it, the punt
+    building to 20.6 m/s, and the fused prior still claiming the other side
+    through the clearance.
+    """
+
+    def clearance_world(
+        self,
+        n=200,
+        ret=141,
+        blind_frames=41,
+        blind_conf=0.2,
+        opp_dist=6.0,
+        def_dist=0.4,
+        reappear=(9.6, 34.0),
+        punt_mps=14.0,
+        dead=False,
+        goals=(),
+        invalid_blind=False,
+    ):
+        # parked until the blind run starts, blind for `blind_frames` frames, back
+        # in the defended left area at `ret`, punted downfield at `punt_mps` m/s
+        blind0 = ret - blind_frames
+        ball = np.full((n, 2), np.nan)
+        ball[:blind0, 0] = 30.0
+        ball[:blind0, 1] = 34.0
+        ball[blind0:ret, 0] = 30.0 + 0.1 * np.arange(ret - blind0)  # low-confidence ghosts
+        ball[blind0:ret, 1] = 34.0
+        step = punt_mps / FPS  # m per frame
+        for t in range(ret, n):
+            ball[t, 0] = reappear[0] + step * (t - ret)
+            ball[t, 1] = reappear[1]
+        conf = np.ones(n)
+        conf[blind0:ret] = blind_conf
+        if invalid_blind:
+            ball[blind0:ret] = np.nan  # and the fused ball is simply absent
+        speed, valid = ball_speed(ball)
+        dead_mask = np.zeros(n, dtype=bool)
+        if dead:
+            dead_mask[ret] = True
+        dist = np.full((n, 2), 6.0)
+        dist[ret] = [opp_dist, def_dist]  # column 0 home, column 1 away
+        defenders = np.array([[1, H]], dtype=np.int8)  # this half: A defends goal 0
+        return ball, conf, speed, valid, dead_mask, dist, defenders, ret
+
+    def _clears(self, world, goals=()):
+        ball, conf, speed, valid, dead, dist, defenders, ret = world
+        return blind_keeper_clearances(
+            ball, conf, speed, valid, dead, dist, defenders, (105.0, 68.0), ((0, 200),),
+            goals_windows=tuple(goals),
+        )
+
+    def test_blind_hold_and_punt_is_won_by_the_defending_side(self):
+        world = self.clearance_world()
+        _, _, _, _, _, _, _, ret = world
+        self.assertEqual(self._clears(world), [(ret, ret, 1)])
+
+    def test_short_blind_run_is_not_a_clearance(self):
+        self.assertEqual(self._clears(self.clearance_world(blind_frames=15, ret=115)), [])
+
+    def test_sighted_blind_run_is_not_a_clearance(self):
+        # confidence stays above clearance_conf_min: the channel never went blind
+        self.assertEqual(self._clears(self.clearance_world(blind_conf=0.9)), [])
+
+    def test_invalid_frames_count_as_blind(self):
+        world = self.clearance_world(blind_conf=1.0, invalid_blind=True)
+        _, _, _, _, _, _, _, ret = world
+        self.assertEqual(self._clears(world), [(ret, ret, 1)])
+
+    def test_contested_reappearance_is_not_a_clearance(self):
+        self.assertEqual(self._clears(self.clearance_world(opp_dist=1.5)), [])
+
+    def test_defender_not_on_the_ball_is_not_a_clearance(self):
+        self.assertEqual(self._clears(self.clearance_world(def_dist=2.5)), [])
+
+    def test_shot_into_the_goal_is_not_a_clearance(self):
+        # a shot leaves at flight speed too, but gains ground into the goal, not away
+        self.assertEqual(self._clears(self.clearance_world(reappear=(9.6, 34.0), punt_mps=-14.0)), [])
+
+    def test_slow_reappearance_is_not_a_clearance(self):
+        # a hand pass gains ground but does not leave at punt speed
+        self.assertEqual(self._clears(self.clearance_world(punt_mps=7.5)), [])
+
+    def test_reappearance_outside_the_area_is_not_a_clearance(self):
+        self.assertEqual(self._clears(self.clearance_world(reappear=(60.0, 34.0))), [])
+
+    def test_reappearance_off_the_pitch_is_not_a_clearance(self):
+        self.assertEqual(self._clears(self.clearance_world(reappear=(-1.0, 34.0))), [])
+
+    def test_dead_reappearance_is_not_a_clearance(self):
+        self.assertEqual(self._clears(self.clearance_world(dead=True)), [])
+
+    def test_goals_window_suppresses_the_clearance(self):
+        world = self.clearance_world()
+        ret = 141
+        self.assertEqual(self._clears(world, goals=((ret - 5, ret + 5),)), [])
+
+
 class ExpireOwnedSpellsTests(unittest.TestCase):
     """A pixel-owned interval cannot outlive the camera's own evidence."""
 
@@ -1608,10 +1772,12 @@ class ControlRowTests(unittest.TestCase):
             [
                 TransitionEvent(start=10, frame=12, kind="control", team=H, distance=1.0, support=0.8),
                 TransitionEvent(start=20, frame=24, kind="area", team=1, distance=1.0, support=1.0),
+                TransitionEvent(start=30, frame=30, kind="clearance", team=H, distance=1.0, support=1.0),
             ]
         )
         self.assertEqual(rows[0, 2], 5)
         self.assertEqual(rows[1, 2], 6)
+        self.assertEqual(rows[2, 2], 9)
 
 
 class RawPoolTests(unittest.TestCase):

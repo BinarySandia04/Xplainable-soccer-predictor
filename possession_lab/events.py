@@ -814,6 +814,31 @@ def detect_stoppages(
     trimmed = _extend_through_lost_view(
         trimmed, np.asarray(tracking.player_present, dtype=bool).sum(axis=1), n
     )
+
+    # After a goal the ball stays dead until the restart kick-off: a stoppage that ends
+    # while the GOALS tag is still active has not actually restarted (the ball is in the
+    # net or being retrieved, and the geometric "restart" it tripped on is a nudge, not a
+    # kick-off).  Extend it to the kick-off that follows the goal.  Both boundaries are
+    # the organisers' smart tags -- the GOALS span and the Kick Off window -- so no new
+    # parameter is fitted (measured 58 081-61 559: the out-of-play run ended at 61 559 on a
+    # one-frame ball nudge at 61 547 while the real restart is the Kick Off (After Goal)
+    # at 62 012, and the gap read as live possession).
+    goals = [
+        (int(event.start_frame), int(event.stop_frame))
+        for event in tags.events
+        if event.code.upper() == "GOALS"
+    ]
+    if goals:
+        extended: list[StopEvent] = []
+        for event in trimmed:
+            for g_start, g_stop in goals:
+                if g_start < event.end and g_stop > event.start and event.end < g_stop:
+                    goal_restart = min((k for k in kickoffs if k >= g_start), default=None)
+                    if goal_restart is not None and goal_restart > event.end:
+                        event = replace(event, end=int(goal_restart))
+                    break
+            extended.append(event)
+        trimmed = extended
     return tuple(trimmed)
 
 
