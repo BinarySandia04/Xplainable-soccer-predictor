@@ -10,6 +10,7 @@ from possession_lab.config import PITCH
 from possession_lab.keepers import (
     derive_keeper_slots,
     half_index,
+    keeper_area_team_map,
     rescue_keeper_teams,
     rescue_officials,
 )
@@ -73,6 +74,55 @@ class DeriveKeeperSlotsTest(unittest.TestCase):
         atd = np.repeat(self.players[None], 2000, axis=0)
         keepers = derive_keeper_slots(atd, self.teams, PITCH, ((0, 1000), (1000, 1100)))
         self.assertEqual(keepers.slot[1].tolist(), [-1, -1])
+
+
+class KeeperAreaTeamMapTest(unittest.TestCase):
+    """A keeper slot standing in a penalty area wears the team that defends that goal."""
+
+    def setUp(self):
+        players, teams = _roster()
+        self.players = np.repeat(players[None], 300, axis=0)
+        self.teams = teams
+        self.present = np.ones(self.players.shape[:2], dtype=bool)
+        self.keepers = derive_keeper_slots(self.players, teams, PITCH, ((0, 300),))
+
+    def test_other_keeper_slot_is_relabelled_by_the_area_it_stands_in(self):
+        # measured 19 863: Athletic's keeper slot carried the Barcelona keeper
+        # holding the ball in Barcelona's penalty area.
+        frames = slice(100, 120)
+        self.players[frames, 1] = (11.3, 29.5)  # inside goal 0's penalty area
+        out = keeper_area_team_map(
+            self.players, self.teams, self.present, self.keepers, ((0, 300),), PITCH
+        )
+        self.assertTrue((out[frames, 1] == 0).all())  # goal 0 is defended by team 0
+        self.assertTrue((out[frames, 0] == 0).all())  # team 0's own keeper stays team 0
+        self.assertTrue((out[:100, 1] == 1).all())  # away from the area: roster team stands
+
+    def test_non_keepers_and_players_outside_an_area_are_untouched(self):
+        out = keeper_area_team_map(
+            self.players, self.teams, self.present, self.keepers, ((0, 300),), PITCH
+        )
+        self.assertTrue((out[:, 2] == self.teams[2]).all())
+        self.assertTrue((out[:, 3] == self.teams[3]).all())
+        self.assertTrue((out[:, 0] == self.teams[0]).all())
+
+    def test_per_frame_teams_are_preserved(self):
+        teams = np.tile(self.teams[None, :], (300, 1))
+        teams[:, 3] = 0  # a roster change the caller already resolved
+        out = keeper_area_team_map(
+            self.players, teams, self.present, self.keepers, ((0, 300),), PITCH
+        )
+        self.assertTrue((out[:, 3] == 0).all())
+        self.assertEqual(out.shape, (300, 4))
+
+    def test_absent_keeper_slot_is_not_relabelled(self):
+        frames = slice(100, 120)
+        self.players[frames, 1] = (11.3, 29.5)
+        self.present[frames, 1] = False
+        out = keeper_area_team_map(
+            self.players, self.teams, self.present, self.keepers, ((0, 300),), PITCH
+        )
+        self.assertTrue((out[frames, 1] == 1).all())
 
 
 class RescueKeeperTeamsTest(unittest.TestCase):

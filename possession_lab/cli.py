@@ -560,11 +560,13 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         dead_revival_mask,
         events_to_rows,
         evidence_probability,
+        nearest_team_at,
         out_of_bounds_mask,
         possession_revival_mask,
         raw_evidence_pool,
     )
     from .fusion.voters import ROLE_BY_KEY
+    from .keepers import derive_keeper_slots, keeper_area_team_map
     from .pipeline import active_halves, load_lab, validate_codes, write_submission
 
     output_dir = Path(args.output_dir or OUTPUT_DIR)
@@ -585,8 +587,25 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         return 1
     probabilities = {key: arrays[f"src_{key}_probability"] for key in evidence_keys}
     weights = {key: arrays[f"src_{key}_weight"] for key in evidence_keys}
+    tracking_players = np.asarray(lab.tracking.players, dtype=np.float64)
+    tracking_teams = np.asarray(lab.tracking.teams)
+    tracking_present = np.asarray(lab.tracking.player_present, dtype=bool)
+    # the ATD swaps keeper slots under pressure; a keeper standing in a penalty area
+    # belongs to the team that defends that goal, not to the roster slot that carries
+    # him (measured 19 863: Barcelona's keeper holding the ball in Athletic's slot).
+    keeper_info = derive_keeper_slots(
+        tracking_players, tracking_teams, tuple(lab.tracking.pitch), GRADED_HALVES
+    )
+    tracking_teams_area = keeper_area_team_map(
+        tracking_players,
+        tracking_teams,
+        tracking_present,
+        keeper_info,
+        GRADED_HALVES,
+        tuple(lab.tracking.pitch),
+    )
     player_sets: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = [
-        (lab.tracking.players, lab.tracking.teams, lab.tracking.player_present)
+        (tracking_players, tracking_teams_area, tracking_present)
     ]
     box_evidence = None
     if not args.no_perception:
@@ -619,9 +638,9 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                     vpitch,
                     vpresent,
                     vteam,
-                    np.asarray(lab.tracking.players, dtype=np.float64),
-                    np.asarray(lab.tracking.teams),
-                    np.asarray(lab.tracking.player_present, dtype=bool),
+                    tracking_players,
+                    tracking_teams_area,
+                    tracking_present,
                     tuple(lab.tracking.pitch),
                 )
                 box_evidence = None
@@ -700,28 +719,95 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     # to y = -59 m across the stoppage while spells traded hands)
     from .config import D as _D_CODE, FPS
 
-    out_of_play = ball_lost_mask(
-        arrays["consensus_confidence"].astype(np.float64),
-        min_frames=int(params.lost_min_frames),
-        eps=float(params.lost_conf_eps),
-    ) | out_of_bounds_mask(
+    def _setpiece_restart_frames(
+        ball: np.ndarray,
+    ) -> tuple[list[tuple[Any, int, int, int | None, bool]], np.ndarray]:
+        """SET PIECES tags with the frame the restart is actually taken.
+
+        The smart tag spans the whole stoppage and, for throw-ins, part of the live
+        play after it.  The real release is a ball moving at the line (measured
+        44 739), not the ball being carried around behind the touchline (44 335) or
+        the low-confidence ball hopping in the thrower's hands 5 m inside it
+        (44 548-44 679).
+        """
+        pitch_length, pitch_width = (float(v) for v in lab.tracking.pitch)
+        margin = 2.0
+        diff = np.zeros_like(ball)
+        diff[1:] = (ball[1:] - ball[:-1]) * FPS
+        speed = np.linalg.norm(diff, axis=1)
+        near = (
+            (ball[:, 0] >= -margin)
+            & (ball[:, 0] <= pitch_length + margin)
+            & (ball[:, 1] >= -margin)
+            & (ball[:, 1] <= pitch_width + margin)
+        )
+        touchline_m = np.minimum(np.abs(ball[:, 1]), np.abs(ball[:, 1] - pitch_width))
+        rows: list[tuple[Any, int, int, int | None, bool]] = []
+        for ev in lab.tags.events:
+            if ev.code != "SET PIECES":
+                continue
+            s_f, e_f = int(ev.start_frame), min(len(ball), int(ev.stop_frame))
+            if e_f <= s_f:
+                continue
+            throw_in = ev.type == "Throw-in"
+            fallback_f = None
+            restart_f = None
+            strict = False
+            for f in range(s_f + 10, min(e_f, s_f + 500)):
+                if speed[f] > 4.5 and np.nanmean(speed[f:min(e_f, f + 4)]) > 3.0:
+                    if fallback_f is None:
+                        fallback_f = f
+                    if not near[f]:
+                        continue
+                    if throw_in:
+                        # a throw-in is taken at the touchline and sends the ball into
+                        # the pitch.  A ball hopping at the line in the thrower's hands
+                        # does not qualify (measured 44 600-44 679), the release does
+                        # (44 739: 4.2 m inward in 0.4 s).
+                        if touchline_m[f] > 2.5:
+                            continue
+                        side = 0 if ball[f, 1] < pitch_width / 2.0 else 1
+                        future = ball[min(len(ball) - 1, f + 10), 1]
+                        if not np.isfinite(future):
+                            continue
+                        inward = future - ball[f, 1] if side == 0 else ball[f, 1] - future
+                        if inward < 1.0:
+                            continue
+                    restart_f = f
+                    strict = True
+                    break
+            if restart_f is None:
+                # no clean release: keep the old first-spike behaviour instead of
+                # declaring the whole tag dead (measured 68 672 and 85 753)
+                restart_f = fallback_f
+            rows.append((ev, s_f, e_f, restart_f, strict))
+        return rows, speed
+
+    c_b = arrays["consensus_ball"].astype(np.float64)
+    setpiece_rows, b_speed = _setpiece_restart_frames(c_b)
+    setpiece_dead = np.zeros(n, dtype=bool)
+    for _ev, s_f, e_f, restart_f, _strict in setpiece_rows:
+        # a tag supports deadness only until the restart it describes
+        setpiece_dead[s_f:(e_f if restart_f is None else restart_f)] = True
+
+    oob = out_of_bounds_mask(
         arrays["consensus_ball"].astype(np.float64),
         tuple(lab.tracking.pitch),
         margin_m=float(params.oob_margin_m),
         min_frames=int(params.oob_min_frames),
         confidence=arrays["consensus_confidence"].astype(np.float64),
     )
+    out_of_play = ball_lost_mask(
+        arrays["consensus_confidence"].astype(np.float64),
+        min_frames=int(params.lost_min_frames),
+        eps=float(params.lost_conf_eps),
+    ) | oob
     event_dead = event_dead | out_of_play
     # the keeper-hold channel reads the half-level keeper roster geometry: which team
     # defends each goal; the hold itself is detected in pixel evidence (see keeper_holds)
     keeper_defenders = None
     keeper_slots = None
     if box_evidence is not None:
-        from .keepers import derive_keeper_slots
-
-        keeper_info = derive_keeper_slots(
-            lab.tracking.players, lab.tracking.teams, tuple(lab.tracking.pitch), GRADED_HALVES
-        )
         keeper_defenders = keeper_info.team
         keeper_slots = keeper_info.slot
         if int(args.keeper_hold_min_frames) > 0:
@@ -832,43 +918,45 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         )
 
     # Setpiece motion gating: set pieces (throw-ins, corners) are D until the ball is in motion
-    c_b = arrays["consensus_ball"].astype(np.float64)
-    b_diff = np.zeros_like(c_b)
-    b_diff[1:] = (c_b[1:] - c_b[:-1]) * FPS
-    b_speed = np.linalg.norm(b_diff, axis=1)
-
-    for ev in lab.tags.events:
-        if ev.code == "SET PIECES":
-            s_f, e_f = int(ev.start_frame), min(len(result.codes), int(ev.stop_frame))
-            if e_f <= s_f:
-                continue
-            is_corner_flight = False
-            # Check if this set piece is actually taken from a corner flag
-            p_start = c_b[s_f]
-            corners = [(0.0, 0.0), (0.0, lab.tracking.pitch[1]), (lab.tracking.pitch[0], 0.0), (lab.tracking.pitch[0], lab.tracking.pitch[1])]
-            from_corner = any((p_start[0] - cx)**2 + (p_start[1] - cy)**2 <= 16.0 for cx, cy in corners)
-            if from_corner and ev.team in (0, 1):
-                for f in range(s_f, min(e_f, s_f + 120)):
-                    if b_speed[f] > 6.0:
-                        end_flight = min(e_f, f + 60)
-                        result.codes[f:end_flight] = ev.team
-                        is_corner_flight = True
-                        break
-            if not is_corner_flight:
-                restart_f = None
-                for f in range(s_f + 10, min(e_f, s_f + 500)):
-                    if b_speed[f] > 4.5 and np.nanmean(b_speed[f:min(e_f, f + 4)]) > 3.0:
-                        restart_f = f
-                        break
-                if restart_f is not None:
-                    result.codes[s_f:restart_f] = _D_CODE
-                    if ev.team in (0, 1):
-                        result.codes[restart_f:min(e_f, restart_f + 60)] = ev.team
-                elif e_f > s_f + 25:
-                    result.codes[s_f:e_f - 25] = _D_CODE
+    for ev, s_f, e_f, restart_f, strict in setpiece_rows:
+        is_corner_flight = False
+        # Check if this set piece is actually taken from a corner flag
+        p_start = c_b[s_f]
+        corners = [(0.0, 0.0), (0.0, lab.tracking.pitch[1]), (lab.tracking.pitch[0], 0.0), (lab.tracking.pitch[0], lab.tracking.pitch[1])]
+        from_corner = any((p_start[0] - cx)**2 + (p_start[1] - cy)**2 <= 16.0 for cx, cy in corners)
+        if from_corner and ev.team in (0, 1):
+            for f in range(s_f, min(e_f, s_f + 120)):
+                if b_speed[f] > 6.0:
+                    end_flight = min(e_f, f + 60)
+                    result.codes[f:end_flight] = ev.team
+                    is_corner_flight = True
+                    break
+        if not is_corner_flight:
+            if restart_f is not None:
+                result.codes[s_f:restart_f] = _D_CODE
+                if ev.team in (0, 1):
+                    result.codes[restart_f:min(e_f, restart_f + 60)] = ev.team
+                elif strict:
+                    # throw-ins carry no team in the smart tags: the player at the
+                    # ball when it starts moving is the one taking the restart
+                    # (measured 44 739: the Athletic thrower stood 0.21 m away).
+                    restart_team = nearest_team_at(
+                        c_b[restart_f],
+                        np.asarray(lab.tracking.players, dtype=np.float64)[restart_f],
+                        tracking_teams_area[restart_f],
+                        np.asarray(lab.tracking.player_present, dtype=bool)[restart_f],
+                    )
+                    if restart_team in (0, 1):
+                        result.codes[restart_f:min(e_f, restart_f + 60)] = restart_team
+            elif e_f > s_f + 25:
+                result.codes[s_f:e_f - 25] = _D_CODE
 
     # Aerial excursion continuity: suppress spurious dead ball on high balloon kicks with return
-    from .fusion.transitions import apply_offside_freekick_restarts, stitch_aerial_excursions
+    from .fusion.transitions import (
+        apply_offside_freekick_restarts,
+        fill_blind_continuity,
+        stitch_aerial_excursions,
+    )
 
     result.codes[:] = stitch_aerial_excursions(
         result.codes,
@@ -888,6 +976,14 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     from .model import merge_isolated_runs
 
     result.codes[:] = merge_isolated_runs(result.codes, min_frames=5)
+    # a ball the tracker loses for a couple of seconds is not a stoppage: keep the
+    # possession the same team held before and after the blind spot (measured 51 646)
+    result.codes[:] = fill_blind_continuity(
+        result.codes,
+        arrays["consensus_confidence"].astype(np.float64),
+        dead_support=np.asarray(arrays["event_dead"], dtype=bool) | setpiece_dead,
+        out_of_bounds=oob,
+    )
 
     # Apply manual verification adjustments for visual inspection cases
     _match_adjustments = [

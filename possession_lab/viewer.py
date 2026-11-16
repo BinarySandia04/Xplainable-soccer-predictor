@@ -57,7 +57,7 @@ from .config import (
     asset_paths,
 )
 from .data import TagTable, load_public_gt, load_smart_tags, load_submission
-from .keepers import derive_keeper_slots, half_index
+from .keepers import derive_keeper_slots, half_index, keeper_area_team_map
 from .perception import _run_ball_track
 
 # Viewer-only ball association.  The yolo layer recomputes the ball track when the viewer loads, so
@@ -509,6 +509,16 @@ class FrameStore:
         self.keeper_slots = derive_keeper_slots(
             tracking.players, tracking.teams, tuple(tracking.pitch), GRADED_HALVES
         )
+        # the same goal-area truth for the jersey dots: a keeper carried by the other
+        # keeper's roster slot wears the team that defends the area he stands in.
+        self._tk_teams_area = keeper_area_team_map(
+            self._tk_players,
+            np.asarray(tracking.teams),
+            self._tk_present,
+            self.keeper_slots,
+            GRADED_HALVES,
+            tuple(tracking.pitch),
+        )
         self._yolo_ball_pitch: np.ndarray | None = None
         self._yolo_ball_confidence: np.ndarray | None = None
         self._yolo_ball_selected: np.ndarray | None = None
@@ -555,7 +565,6 @@ class FrameStore:
     def _roster_team(self, frame: int, x: float, y: float) -> int | None:
         """Team of the nearest present tracking slot within 2 m — the file's roster
         identity beats a failed jersey read; ``None`` when the tracker has nobody there."""
-        tk = self.tracking
         i = min(max(int(frame), 0), self.n_frames - 1)
         slots = np.flatnonzero(self._tk_present[i])
         if slots.size == 0:
@@ -569,7 +578,7 @@ class FrameStore:
         j = int(np.nanargmin(np.where(finite, d, np.inf)))
         if float(d[j]) > 2.0:
             return None
-        team = int(tk.teams[slots[j]])
+        team = int(self._tk_teams_area[i, slots[j]])
         return team if team in (0, 1) else None
 
     def _atd_team(self, frame: int, index: int, x: float, y: float) -> int:

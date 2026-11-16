@@ -320,6 +320,41 @@ def control_map(
     return nearest
 
 
+def nearest_team_at(
+    ball_xy: np.ndarray,
+    players: np.ndarray,
+    teams: np.ndarray,
+    present: np.ndarray,
+    max_distance: float = 2.0,
+    min_margin: float = 1.0,
+) -> int:
+    """Team of the player standing at the ball, when the geometric claim is clear.
+
+    Set-piece smart tags leave throw-ins with team ``N/A``: the player at the ball
+    when it starts moving is the one taking the restart.  A contested ball is left
+    unresolved (``-1``) so the caller keeps the decoded state instead of guessing.
+    """
+    ball = np.asarray(ball_xy, dtype=np.float64)
+    pitch = np.asarray(players, dtype=np.float64)
+    team = np.asarray(teams)
+    ok = np.asarray(present, dtype=bool) & np.isin(team, (H, 1))
+    if pitch.ndim != 2 or ok.shape != (pitch.shape[0],):
+        return -1
+    with np.errstate(invalid="ignore"):
+        dist = np.linalg.norm(pitch - ball, axis=1)
+    ok &= np.isfinite(dist)
+    if not ok.any():
+        return -1
+    rows = np.flatnonzero(ok)
+    closest = rows[int(np.argmin(dist[rows]))]
+    if float(dist[closest]) > float(max_distance):
+        return -1
+    others = rows[team[rows] != team[closest]]
+    if others.size and float(dist[others].min()) < float(dist[closest]) + float(min_margin):
+        return -1
+    return int(team[closest])
+
+
 # --------------------------------------------------------------------------- pixel contact evidence
 
 @dataclass(frozen=True)
@@ -1166,6 +1201,51 @@ def apply_goalkeeper_restarts(
                     out_codes[f:flight_end] = k_team
 
     return out_codes
+
+
+def fill_blind_continuity(
+    codes: np.ndarray,
+    confidence: np.ndarray,
+    dead_support: np.ndarray | None = None,
+    out_of_bounds: np.ndarray | None = None,
+    max_frames: int = 75,
+    max_confidence: float = 0.5,
+) -> np.ndarray:
+    """Keep a live possession through a short tracker blind spot.
+
+    A high or fast ball leaves the optical tracker for a second or two without
+    leaving play.  When no event or set-piece stoppage covers the gap, the ball
+    confidence stays near zero, and the same team is on both sides of it, treating
+    the gap as a transfer invents a turnover the evidence does not support
+    (measured 51 646: 2.8 s of conf 0.00 while Barcelona kept the ball in play).
+    Gaps bracketed by different teams, covered by a dead-ball window, crossing the
+    touchline, or longer than ``max_frames`` are left untouched.
+    """
+    out = np.asarray(codes, dtype=np.int8).copy()
+    n = out.size
+    if n == 0:
+        return out
+    conf = np.asarray(confidence, dtype=np.float64)
+    if conf.size != n:
+        raise ValueError("confidence must cover every code")
+    blocked = np.zeros(n, dtype=bool)
+    if dead_support is not None:
+        blocked |= np.asarray(dead_support, dtype=bool)
+    if out_of_bounds is not None:
+        blocked |= np.asarray(out_of_bounds, dtype=bool)
+    for start, stop in _bool_runs(out == D):
+        if start == 0 or stop >= n or stop - start > max_frames:
+            continue
+        before, after = int(out[start - 1]), int(out[stop])
+        if before != after or before not in (H, 1):
+            continue
+        window = conf[start:stop]
+        if not np.isfinite(window).all() or float(window.max()) >= max_confidence:
+            continue
+        if blocked[start:stop].any():
+            continue
+        out[start:stop] = before
+    return out
 
 
 def stitch_aerial_excursions(
@@ -2547,6 +2627,7 @@ __all__ = [
     "events_to_rows",
     "evidence_probability",
     "expire_owned_spells",
+    "fill_blind_continuity",
     "gate_events",
     "gate_pixel_events",
     "hold_touch_through",

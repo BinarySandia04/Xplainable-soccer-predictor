@@ -93,6 +93,63 @@ def half_index(frame: int, halves: tuple[tuple[int, int], ...]) -> int:
     return -1
 
 
+def keeper_area_team_map(
+    players: np.ndarray,
+    teams: np.ndarray,
+    present: np.ndarray,
+    keeper_slots: KeeperSlots,
+    halves: tuple[tuple[int, int], ...],
+    pitch: tuple[float, float],
+    penalty_depth_m: float = 18.5,
+    penalty_half_width_m: float = 21.0,
+) -> np.ndarray:
+    """Per-frame team labels with keeper slots handed to the goal they stand in.
+
+    The ATD sometimes carries a keeper in the other keeper's roster slot (measured
+    19 863: the Barcelona keeper holding the ball occupied Athletic's slot 45).  A
+    keeper slot whose feet are inside a penalty area belongs to the team that
+    defends that goal: the area is the geometric truth, the slot id is not.  Slots
+    away from a penalty area keep their roster team, and non-keeper slots are never
+    touched.  ``teams`` may be per-slot ``(p,)`` or per-frame ``(n, p)``; the
+    result is always ``(n, p)`` int8.
+    """
+    p = np.asarray(players, dtype=np.float64)
+    t = np.asarray(teams)
+    pr = np.asarray(present, dtype=bool)
+    n, n_slots = int(p.shape[0]), int(p.shape[1])
+    if t.ndim == 1:
+        out = np.tile(t.astype(np.int8, copy=False)[None, :], (n, 1))
+    else:
+        out = np.array(t, dtype=np.int8, copy=True)
+    length, width = float(pitch[0]), float(pitch[1])
+    center_y = width / 2.0
+    for h, (start, stop) in enumerate(halves):
+        start = max(0, int(start))
+        stop = min(n, int(stop))
+        if start >= stop:
+            continue
+        for slot_side in (0, 1):
+            slot = int(keeper_slots.slot[h, slot_side])
+            if slot < 0 or slot >= n_slots:
+                continue
+            xs = p[start:stop, slot, 0]
+            ys = p[start:stop, slot, 1]
+            ok = pr[start:stop, slot] & np.isfinite(xs) & np.isfinite(ys)
+            if not ok.any():
+                continue
+            side = np.where(xs < length / 2.0, 0, 1)
+            near_goal = ok & ((xs <= penalty_depth_m) | (xs >= length - penalty_depth_m))
+            near_goal &= np.abs(ys - center_y) <= penalty_half_width_m
+            for goal in (0, 1):
+                right = int(keeper_slots.team[h, goal])
+                if right < 0:
+                    continue
+                rows = np.flatnonzero(near_goal & (side == goal)) + start
+                if rows.size:
+                    out[rows, slot] = right
+    return out
+
+
 def _duplicates_inherit_keeper_team(
     teams: np.ndarray,
     present: np.ndarray,

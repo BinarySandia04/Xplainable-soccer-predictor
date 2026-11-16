@@ -29,11 +29,13 @@ from possession_lab.fusion.transitions import (
     events_to_rows,
     evidence_probability,
     expire_owned_spells,
+    fill_blind_continuity,
     gate_events,
     gate_pixel_events,
     hold_touch_through,
     keeper_area_catches,
     keeper_holds,
+    nearest_team_at,
     pixel_contact,
     raw_evidence_pool,
     relay_contacts,
@@ -89,6 +91,30 @@ class KinematicsTests(unittest.TestCase):
         pitch[:, 0] = [30.5, 20.0]
         referee = player_set(pitch, [2])  # referee team is not a control candidate
         self.assertTrue((control_map(ball, [referee]) == -1).all())
+
+
+class RestartTeamTests(unittest.TestCase):
+    def setUp(self):
+        self.players = np.array([[0.2, 34.0], [7.0, 34.0], [1.8, 31.0]], dtype=np.float64)
+        self.teams = np.array([A, H, H], dtype=np.int8)
+        self.present = np.array([True, True, True])
+
+    def test_player_at_the_ball_takes_the_restart(self):
+        # measured 44 740: the Athletic thrower stood 0.24 m from the ball
+        self.assertEqual(nearest_team_at((0.0, 34.0), self.players, self.teams, self.present), A)
+
+    def test_contested_ball_is_left_unresolved(self):
+        teams = np.array([A, A, H], dtype=np.int8)
+        players = np.array([[0.6, 34.0], [6.0, 34.0], [1.2, 34.0]])
+        self.assertEqual(nearest_team_at((0.0, 34.0), players, teams, self.present), -1)
+
+    def test_nobody_within_reach_is_unresolved(self):
+        self.assertEqual(nearest_team_at((30.0, 34.0), self.players, self.teams, self.present), -1)
+
+    def test_absent_and_non_playing_teams_are_ignored(self):
+        present = np.array([False, True, True])
+        teams = np.array([2, H, H], dtype=np.int8)
+        self.assertEqual(nearest_team_at((6.8, 34.0), self.players, teams, present), H)
 
 
 class KickDetectionTests(unittest.TestCase):
@@ -1092,6 +1118,71 @@ class DeadNeedsSupportTests(unittest.TestCase):
         self.assertEqual(list(out[100:]), [D] * 100)  # the second half never held a live team
 
 
+class FillBlindContinuityTests(unittest.TestCase):
+    """A short ball-blind gap between the same live labels is a dropout, not a turnover."""
+
+    def gap(self, label, gap=10, n=40):
+        codes = np.zeros(n, dtype=np.int8)
+        codes[:15] = label
+        codes[15:15 + gap] = D
+        codes[15 + gap:] = label
+        return codes, 15, 15 + gap
+
+    def test_a_short_blind_gap_keeps_the_surrounding_team(self):
+        codes, s, e = self.gap(H)
+        conf = np.ones(codes.size)
+        conf[s:e] = 0.0
+        out = fill_blind_continuity(codes, conf)
+        self.assertEqual(list(out[s:e]), [H] * (e - s))
+        np.testing.assert_array_equal(out[[0, s - 1, e, -1]], np.array([H, H, H, H], dtype=np.int8))
+
+    def test_works_for_athletic_too(self):
+        codes, s, e = self.gap(A, gap=3)
+        conf = np.zeros(codes.size)
+        out = fill_blind_continuity(codes, conf)
+        self.assertEqual(list(out[s:e]), [A] * 3)
+
+    def test_bracketed_by_different_teams_is_left_alone(self):
+        codes, s, e = self.gap(H, gap=8)
+        codes[e:] = A
+        conf = np.zeros(codes.size)
+        out = fill_blind_continuity(codes, conf)
+        self.assertEqual(list(out[s:e]), [D] * 8)
+
+    def test_a_dead_ball_window_blocks_the_fill(self):
+        codes, s, e = self.gap(H, gap=12)
+        conf = np.zeros(codes.size)
+        dead = np.zeros(codes.size, dtype=bool)
+        dead[s:s + 2] = True
+        out = fill_blind_continuity(codes, conf, dead_support=dead)
+        self.assertEqual(list(out[s:e]), [D] * 12)
+
+    def test_out_of_bounds_blocks_the_fill(self):
+        codes, s, e = self.gap(H, gap=12)
+        conf = np.zeros(codes.size)
+        oob = np.zeros(codes.size, dtype=bool)
+        oob[e - 1] = True
+        out = fill_blind_continuity(codes, conf, out_of_bounds=oob)
+        self.assertEqual(list(out[s:e]), [D] * 12)
+
+    def test_a_gap_longer_than_the_blind_window_stands(self):
+        codes, s, e = self.gap(H, gap=76, n=106)
+        conf = np.zeros(codes.size)
+        out = fill_blind_continuity(codes, conf)
+        self.assertEqual(list(out[s:e]), [D] * 76)
+
+    def test_a_visible_ball_gap_is_not_a_dropout(self):
+        codes, s, e = self.gap(H, gap=9)
+        conf = np.ones(codes.size)  # the tracker saw the ball: not blind
+        out = fill_blind_continuity(codes, conf)
+        self.assertEqual(list(out[s:e]), [D] * 9)
+
+    def test_edge_gaps_are_left_alone(self):
+        codes = np.array([D] * 10 + [H] * 30, dtype=np.int8)
+        out = fill_blind_continuity(codes, np.zeros(codes.size))
+        np.testing.assert_array_equal(out, codes)
+
+
 class ConflictMaskTests(unittest.TestCase):
     """Sustained ATD-vs-YOLO divergence marks drifting-ball frames (gate knob only)."""
 
@@ -1425,6 +1516,20 @@ class RelabelTeamsFromTrackingTests(unittest.TestCase):
             pitch, present, teams, track_xy, track_teams, track_present, (105.0, 68.0)
         )
         self.assertEqual(out[0].tolist(), [1, 0, 0])  # slot 3 not present: raw label stands
+
+    def test_per_frame_roster_team_follows_a_keeper_swap(self):
+        from possession_lab.perception import relabel_teams_from_tracking
+
+        pitch = np.array([[[11.1, 29.1]], [[11.1, 29.1]]])
+        present = np.array([[True], [True]])
+        teams = np.array([[0], [0]], dtype=np.int8)
+        track_xy = np.array([[[11.3, 29.5]], [[11.3, 29.5]]])
+        track_teams = np.array([[1], [0]], dtype=np.int8)  # slot 45: A then Barça
+        track_present = np.array([[True], [True]])
+        out = relabel_teams_from_tracking(
+            pitch, present, teams, track_xy, track_teams, track_present, (105.0, 68.0)
+        )
+        self.assertEqual(out[:, 0].tolist(), [1, 0])
 
     def test_off_pitch_ghost_slot_is_never_a_match(self):
         from possession_lab.perception import relabel_teams_from_tracking

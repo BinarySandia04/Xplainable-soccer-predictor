@@ -38,6 +38,7 @@
     overlay: $("#overlay"),
     overlayToggle: $("#overlayToggle"),
     yoloPlayersToggle: $("#yoloPlayersToggle"),
+    playerBoxesToggle: $("#playerBoxesToggle"),
     yoloCandidatesToggle: $("#yoloCandidatesToggle"),
     layerToggles: Array.from(document.querySelectorAll("[data-layer]")),
     pitchMap: $("#pitchMap"),
@@ -137,6 +138,7 @@
     overlayEnabled: true,
     layers: { raw: true, yolo: true, consensus: true },
     yoloPlayersEnabled: true,
+    playerBoxesEnabled: true,
     yoloCandidatesEnabled: true,
     frameData: null,
     frameDataRequest: null,
@@ -637,6 +639,40 @@
     ctx.restore();
   }
 
+  function drawYoloPlayerBoxes(ctx, players, xOf, yOf) {
+    if (!state.playerBoxesEnabled || !Array.isArray(players) || players.length === 0) return;
+    ctx.save();
+    ctx.lineWidth = 1.2;
+    ctx.font = `600 10px ${MONO}`;
+    ctx.textBaseline = "bottom";
+    for (const player of players) {
+      if (player.official) continue; // referees are not players: no boxes around them
+      const box = player.box;
+      if (!Array.isArray(box) || box.length < 4) continue;
+      const [x1, y1, x2, y2] = box.map(Number);
+      if (![x1, y1, x2, y2].every(Number.isFinite)) continue;
+      const left = Math.min(xOf(x1), xOf(x2));
+      const top = Math.min(yOf(y1), yOf(y2));
+      const width = Math.abs(xOf(x2) - xOf(x1));
+      const height = Math.abs(yOf(y2) - yOf(y1));
+      if (width < 1 || height < 1) continue;
+      const color = player.team === 0 ? COLORS.H : player.team === 1 ? COLORS.A : "#c8d6e5";
+      ctx.globalAlpha = 0.7;
+      ctx.strokeStyle = color;
+      ctx.strokeRect(left + 0.5, top + 0.5, width - 1, height - 1);
+      if (Number.isFinite(Number(player.track)) && Number(player.track) >= 0) {
+        const label = String(player.track);
+        const labelWidth = ctx.measureText(label).width + 4;
+        ctx.globalAlpha = 0.9;
+        ctx.fillStyle = "rgba(8, 16, 24, 0.72)";
+        ctx.fillRect(left, Math.max(0, top - 12), labelWidth, 12);
+        ctx.fillStyle = color;
+        ctx.fillText(label, left + 2, Math.max(9, top - 2));
+      }
+    }
+    ctx.restore();
+  }
+
   // Decision codes mirror BALL_CAND_* in possession_lab/perception.py.  The accepted winner is drawn
   // by drawLayerBall, so this overlay only draws the *other* candidates to make the physical gate
   // visible: what YOLO saw, and why the tracker kept or discarded each one.
@@ -868,6 +904,7 @@
 
     drawLayerTrails(ctx, frameData, xOf, yOf, "video");
     drawBallCandidates(ctx, frameData, xOf, yOf, "video", 1);
+    drawYoloPlayerBoxes(ctx, frameData.video_players, xOf, yOf);
 
     for (const player of frameData.players || []) {
       if (player.px === null || player.px === undefined || player.py === null || player.py === undefined) {
@@ -2359,6 +2396,13 @@
       ui.yoloPlayersToggle.checked = state.yoloPlayersEnabled;
       ui.yoloPlayersToggle.addEventListener("change", () => {
         state.yoloPlayersEnabled = ui.yoloPlayersToggle.checked;
+        drawOverlay();
+      });
+    }
+    if (ui.playerBoxesToggle) {
+      ui.playerBoxesToggle.checked = state.playerBoxesEnabled;
+      ui.playerBoxesToggle.addEventListener("change", () => {
+        state.playerBoxesEnabled = ui.playerBoxesToggle.checked;
         drawOverlay();
       });
     }

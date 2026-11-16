@@ -1786,6 +1786,8 @@ def relabel_teams_from_tracking(
     team of the nearest present tracking slot within ``max_match_m`` metres; slots
     outside the pitch (ghosts, throw-in corridors) are never a match, and a
     detection nobody recognises keeps its own label.
+    ``track_teams`` may be per-slot ``(p,)`` or per-frame ``(n, p)``; the latter
+    lets a keeper-area correction follow the slot through an ATD keeper swap.
     """
     p = np.asarray(players_pitch, dtype=np.float64)
     pres = np.asarray(present, dtype=bool)
@@ -1801,7 +1803,12 @@ def relabel_teams_from_tracking(
             & (tk[:n, :, 0] > -1.0) & (tk[:n, :, 0] < length + 1.0)
             & (tk[:n, :, 1] > -1.0) & (tk[:n, :, 1] < width + 1.0)
         )
-    slot_ok = tk_p[:n] & inside & np.isin(tk_t, (0, 1))[None, :]
+    team_ok = (
+        np.isin(tk_t[:n], (0, 1))
+        if tk_t.ndim == 2
+        else np.isin(tk_t, (0, 1))[None, :]
+    )
+    slot_ok = tk_p[:n] & inside & team_ok
     for f in range(n):
         det = np.flatnonzero(pres[f] & np.isfinite(p[f]).all(axis=1))
         if det.size == 0 or not slot_ok[f].any():
@@ -1812,5 +1819,8 @@ def relabel_teams_from_tracking(
         nearest = d.argmin(axis=1)
         close = d[np.arange(det.size), nearest] <= max_match_m
         if close.any():
-            out_teams[f, det[close]] = tk_t[slots][nearest[close]]
+            if tk_t.ndim == 2:
+                out_teams[f, det[close]] = tk_t[f, slots][nearest[close]]
+            else:
+                out_teams[f, det[close]] = tk_t[slots][nearest[close]]
     return out_teams
