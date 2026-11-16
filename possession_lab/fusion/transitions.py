@@ -25,6 +25,12 @@ moments).  This module adds exactly that layer, in three steps:
    decaying logit pulse for the attributed team from each kept event, an eased transition
    matrix around event frames, and protection so the post-hoc merge cannot absorb the
    event spell.
+4. **Hand the ball to who has it**: the decode is corrected by the physics of the ball
+   itself.  A spell is held frame by frame by the team that last *played* the ball — a
+   witnessed event, a witnessed release (the ball leaves a slow start from a player
+   clearly at its feet), or a trap of a ball that was (nearly) at rest before — and a
+   stopped, seen ball belongs to the player clearly at its feet, whatever the decode's
+   memory of the stoppage says.
 
 Every threshold is physical (m/s, metres, frames) and deliberately conservative: on the
 public window the layer adds true-positive spells with zero spurious ones, but the gates
@@ -33,10 +39,13 @@ exist to earn that on the full match, not to fit the public five minutes.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import warnings
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
+from numpy.lib.stride_tricks import as_strided
 
 from ..config import FPS, GRADED_HALVES, D, H, X
 from ..model import DEFAULT_PARAMS, ModelParams
@@ -44,6 +53,16 @@ from .geometry import EPS, PRIOR, PRIOR_WEIGHT
 
 CONTROL_RADIUS = 3.0  # metres; a player closer than this is treated as controlling the ball
 CHUNK = 2000
+
+
+@contextmanager
+def _ignore_nan_runtime() -> Iterator[None]:
+    """Silence ``nanmin``/``nanmax`` "All-NaN slice" warnings on deliberately-padded
+    windows (trailing frames without a future, lost-ball frames); the result is
+    NaN there and callers treat it as "no evidence"."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        yield
 
 
 @dataclass(frozen=True)
@@ -227,16 +246,42 @@ class TransitionParams:
     revive_touch_dist_m: float = 2.0  # how close a player must be to own the ball
     revive_touch_cov: float = 0.7  # share of each second's frame holding that glue
     revive_touch_gap: float = 0.1  # raw pool margin the gluing player's team needs
-    # -- a change of owner needs a touch: while the ball is in flight it still belongs
-    # to whoever played it.  A spell whose team never brings a player within reach of
-    # the ball — and owns no witnessed event there — is the decoder outrunning the
-    # play and is handed back to the team that had it (measured 115 330: A->H with
-    # the ball 7.7 m from every player, the back-pass still in the air, and H held
-    # for 121 frames until the receiver touched it).
-    flight_touch_radius_m: float = 2.5  # m: a player this close to the ball has touched it
-    flight_touch_lookback_frames: int = 25  # 1 s: a touch just before the boundary counts
+    # -- physical control: possession follows the ball, and a spell is held by the team
+    # that last played it.  A change of owner needs a play — a kick, a trap, a control —
+    # not a decode that outruns the play (measured 115 330: A->H with the ball 7.7 m from
+    # every player, the back-pass still in the air, and H held for 121 frames until the
+    # receiver touched it).
+    flight_touch_lookback_frames: int = 25  # 1 s: a play just before the boundary counts
     flight_min_ball_frames: float = 0.6  # share of the spell with a seen ball, or no verdict
     flight_max_rollback_frames: int = 750  # 30 s: longer spells are not rewritten blindly
+    # a release anchor: the ball leaves a slow start to live-ball speed — a kick nobody
+    # witnessed.  The peak is the median of the next few speeds, so a single-frame tracker
+    # spike cannot fake a kick, and the releasing player must be clearly at the ball's feet
+    release_window_frames: int = 3  # speeds after the release that define its peak
+    release_anchor_radius_m: float = 1.5  # m: the releasing player this close to the ball
+    release_anchor_margin_m: float = 1.0  # m: and this much closer than the opponent
+    # a trap-from-rest anchor: possession returns when a player takes on a ball that was
+    # (nearly) at rest before.  A rolling or flying ball at live speed is not possession
+    # until it is controlled; the prior rest is what makes a close run a trap, not a fly-by
+    rest_trap_radius_m: float = 1.0  # m: the trapping player this close to the ball
+    rest_trap_margin_m: float = 1.5  # m: and this much closer than the opponent
+    rest_trap_max_speed_m: float = 8.0  # m/s: a trap can catch a ball still dying down
+    rest_trap_min_run: int = 3  # frames of near contact before the trap counts
+    rest_trap_prior_frames: int = 6  # window the ball's prior speed is read from
+    rest_trap_prior_speed_m: float = 1.5  # m/s: the ball was (nearly) at rest before
+    # -- rest ownership: a ball that is stopped, seen and in play belongs to the team with
+    # the player clearly at its feet — a restart being set, a ball left on the foot — not
+    # the decode's memory of who had the ball before the stoppage (measured 122 877: the
+    # ball sat at rest with the nearest Barcelona player 15 m away while the Athletic
+    # restart was being set, and the decode held Barcelona for 46 frames).  Two clauses:
+    # a player on the ball itself, or a clear stop with the owner well clear of contest.
+    rest_max_speed_m: float = 4.0  # m/s: at or below this the ball is at rest
+    rest_onball_radius_m: float = 0.5  # m: on the ball itself (a restart on the foot)
+    rest_onball_margin_m: float = 1.0  # m: the other team this much further than the foot
+    rest_radius_m: float = 5.0  # m: clear-stop clause: a player this close to a stopped ball
+    rest_margin_m: float = 8.0  # m: clear-stop clause: the other team must be this much further
+    rest_min_frames: int = 10  # 0.4 s: a sustained setup, not a player passing by
+    rest_gap_frames: int = 3  # speed blips up to this long inside a rest run are bridged
 
 
 DEFAULT_TRANSITION_PARAMS = TransitionParams()
@@ -257,7 +302,7 @@ class TransitionEvent:
     hold_through: bool = False
 
     def as_row(self) -> tuple[int, int, int, int, float, float]:
-        kind_code = {"kick": 0, "onset": 1, "contact": 2, "kicker": 3, "hold": 4, "control": 5, "area": 6}[self.kind]
+        kind_code = {"kick": 0, "onset": 1, "contact": 2, "kicker": 3, "hold": 4, "control": 5, "area": 6, "touch": 7}[self.kind]
         return (self.start, self.frame, kind_code, self.team, self.distance, self.support)
 
 
@@ -276,6 +321,10 @@ class TransitionLayerResult:
     n_control: int = 0
     n_area: int = 0
     n_flight: int = 0
+    n_touch: int = 0
+    n_rest: int = 0
+    n_revived: int = 0
+    n_touched: int = 0
 
 
 # --------------------------------------------------------------------------- ball kinematics
@@ -2037,47 +2086,208 @@ def hold_touch_through(
     return out
 
 
+def ball_release_mask(
+    speed: np.ndarray,
+    window_frames: int = 3,
+    gain: float = 6.0,
+    min_speed: float = 8.0,
+    max_speed: float = 32.0,
+) -> np.ndarray:
+    """Frames where the ball is released: from a standing or slow start it reaches
+    live-ball speed within a few frames — a kick, a punt, a clearance.
+
+    The release peak is the *median* of the next ``window_frames`` speeds: a
+    real release keeps live speed for a couple of frames, while a single-frame
+    tracker spike does not, and one noise frame must not fake a kick.  The ball
+    must still be slow on the frame itself (a kick, not a ball that is already
+    moving), and a detector jump past ``max_speed`` is not a release.  Non-finite
+    speed (ball lost) is never a release.
+    """
+    sp = np.asarray(speed, dtype=np.float64)
+    n = sp.size
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    f = max(1, int(window_frames))
+    window = np.full((n, f), np.nan)
+    for k in range(f):
+        window[: n - (k + 1), k] = sp[k + 1 :]
+    with np.errstate(invalid="ignore"), _ignore_nan_runtime():  # trailing frames: no future
+        peak = np.nanmedian(window, axis=1)
+    return (
+        np.isfinite(sp)
+        & (sp <= min_speed)
+        & np.isfinite(peak)
+        & (peak >= min_speed)
+        & (peak <= max_speed)
+        & ((peak - sp) >= gain)
+    )
+
+
+def _max_speed_window(speed: np.ndarray, frames: int) -> np.ndarray:
+    """Maximum speed over each window of the last ``frames`` frames.
+
+    The window includes the frame itself: position ``f`` holds the max of
+    frames ``f - frames + 1 .. f``.  ``NaN`` where the window holds no finite
+    speed at all (the ball was blind throughout).
+    """
+    sp = np.asarray(speed, dtype=np.float64)
+    n = sp.size
+    k = max(1, int(frames))
+    if n < k:
+        return np.full(n, np.nan)
+    sp2 = np.where(np.isfinite(sp), sp, -np.inf)
+    window = as_strided(sp2, shape=(n - k + 1, k), strides=(sp2.strides[0], sp2.strides[0]))
+    peak = np.full(n, -np.inf)
+    peak[k - 1 :] = window.max(axis=1)
+    return np.where(peak == -np.inf, np.nan, peak)
+
+
 def hold_through_flight(
     codes: np.ndarray,
     distances: np.ndarray,
     ball_valid: np.ndarray,
+    speed: np.ndarray,
     events: Sequence[TransitionEvent] = (),
     halves: tuple[tuple[int, int], ...] | None = None,
+    event_dead: np.ndarray | None = None,
+    consensus: np.ndarray | None = None,
+    pitch: tuple[float, float] | None = None,
     params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
 ) -> tuple[np.ndarray, int]:
-    """A change of owner needs a touch: a spell its team never touched goes back.
+    """Possession is held by the team that last *played* the ball.
 
-    ``distances`` is :func:`team_distances` (min ball distance per team, ``inf``
-    where unseen).  An H<->A spell is kept when its team brings a player within
-    ``flight_touch_radius_m`` of the ball inside the spell (or ``lookback`` frames
-    before its start), or owns a witnessed event there — a pass received, a
-    dribble, a kick.  Otherwise the decoder has changed hands while the ball was
-    still travelling, and the spell is handed back to the team that had it.  The
-    rule is one-sided: it only ever *removes* unsupported changes, and it refuses
-    to judge spells where the ball was not seen for ``flight_min_ball_frames`` of
-    the time or that last longer than ``flight_max_rollback_frames``.
+    ``distances`` is :func:`team_distances` (min ball distance per team,
+    ``inf`` where unseen).  A team spell that begins where the previous frame
+    was a different state is re-labelled, frame by frame, with the team of the
+    latest anchor at or before that frame — and no anchor older than the
+    spell's window counts.  There are three kinds of anchor, strongest first:
+
+    * a **witnessed event** (a kick, a control, a catch the event channels
+      actually saw),
+    * a **release**: the ball leaves a slow start to live-ball speed — a kick
+      nobody witnessed.  The peak is the median of the next few speeds, so a
+      single-frame tracker spike cannot fake one, and the releasing player
+      must be clearly at the ball's feet,
+    * a **trap from rest**: possession returns when a player takes on a ball
+      that was (nearly) at rest before it.  A ball rolling or flying at live
+      speed is not possession until it is controlled; the prior rest is what
+      makes a close run a trap, not a fly-by.
+
+    No play happens while the ball is dead, so no anchor is taken inside a
+    stoppage (witnessed events still anchor: a taken restart starts its
+    spell).  An H<->A spell looks ``flight_touch_lookback_frames`` back; a
+    spell that follows a dead state looks back over that dead run and a little
+    before it (a kick just before the ball went blind still owns what
+    follows), and no anchor older than ``flight_max_rollback_frames`` counts
+    at all.  The rule only ever hands a spell to a side that demonstrably
+    played the ball, and it refuses to judge spells where the ball was not
+    seen for ``flight_min_ball_frames`` of the time.  Returns the codes and
+    the number of frames re-labelled.
     """
     out = np.asarray(codes).copy()
     n = out.size
-    if params.flight_touch_radius_m <= 0 or params.flight_max_rollback_frames <= 0:
+    if n == 0 or params.flight_max_rollback_frames <= 0:
         return out, 0
-    radius = float(params.flight_touch_radius_m)
+    valid = np.asarray(ball_valid, dtype=bool)
+    dead = np.zeros(n, dtype=bool) if event_dead is None else np.asarray(event_dead, dtype=bool)
+    oob = (
+        out_of_bounds_mask(consensus, pitch)
+        if pitch is not None and consensus is not None
+        else np.zeros(n, dtype=bool)
+    )
+    dist = np.asarray(distances, dtype=np.float64)
+    dmin = np.minimum(dist[:, 0], dist[:, 1])
+    with np.errstate(invalid="ignore"):
+        margin = np.abs(dist[:, 0] - dist[:, 1])
+    nearest = np.where(dist[:, 0] < dist[:, 1], H, 1)
+    sp = np.asarray(speed, dtype=np.float64)
+    # anchors, strongest first
+    anchor_team = np.full(n, -1, dtype=np.int8)
+    for e in events:
+        f, t = int(e.frame), int(e.team)
+        if 0 <= f < n and t in (H, 1):
+            anchor_team[f] = t
+    # a release: the ball leaves a slow start, the releasing player at its feet
+    release = ball_release_mask(
+        sp,
+        params.release_window_frames,
+        params.kick_min_gain,
+        params.kick_min_after,
+        params.kick_max_after,
+    )
+    rlx = (
+        release
+        & valid
+        & ~dead
+        & ~oob
+        & (dmin <= float(params.release_anchor_radius_m))
+        & (margin >= float(params.release_anchor_margin_m))
+    )
+    for f in np.flatnonzero(rlx):
+        if anchor_team[f] < 0:
+            anchor_team[f] = nearest[f]
+    # a trap from rest: near contact that starts with the ball (nearly) at rest
+    onb = (
+        valid
+        & ~dead
+        & ~oob
+        & (dmin <= float(params.rest_trap_radius_m))
+        & (margin >= float(params.rest_trap_margin_m))
+        & np.isfinite(sp)
+        & (sp <= float(params.rest_trap_max_speed_m))
+    )
+    keep = np.zeros_like(onb)
+    idx = np.flatnonzero(onb)
+    if idx.size:
+        brk = np.flatnonzero(np.diff(idx) > 1) + 1
+        for s, e in zip(np.r_[0, brk], np.r_[brk, idx.size]):
+            if idx[e - 1] - idx[s] + 1 >= int(params.rest_trap_min_run):
+                keep[idx[s:e]] = True
+    k = max(1, int(params.rest_trap_prior_frames))
+    if n >= k:
+        finite = np.isfinite(sp)
+        cum = np.concatenate(([0], np.cumsum(finite.astype(np.int64))))
+        count = np.zeros(n, dtype=np.int64)
+        count[k - 1 :] = cum[k:] - cum[:-k]
+        prior = np.where(count >= max(1, k // 2), _max_speed_window(sp, k), np.nan)
+    else:
+        prior = np.full(n, np.nan)
+    onb_prev = np.zeros_like(onb)
+    onb_prev[1:] = onb[:-1]
+    trap_start = keep & ~onb_prev & (prior <= float(params.rest_trap_prior_speed_m))
+    for f in np.flatnonzero(trap_start):
+        if anchor_team[f] < 0:
+            anchor_team[f] = nearest[f]
+    have = anchor_team >= 0
+    if not have.any():
+        return out, 0
+    # last anchor at or before each frame
+    last = np.maximum.accumulate(np.where(have, np.arange(n), -1))
+    last_tf = np.where(last >= 0, last, -1).astype(np.int64)
+    last_tt = anchor_team[np.clip(last, 0, n - 1)]
     starts = np.flatnonzero(np.r_[True, out[1:] != out[:-1]])
     ends = np.r_[starts[1:], n]
-    valid = np.asarray(ball_valid, dtype=bool)
-    rolled = 0
+    changed = 0
     for a, b in zip(starts.tolist(), ends.tolist()):
         team = int(out[a])
         if a == 0 or team not in (H, 1):
             continue
         prev = int(out[a - 1])
-        if prev not in (H, 1) or prev == team:
-            continue
-        if b - a > int(params.flight_max_rollback_frames):
+        if prev == team:
             continue
         if float(valid[a:b].mean()) < float(params.flight_min_ball_frames):
             continue
-        lo = a - int(params.flight_touch_lookback_frames)
+        if prev in (H, 1):
+            lo = a - int(params.flight_touch_lookback_frames)
+        else:
+            # a spell after deadness inherits the ownership of the last seen
+            # moment: walk back over the decoded dead run and allow a play
+            # just before it began (a kick right before the ball went blind)
+            dstart = a
+            while dstart > 0 and out[dstart - 1] not in (H, 1):
+                dstart -= 1
+            lo = dstart - int(params.flight_touch_lookback_frames)
+        lo = max(0, lo, a - int(params.flight_max_rollback_frames))
         hi = b
         if halves is not None:
             for start_h, stop_h in halves:
@@ -2085,17 +2295,93 @@ def hold_through_flight(
                     lo = max(lo, start_h)
                     hi = min(hi, stop_h)
                     break
-        lo = max(0, lo)
-        if bool((np.asarray(distances[lo:hi, team]) <= radius).any()):
+        # only frames with an anchor in the window are re-labelled: with no
+        # play in the window the decode's verdict stands
+        mask = last_tf[a:hi] >= lo
+        want = last_tt[a:hi]
+        seg = out[a:hi]
+        diff = mask & (seg != want)
+        out[a:hi] = np.where(diff, want, seg)
+        changed += int(diff.sum())
+    return out, changed
+
+
+def rest_ownership(
+    codes: np.ndarray,
+    distances: np.ndarray,
+    speed: np.ndarray,
+    ball_valid: np.ndarray,
+    event_dead: np.ndarray,
+    consensus: np.ndarray,
+    halves: tuple[tuple[int, int], ...] | None = None,
+    pitch: tuple[float, float] | None = None,
+    params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
+) -> tuple[np.ndarray, int]:
+    """A stopped, seen ball belongs to the team at its feet.
+
+    While the ball is at rest (``rest_max_speed_m``), tracked, in play, and not
+    out of bounds, its owner is the nearest team — whatever the decode says —
+    under either of two clauses:
+
+    * **on the ball itself**: a player within ``rest_onball_radius_m`` and
+      ``rest_onball_margin_m`` closer than the opponent — a restart on the
+      foot, a ball left to be taken,
+    * **the clear stop**: a player within ``rest_radius_m`` with the other
+      team at least ``rest_margin_m`` further — a restart being set, with the
+      owner well clear of any contest.
+
+    The decode may still hold the team that possessed the ball *before* the
+    stoppage, or a dead state the events channel never confirmed — the player
+    at the ball is a direct observation and memory is second.  Runs shorter
+    than ``rest_min_frames`` are tracking blips, not ownership; contested
+    balls (neither clause met) stay with the decode.  A rest run overwrites
+    any decoded code in its frames, ``D`` included: the ball is seen, stopped
+    and owned, so there is no stoppage to remember.
+    """
+    out = np.asarray(codes).copy()
+    n = out.size
+    if n == 0 or params.rest_radius_m <= 0:
+        return out, 0
+    dist = np.asarray(distances, dtype=np.float64)
+    sp = np.asarray(speed, dtype=np.float64)
+    valid = np.asarray(ball_valid, dtype=bool)
+    dead = np.asarray(event_dead, dtype=bool)
+    dmin = np.minimum(dist[:, 0], dist[:, 1])
+    with np.errstate(invalid="ignore"):
+        margin = np.abs(dist[:, 0] - dist[:, 1])
+    onb = (dmin <= float(params.rest_onball_radius_m)) & (margin >= float(params.rest_onball_margin_m))
+    clear = (dmin <= float(params.rest_radius_m)) & (margin >= float(params.rest_margin_m))
+    ok = valid & ~dead & np.isfinite(sp) & (sp <= float(params.rest_max_speed_m)) & (onb | clear)
+    if pitch is not None:
+        ok &= ~out_of_bounds_mask(consensus, pitch)
+    if halves is not None:
+        inside = np.zeros(n, dtype=bool)
+        for start, stop in halves:
+            inside[max(0, int(start)):min(n, int(stop))] = True
+        ok &= inside
+    # a one-frame speed spike inside a rest run is the tracker hiccuping, not
+    # the ball moving: bridge gaps up to rest_gap_frames so the run stays whole
+    gap = max(0, int(params.rest_gap_frames))
+    if gap > 0 and ok.any():
+        idx = np.arange(n)
+        last_ok = np.maximum.accumulate(np.where(ok, idx, -1))
+        next_ok = np.minimum.accumulate(np.where(ok, idx, n)[::-1])[::-1]
+        flanked = (last_ok >= 0) & (next_ok <= n - 1)
+        flanked &= (idx - last_ok) <= gap
+        flanked &= (next_ok - idx) <= gap
+        ok = ok | flanked
+    owner = np.where(ok, np.where(dist[:, 0] < dist[:, 1], H, 1), -1).astype(np.int8)
+    starts = np.flatnonzero(np.r_[True, owner[1:] != owner[:-1]])
+    ends = np.r_[starts[1:], n]
+    changed = 0
+    for a, b in zip(starts.tolist(), ends.tolist()):
+        team = int(owner[a])
+        if team < 0 or b - a < int(params.rest_min_frames):
             continue
-        if any(
-            int(e.team) == team and (lo <= int(e.start) < b or lo <= int(e.frame) < b)
-            for e in events
-        ):
-            continue
-        out[a:b] = prev
-        rolled += 1
-    return out, rolled
+        diff = out[a:b] != team
+        changed += int(diff.sum())
+        out[a:b] = np.where(diff, team, out[a:b])
+    return out, changed
 
 
 def apply_transition_layer(
@@ -2118,6 +2404,11 @@ def apply_transition_layer(
     atd_ball_present: np.ndarray | None = None,
     dead_support: np.ndarray | None = None,
     evidence_pool: np.ndarray | None = None,
+    out_of_play: np.ndarray | None = None,
+    live_tags: Sequence[tuple[int, int, int, bool]] | None = None,
+    setpiece: np.ndarray | None = None,
+    raw_ball: np.ndarray | None = None,
+    atd_players: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> TransitionLayerResult:
     """Detect, gate, and decode ball-control transitions on top of the fused poll.
 
@@ -2135,6 +2426,15 @@ def apply_transition_layer(
     settled spell.  ``atd_ball_present`` tells the pixel channel which frames the pitch
     stream actually saw the ball on; ``dead_support`` (a confirmed stoppage or a
     ``SET PIECES`` smart tag) is what a ``D`` inside a ball-blind window must be backed by.
+
+    With ``out_of_play`` the layer also owns the false-stoppage escape, applied after
+    the decode and the half-gap fill and before the physical rules: lost/out-of-bounds
+    frames are forced ``D``, a live-phase tag (``live_tags`` as ``(start, stop, team,
+    strong)`` from the smart tags, with ``setpiece`` and the out-of-play frames as the
+    ``blocked`` mask, ``raw_ball`` the pitch stream's own ball for the marginal-crossing
+    test) reopens a dead lock it contradicts, and a player at a rolling ball (the
+    ``atd_players`` tracking set) does the same — each only into ``D`` frames, never
+    over a live label.  The physical rules then judge the reopened frames.
     """
     consensus = np.asarray(consensus_ball, dtype=np.float64)
     sets64 = [(np.asarray(p, dtype=np.float64), np.asarray(t), np.asarray(pr, dtype=bool)) for p, t, pr in player_sets]
@@ -2148,6 +2448,10 @@ def apply_transition_layer(
         kicks = [event for event in kicks if not stale[event[0]]]
         onsets = [event for event in onsets if not stale[event[0]]]
     events, dropped = gate_events(kicks, onsets, codes_pooled, evidence_prob, event_dead, nearest_team, params)
+    # the kinematic touch channel is retired: direct control is judged by the
+    # physical rules below (a trap from rest, a ball at rest on a foot), which
+    # see the same physics without the pulse's memory lag
+    n_touch = 0
     if box_evidence is not None:
         contain, touch = pixel_contact(box_evidence)
         contact = detect_contact_events(contain, touch, speed, event_dead, params)
@@ -2247,21 +2551,89 @@ def apply_transition_layer(
             np.asarray(dead_support if dead_support is not None else event_dead, dtype=bool),
             params,
         )
-    n_flight = 0
-    if params.flight_touch_radius_m > 0:
-        # nobody wins the ball while it is in the air: a change without a touch is
-        # handed back until the receiving side actually plays it
-        codes, n_flight = hold_through_flight(
-            codes,
-            team_distances(consensus, sets64),
-            valid,
-            events,
-            halves if halves is not None else GRADED_HALVES,
-            params,
-        )
+    # physical hand-over, judged on the ball itself rather than the decode's
+    # memory: a spell is held by the team that last played the ball (a
+    # witnessed event, a release, a trap from rest), and a stopped, seen ball
+    # belongs to the team at its feet.  The break between halves is gap-filled
+    # first so a spell spanning it is read as two spells; the false-stoppage
+    # escape (a live tag, or a player at a rolling ball, reopening a dead lock
+    # the events channel misfired on) runs before the rules, so a spell the
+    # tags reopened is judged like any other — the physical play has the last
+    # word on whose ball it is.
     from ..pipeline import fill_match_breaks
 
-    codes = fill_match_breaks(codes, halves if halves is not None else GRADED_HALVES)
+    active = halves if halves is not None else GRADED_HALVES
+    codes = fill_match_breaks(codes, active)
+    n_revived = n_touched = 0
+    if out_of_play is not None and keeper_pitch is not None:
+        codes[np.asarray(out_of_play, dtype=bool)] = D  # nobody possesses a ball off the pitch
+        blocked = np.asarray(out_of_play, dtype=bool)
+        if setpiece is not None:
+            blocked |= np.asarray(setpiece, dtype=bool)
+        if live_tags is not None and evidence_pool is not None:
+            revived, revived_team = dead_revival_mask(
+                consensus,
+                np.asarray(evidence_pool, dtype=np.float64),
+                live_tags,
+                keeper_pitch,
+                blocked,
+                min_frames=int(params.revive_min_frames),
+                gap_min=float(params.revive_gap_min),
+                speed_min=float(params.revive_speed_min),
+                raw_ball=None if raw_ball is None else np.asarray(raw_ball, dtype=np.float64),
+            )
+            revived &= codes == D  # reopen a false lock; never overrule a live label
+            codes[revived] = revived_team[revived]
+            n_revived = int(revived.sum())
+        if atd_players is not None and evidence_pool is not None:
+            # the ball's own state gets the last word over its own lock: a player at
+            # the ball, the ball rolling, and the voters backing that player's team
+            # means the game is on, whatever false trigger pinned the label
+            ap, apr, at = atd_players
+            touched, touched_team = possession_revival_mask(
+                consensus,
+                np.asarray(ap, dtype=np.float64),
+                np.asarray(apr, dtype=bool),
+                np.asarray(at, dtype=np.int8),
+                np.asarray(evidence_pool, dtype=np.float64),
+                keeper_pitch,
+                blocked,
+                dist_max=float(params.revive_touch_dist_m),
+                hold_cov=float(params.revive_touch_cov),
+                gap_min=float(params.revive_touch_gap),
+                speed_min=float(params.revive_speed_min),
+                min_frames=int(params.revive_min_frames),
+            )
+            touched &= codes == D  # same rule: reopen dead frames, never a live label
+            codes[touched] = touched_team[touched]
+            n_touched = int(touched.sum())
+    dists = team_distances(consensus, sets64)
+    codes, n_flight = hold_through_flight(
+        codes,
+        dists,
+        valid,
+        speed,
+        events,
+        active,
+        np.asarray(event_dead, dtype=bool),
+        consensus,
+        keeper_pitch,
+        params,
+    )
+    n_rest = 0
+    if params.rest_radius_m > 0:
+        # a stopped, seen ball belongs to the team at its feet
+        codes, n_rest = rest_ownership(
+            codes,
+            dists,
+            speed,
+            valid,
+            np.asarray(event_dead, dtype=bool),
+            consensus,
+            active,
+            keeper_pitch,
+            params,
+        )
     return TransitionLayerResult(
         codes=codes,
         events=events,
@@ -2274,12 +2646,16 @@ def apply_transition_layer(
         n_control=n_control,
         n_area=n_area,
         n_flight=n_flight,
+        n_touch=n_touch,
+        n_rest=n_rest,
+        n_revived=n_revived,
+        n_touched=n_touched,
     )
 
 
 def events_to_rows(events: Sequence[TransitionEvent]) -> np.ndarray:
     """Events as an ``(m, 6)`` array: start, frame, kind (0=kick, 1=onset, 2=contact,
-    3=kicker, 4=hold, 5=control, 6=area), team, distance, support."""
+    3=kicker, 4=hold, 5=control, 6=area, 7=touch), team, distance, support."""
     if not events:
         return np.zeros((0, 6), dtype=np.float64)
     return np.asarray([e.as_row() for e in events], dtype=np.float64)
@@ -2294,6 +2670,7 @@ __all__ = [
     "apply_transition_layer",
     "ball_conflict_mask",
     "ball_lost_mask",
+    "ball_release_mask",
     "ball_speed",
     "ball_stale_mask",
     "build_pulse",
@@ -2320,5 +2697,6 @@ __all__ = [
     "possession_revival_mask",
     "pixel_contact",
     "raw_evidence_pool",
+    "rest_ownership",
     "team_distances",
 ]
