@@ -190,6 +190,18 @@ def _rule_keeper_save(
                 team=target,
             )
 
+    # An explicit kick or kicker event in the window belongs to a defender clearance / touch, not a keeper save
+    if events_df is not None and hasattr(events_df, "empty") and not events_df.empty:
+        lo_f, hi_f = frame - int(1.5 * FPS), frame + int(1.5 * FPS)
+        subset_k = events_df[
+            (events_df["event_frame"] >= lo_f)
+            & (events_df["start_frame"] <= hi_f)
+            & (events_df["kind"].isin(["kick", "kicker"]))
+            & (events_df["team"] == target_label)
+        ]
+        if not subset_k.empty:
+            return None
+
     # Check 2: ball position inside penalty area and near target team
     if 0 <= local < features.present.size:
         xy = None
