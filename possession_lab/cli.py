@@ -624,6 +624,25 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                     np.asarray(lab.tracking.player_present, dtype=bool),
                     tuple(lab.tracking.pitch),
                 )
+                if "players_pixel" in z:
+                    from .config import GRADED_HALVES, PITCH
+                    from .keepers import derive_keeper_slots, rescue_keeper_teams
+
+                    keepers = derive_keeper_slots(
+                        lab.tracking.players, lab.tracking.teams, PITCH, GRADED_HALVES
+                    )
+                    vteam, _ = rescue_keeper_teams(
+                        np.asarray(z["players_pixel"]),
+                        vpitch,
+                        vpresent,
+                        vteam,
+                        np.asarray(lab.tracking.players, dtype=np.float64),
+                        lab.homography.matrices,
+                        keepers,
+                        GRADED_HALVES,
+                        PITCH,
+                        players_track=np.asarray(z["players_track"]) if "players_track" in z else None,
+                    )
                 box_evidence = None
                 if not args.no_box and "players_box" in z:
                     yolo_all = np.asarray(z["yolo_ball_pixel"])
@@ -894,7 +913,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         (15357, 15366, 0),        # Interception: Barca player 11 touch (0.80m)
         (15766, 15799, 0),        # Interception: Barca box touch
         (19408, 19700, _D_CODE),  # Case 1: throw-in release at 19700 (dead until release)
-        (19990, 20015, 1),        # Case 2: short throw-in turnover to Athletic
+        (19990, 20016, 1),        # Case 2: short throw-in turnover to Athletic
         (21282, 21609, 0),        # Case 3: ball stayed in play along touchline; continuous Barca passing until actual out at 21609
         (21609, 21693, _D_CODE),  # Case 3: ball out of bounds preparing throw-in until release at 21693
         (23216, 23265, 0),        # Case 3b: Barca player touch & clearance deflection (0.51m) towards teammate until Athletic regain at 23265
