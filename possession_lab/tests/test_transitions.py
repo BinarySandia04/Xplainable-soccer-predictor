@@ -919,6 +919,32 @@ class PixelChannelTests(unittest.TestCase):
         _, touch2 = pixel_contact(ev2)
         self.assertEqual(detect_kicker_events(ev2, touch2, speed_still), [])
 
+    def test_kicker_catches_a_cushioned_first_touch_release(self):
+        n = 80
+        boxes = np.zeros((n, 2, 4))
+        boxes[:, 0] = [-2.0, 0.0, 2.0, 20.0]  # H player, feet at (0, 20)
+        boxes[:, 1] = [60.0, 0.0, 64.0, 20.0]  # A player far away
+        atd = np.zeros((n, 2))
+        atd[:, :] = [0.0, 19.0]  # at H's feet
+        for t in range(51, n):
+            atd[t, 0] = 5.0 * (t - 50)  # released: 5 px/frame away
+        speed = np.full(n, 4.0)
+        speed[54:] = 10.0  # cushioned first touch: in flight 4 frames after the close
+        ev = self.evidence(n, atd, boxes=boxes)
+        _, touch = pixel_contact(ev)
+        events = detect_kicker_events(ev, touch, speed)
+        self.assertEqual([(f, t) for f, _, t, _, _ in events], [(50, H)])
+        self.assertEqual(events[0][1], 10.0)  # release speed read from the 4th frame
+        # the 0.16 s ceiling is relative to the ball leaving the feet: once it rolls
+        # out of reach of both feet, a later acceleration is a second touch, not this
+        atd_gap = atd.copy()
+        atd_gap[51:56] = [25.0, 19.0]  # out of reach of both feet (20 px close window)
+        ev_gap = self.evidence(n, atd_gap, boxes=boxes)
+        _, touch_gap = pixel_contact(ev_gap)
+        speed_late = np.full(n, 4.0)
+        speed_late[56:] = 10.0
+        self.assertEqual(detect_kicker_events(ev_gap, touch_gap, speed_late), [])
+
     @staticmethod
     def _gate_world(n, flip_at):
         codes = np.zeros(n, dtype=np.int8)
