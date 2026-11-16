@@ -201,6 +201,7 @@ class TransitionParams:
     # defending the low side in the second half) and left again at 18.9 m/s, with no
     # opponent closer; the fused prior kept claiming H through catch and punt.
     area_catch_in_min_speed: float = 8.0  # m/s the ball must arrive with
+    area_catch_in_frames: int = 2  # frames arriving at that speed: one is a tracker spike, not a pass
     area_catch_max_speed: float = 3.5  # m/s the stop counts as a catch below
     area_catch_prior_frames: int = 40  # window the arrival speed is read from
     area_catch_depth_m: float = 16.5  # penalty-area depth from the goal line
@@ -212,6 +213,21 @@ class TransitionParams:
     area_catch_extend_dip_max: int = 15  # frames the support may dip for mid-flight
     area_catch_max_span: int = 330  # ownership cap: catch, gather, punt
     area_catch_min_pool_margin: float = 0.25  # the voters must back the catcher
+    # -- blind keeper clearance: the pixel channel is fully blind for a second or
+    # more while the keeper holds the ball near his goal (the fused consensus then
+    # carries low-confidence ghosts, not a sighted ball), and the ball returns as a
+    # downfield punt.  The keeper is the one standing on the ball, clear of any
+    # opponent; a shot or a deflected rebound moves into the goal, not away from it.
+    # Measured 69 405: blind 69 116-69 404, the ball back in the defended area at
+    # (7.4, 35.3) with the keeper 0.4 m from it, the punt building to 20.6 m/s, and
+    # the fused prior still claiming the other side through the clearance.
+    clearance_blind_min_frames: int = 25  # 1 s of fused blindness before the return
+    clearance_conf_min: float = 0.5  # fused confidence below this counts as blind
+    clearance_kick_speed: float = 10.0  # m/s: a punt clearing leaves at this speed or more
+    clearance_kick_window: int = 40  # frames after the return the punt speed is read from
+    clearance_leave_m: float = 5.0  # m the ball must gain going away from the goal
+    clearance_def_radius_m: float = 1.5  # m: the attributed defender stands on the ball
+    clearance_opp_min_m: float = 2.0  # m: an opponent closer contests the clearance
     # -- evidence expiry of a pixel-owned spell: an owned interval cannot outlive
     # the camera's own evidence.  A lone touch that is never followed up must not
     # hold the spell while the ball settles on the other team's feet (measured
@@ -331,7 +347,7 @@ class TransitionEvent:
     def as_row(self) -> tuple[int, int, int, int, float, float]:
         kind_code = {
             "kick": 0, "onset": 1, "contact": 2, "kicker": 3, "hold": 4,
-            "control": 5, "area": 6, "touch": 7, "restart": 8,
+            "control": 5, "area": 6, "touch": 7, "restart": 8, "clearance": 9,
         }[self.kind]
         return (self.start, self.frame, kind_code, self.team, self.distance, self.support)
 
@@ -356,6 +372,7 @@ class TransitionLayerResult:
     n_revived: int = 0
     n_touched: int = 0
     n_restart: int = 0
+    n_clearance: int = 0
 
 
 # --------------------------------------------------------------------------- ball kinematics
@@ -1462,8 +1479,10 @@ def keeper_area_catches(
 
     The pixel twin (``keeper_holds``) goes blind right by the goal, where depth
     compresses the boxes and a gathered ball never trips the contain bits; the pitch
-    geometry reads the same story: the ball decelerates from flight speed to a stop
-    inside the defended area (``area_catch_*``) with no opponent near, then
+    geometry reads the same story: the ball decelerates from flight speed (at least
+    ``area_catch_in_frames`` frames at or above ``area_catch_in_min_speed`` — a
+    single-frame spike is the tracker hiccuping, not the pass) to a stop inside the
+    defended area (``area_catch_*``) with no opponent near, then
     leaves again.  The catch belongs to the defending side (``defenders[h, g]``, the
     keeper-roster geometry of :mod:`possession_lab.keepers`) from the kick that sent
     the ball in — the nearest velocity jump searched back over
@@ -1508,8 +1527,9 @@ def keeper_area_catches(
         if not np.isfinite(sp[t]) or sp[t] > params.area_catch_max_speed:
             continue
         w = sp[max(0, t - int(params.area_catch_prior_frames)) : t]
-        if w.size == 0 or not np.isfinite(w).any() or float(np.nanmax(w)) < params.area_catch_in_min_speed:
-            continue
+        fast = np.isfinite(w) & (w >= params.area_catch_in_min_speed)
+        if int(fast.sum()) < int(params.area_catch_in_frames):
+            continue  # one fast frame is the tracker hiccuping, not the pass that fed the keeper
         x, y = ball[t]
         if not np.isfinite([x, y]).all():
             continue
@@ -1575,6 +1595,98 @@ def keeper_area_catches(
                     start = k
                     break
         out.append((int(start), int(catch), team))
+    return out
+
+
+def blind_keeper_clearances(
+    consensus: np.ndarray,
+    confidence: np.ndarray,
+    speed: np.ndarray,
+    ball_valid: np.ndarray,
+    event_dead: np.ndarray,
+    distances: np.ndarray,
+    defenders: np.ndarray,
+    pitch: tuple[float, float],
+    halves: tuple[tuple[int, int], ...],
+    goals_windows: Sequence[tuple[int, int]] = (),
+    params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
+) -> list[tuple[int, int, int]]:
+    """A punt of a ball the keeper held while the fused ball went blind.
+
+    The pixel channel is fully blind by the goal mouth: a pass into the area and a
+    keeper gathering it leave the fused consensus carrying low-confidence ghosts
+    (``confidence`` below ``clearance_conf_min``) for a second or more, then the
+    ball returns — seen, in the defended area, with the defending keeper standing
+    on it — and leaves again as a downfield punt (``clearance_kick_speed`` within
+    ``clearance_kick_window`` frames, gaining ``clearance_leave_m`` away from the
+    goal).  The clearance belongs to the defending side (``defenders[h, g]``) from
+    the return: the keeper had the ball the whole blind stretch, and the prior
+    team the fused decode remembers never touched it.  A contested ball (an
+    opponent within ``clearance_opp_min_m`` of the defender) is no keeper's
+    clearance, neither is a shot (the ball gains ground *into* the goal, not away
+    from it), a dead ball, or a tagged goal sequence.  ``distances`` is
+    :func:`team_distances` over the same sets the layer decodes with.  Returns
+    ``(start, frame, team)`` with both at the return frame.
+    """
+    length, width = float(pitch[0]), float(pitch[1])
+    ball = np.asarray(consensus, dtype=np.float64)
+    sp = np.asarray(speed, dtype=np.float64)
+    ok = np.asarray(ball_valid, dtype=bool)
+    dead = np.asarray(event_dead, dtype=bool)
+    conf = np.asarray(confidence, dtype=np.float64)
+    dist = np.asarray(distances, dtype=np.float64)
+    n = ball.shape[0]
+    blind = ~ok | ~np.isfinite(conf) | (conf < float(params.clearance_conf_min))
+    half_of = np.full(n, -1, dtype=np.int8)
+    for h, (a, b) in enumerate(halves):
+        half_of[int(a) : int(b)] = h
+    # the reappearance frames: the first seen frame after a long blind run
+    cand: list[int] = []
+    f = 0
+    while f < n:
+        if not blind[f]:
+            f += 1
+            continue
+        s = f
+        while f < n and blind[f]:
+            f += 1
+        if f < n and f - s >= int(params.clearance_blind_min_frames):
+            cand.append(f)
+    out: list[tuple[int, int, int]] = []
+    for t in cand:
+        x, y = ball[t]
+        if not np.isfinite([x, y]).all():
+            continue
+        if not (0.0 <= x <= length and 0.0 <= y <= width):
+            continue  # a ball reappearing off the pitch is a stoppage, not a clearance
+        side = 0 if x < length / 2.0 else 1
+        goal_x = 0.0 if side == 0 else length
+        if abs(x - goal_x) > params.area_catch_depth_m or abs(y - width / 2.0) > params.area_catch_half_width_m:
+            continue  # the keeper holds his ball only in his own area
+        if any(a <= t <= b for a, b in goals_windows):
+            continue  # a tagged goal sequence is not a clearance
+        if dead[t] or float(np.mean(dead[max(0, t - 10) : min(n, t + 10)])) > params.dead_max:
+            continue  # no play while the ball is dead
+        h_i = int(half_of[t])
+        if h_i < 0 or h_i >= defenders.shape[0]:
+            continue
+        team = int(defenders[h_i, side])
+        if team not in (H, 1):
+            continue
+        if dist[t, team] > params.clearance_def_radius_m or dist[t, 1 - team] < params.clearance_opp_min_m:
+            continue  # the attributed defender must stand on the ball, clear of the opponent
+        k = min(n, t + 1 + int(params.clearance_kick_window))
+        win = sp[t + 1 : k]
+        if win.size == 0 or not np.isfinite(win).any() or float(np.nanmax(win)) < params.clearance_kick_speed:
+            continue  # a punt clearing leaves at flight speed; a hand pass does not
+        seg = ball[t : k, 0]
+        if side == 0:
+            gained = float(np.nanmax(seg)) - x
+        else:
+            gained = x - float(np.nanmin(seg))
+        if not np.isfinite(gained) or gained < params.clearance_leave_m:
+            continue  # a clearance goes downfield; a shot or a rebound goes at the goal
+        out.append((t, t, team))
     return out
 
 
@@ -2570,6 +2682,8 @@ def apply_transition_layer(
     raw_ball: np.ndarray | None = None,
     atd_players: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
     restart_windows: Sequence[tuple[int, int, str]] | None = None,
+    consensus_confidence: np.ndarray | None = None,
+    goals_windows: Sequence[tuple[int, int]] | None = None,
 ) -> TransitionLayerResult:
     """Detect, gate, and decode ball-control transitions on top of the fused poll.
 
@@ -2600,7 +2714,13 @@ def apply_transition_layer(
     / ``Throw-in`` windows as ``(start, stop, type)``) the witnessed-restart rule
     (``restart_ownership``) runs last: a restart only paints when the ball's own
     streams witness it and a player stands at the ball, and it may only fill the
-    ``D``/``X`` gaps the earlier rules left, never a decoded possession.
+    ``D``/``X`` gaps the earlier rules left, never a decoded possession.  With
+    ``consensus_confidence`` (the fused ball's per-frame confidence) and
+    ``goals_windows`` (the ``GOALS`` smart-tag spans as ``(start, stop)``) the
+    blind keeper clearance (``blind_keeper_clearances``) also runs: a punt of a
+    ball the keeper held while the fused ball went blind for a second or more is
+    given to the defending side from the reappearance, never inside a tagged goal
+    sequence.
     """
     consensus = np.asarray(consensus_ball, dtype=np.float64)
     sets64 = [(np.asarray(p, dtype=np.float64), np.asarray(t), np.asarray(pr, dtype=bool)) for p, t, pr in player_sets]
@@ -2649,15 +2769,34 @@ def apply_transition_layer(
         intervals: list[tuple[int, int, int]] = []
         hold_keys: frozenset[tuple[int, int]] = frozenset()
     n_area = 0
+    n_clearance = 0
+    dists = team_distances(consensus, sets64)
     if keeper_defenders is not None and keeper_pitch is not None:
-        # the pitch twin of the keeper hold: a stop inside the defended area that the
-        # blind near-goal pixel channel never saw belongs to the side that owns goal
+        # the pitch twins of the keeper hold: a stop inside the defended area that the
+        # blind near-goal pixel channel never saw, and a punt of a ball the keeper
+        # held while the fused ball went blind, belong to the side that owns the goal
         bnd = np.flatnonzero(np.r_[True, codes_pooled[1:] != codes_pooled[:-1]])
-        for start, frame, team in keeper_area_catches(
-            consensus, speed, valid, np.asarray(event_dead, dtype=bool), sets64,
-            keeper_defenders, keeper_pitch, halves if halves is not None else GRADED_HALVES, params,
-            evidence_pool=None if evidence_pool is None else np.asarray(evidence_pool, dtype=np.float64),
-        ):
+        found: list[tuple[int, int, int, str]] = [
+            (start, frame, team, "area")
+            for start, frame, team in keeper_area_catches(
+                consensus, speed, valid, np.asarray(event_dead, dtype=bool), sets64,
+                keeper_defenders, keeper_pitch, halves if halves is not None else GRADED_HALVES, params,
+                evidence_pool=None if evidence_pool is None else np.asarray(evidence_pool, dtype=np.float64),
+            )
+        ]
+        if consensus_confidence is not None:
+            found += [
+                (start, frame, team, "clearance")
+                for start, frame, team in blind_keeper_clearances(
+                    consensus, np.asarray(consensus_confidence, dtype=np.float64),
+                    speed, valid, np.asarray(event_dead, dtype=bool), dists,
+                    keeper_defenders, keeper_pitch,
+                    halves if halves is not None else GRADED_HALVES,
+                    tuple(goals_windows) if goals_windows is not None else (),
+                    params,
+                )
+            ]
+        for start, frame, team, kind in found:
             if any(a <= frame < b and t_ == team for a, b, t_ in intervals):
                 continue  # the pixel channel already owns the catch with the same team
             if any((a <= frame < b) and (a, int(t_)) in hold_keys for a, b, t_ in intervals):
@@ -2675,11 +2814,14 @@ def apply_transition_layer(
                 intervals.append([start, stop, team])
                 events = tuple(sorted(
                     (*events,
-                     TransitionEvent(start=start, frame=frame, kind="area", team=team,
+                     TransitionEvent(start=start, frame=frame, kind=kind, team=team,
                                      distance=1.0, support=1.0)),
                     key=lambda e: (e.start, e.frame),
                 ))
-                n_area += 1
+                if kind == "area":
+                    n_area += 1
+                else:
+                    n_clearance += 1
     n_control = 0
     if evidence_pool is not None:
         control, intervals = expire_owned_spells(
@@ -2774,7 +2916,6 @@ def apply_transition_layer(
             touched &= codes == D  # same rule: reopen dead frames, never a live label
             codes[touched] = touched_team[touched]
             n_touched = int(touched.sum())
-    dists = team_distances(consensus, sets64)
     codes, n_flight = hold_through_flight(
         codes,
         dists,
@@ -2837,6 +2978,7 @@ def apply_transition_layer(
         n_revived=n_revived,
         n_touched=n_touched,
         n_restart=n_restart,
+        n_clearance=n_clearance,
     )
 
 
