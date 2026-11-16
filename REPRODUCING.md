@@ -11,7 +11,7 @@ labels `H` / `A` / `D` / `X`. Upload it named `<team_name>.csv`.
 ```bash
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt        # CPU inference for fusion/transitions
-.venv/bin/python -m pytest possession_lab -q     # 329 passed (+4 subtests)
+.venv/bin/python -m pytest possession_lab -q     # 347 passed (+4 subtests)
 ```
 
 The match data lives in `data/` (tactical video, tracking, homography, ATD, smart tags).
@@ -74,6 +74,10 @@ python -m possession_lab viewer \
 The viewer plays the tactical video with the detected ball, every player/goalkeeper/referee box,
 the possession spell per frame and the explanation layer.
 
+Note: the `outputs_view_bundle.tar.gz` in the champion-run release was built from an earlier run
+and its `transition_predictions.csv` predates the physical control rules; rerunning steps 2-4
+from the perception cache (pure CPU) reproduces the current CSV with the checksum above.
+
 ## The chain
 
 Only step 1 needs a GPU; everything after it is deterministic CPU code (no RNG in the pipeline).
@@ -99,8 +103,10 @@ python farm_perceive.py \
 # 3. Fusion: multi-source evidence pool (tracking, tags, events, perception).
 .venv/bin/python -m possession_lab fusion --perception $P/perception_new_fixed.npz
 
-# 4. Transition layer: possession spells, dead-ball locks, tag/possession revival,
-#    no-possession-change-without-a-touch.
+# 4. Transition layer: decode, half-gap fill, lost/out-of-bounds -> D,
+#    tag and player revival (reopen false stoppages), then physical
+#    control: possession follows the last play (witnessed event, release,
+#    trap from rest) and a stopped, seen ball goes to the team at its feet.
 .venv/bin/python -m possession_lab transitions \
     --perception $P/perception_new_fixed.npz --fusion $P/fusion.npz
 
@@ -114,6 +120,47 @@ cp $P/transition_predictions.csv <team_name>.csv
 python evaluation/validate_submission.py <team_name>.csv
 ```
 
+## Physical control rules (transition layer)
+
+The decode says who the voters *think* has the ball; the physical rules say
+who the ball is *with*. They are a priori rules — no parameter was fitted to
+any ground truth — and they run in this order:
+
+1. **Decode + half-gap fill** — the fused vote is decoded and the halftime
+   gap is filled with `D`.
+2. **Lost / out-of-bounds -> `D`** — nobody possesses a ball off the pitch or
+   that the tracker has lost.
+3. **Tag revival** — a live-phase smart tag that contradicts a dead lock
+   reopens it (into `D` frames only, never over a live label).
+4. **Player revival** — a player at a rolling ball, with the raw evidence
+   pool behind that player's team, reopens a dead lock the same way.
+5. **Possession follows the last play** (`hold_through_flight`) — a spell is
+   re-labelled to the team of the last *play* in its lookback window. A play
+   is an anchor, strongest first: a witnessed transition event, a **release**
+   (the ball leaves a slow start at live speed with its player at the feet),
+   or a **trap from rest** (a player takes on a ball that was, up to 0.24 s
+   earlier, (nearly) at rest — pickup's observable signature is prior rest).
+   A ball at live speed is not possession until it is controlled; only frames
+   governed by an anchor in the window move, and no anchor older than 30 s
+   counts.
+6. **A stopped, seen ball is owned** (`rest_ownership`) — while the ball is
+   at rest and tracked, the team at its feet owns it under either clause: on
+   the ball itself (a player within 0.5 m and 1 m ahead of the opponent) or
+   the clear stop (within 5 m with the opponent 8 m further), sustained for
+   at least 0.4 s. A rest run overwrites any decode, `D` included: the ball
+   is seen, stopped and owned, so there is no stoppage to remember.
+
+The run's own count line (all 199,319 frames):
+
+> 194 kicks + 23 onsets detected, 523 contacts + 239 win-and-clear kicks + 10
+> keeper holds + 60 area catches from boxes, 2 spell expiries, 0 touch
+> takeovers + 2934 rest balls owned, 5671 flight ownership fixes, 1001 gated
+> out -> 103 transition events; 93,739 frames of lost/out-of-bounds ball
+> marked D; 641 frames revived by live tags, 487 by a player at the ball.
+
+Against the public 5-minute window (`evaluation/run_evaluation.py`, 7,500
+graded frames): **spellF1 0.7600, macroF1 0.9695, accuracy 0.9675**.
+
 ## Expected checksums
 
 `sha256sum` of the intermediate and final artefacts of the champion run:
@@ -122,8 +169,12 @@ python evaluation/validate_submission.py <team_name>.csv
 |---|---|
 | `possession_lab/outputs/perception_new_fixed.npz` | `9d63f358c035fba6e80ca959f913ce90d3cae34f5e8115e221158dd2d7465bf1` |
 | `possession_lab/outputs/fusion.npz` | `fb11ccb7f8e91d5dc79c2bf23f4f7445af4bf846b61c787e682576d2c9354117` |
-| `possession_lab/outputs/transition_predictions.csv` | `0bb5500b69850e6d36f2e477078772a9010d6ce1449d2d6a6db81ebbb5b86ba6` |
-| `possession_lab/outputs/explanations.json` | `f0a455a80a369eed7453c58c736d7684b45554ddd5c0417c10d3bbcc0fed59b1` |
+| `possession_lab/outputs/transition_predictions.csv` | `2abf87ff5f177e7973b8830d7c51b952b8d59c02c64031f57bc85b04136c6a2e` |
+| `possession_lab/outputs/transition_events.csv` | `aec400824a33c1c6ffa873ec9850fc25fb1364fbbadffb051b56d6036927977c` |
+| `possession_lab/outputs/fusion_transitioned.npz` | `794ff1fea201b441042b5927cf2908fe22f9250a87bb48ea0e347e21f3dcb9a5` |
+
+`explanations.json` (step 5) is derived from the predictions; its checksum
+follows the one above.
 
 If your perception cache matches the checksum above, steps 2–4 are pure CPU and reproduce the
 CSV exactly. Perception itself is deterministic given the same weights, `imgsz` (1024), device

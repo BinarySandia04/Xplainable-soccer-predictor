@@ -15,6 +15,7 @@ from possession_lab.fusion.transitions import (
     TransitionParams,
     apply_transition_layer,
     ball_conflict_mask,
+    ball_release_mask,
     ball_speed,
     ball_stale_mask,
     build_pulse,
@@ -38,6 +39,7 @@ from possession_lab.fusion.transitions import (
     pixel_contact,
     raw_evidence_pool,
     relay_contacts,
+    rest_ownership,
     team_distances,
 )
 
@@ -315,7 +317,14 @@ class HoldTouchThroughTests(unittest.TestCase):
 
 
 class HoldThroughFlightTests(unittest.TestCase):
-    """A change of owner needs a touch: a spell its team never touched goes back."""
+    """A spell is the team that last played the ball, frame by frame.
+
+    A play is an anchor, strongest first: a witnessed event, a release (the ball
+    leaves a slow start to live speed with its player at the feet), or a trap
+    from rest (a player takes on a ball that was (nearly) at rest).  Frames are
+    re-labelled only while the latest anchor in the spell's own window governs
+    them; with no play in the window the decode's verdict stands.
+    """
 
     def setUp(self):
         self.n = 300
@@ -323,63 +332,256 @@ class HoldThroughFlightTests(unittest.TestCase):
         self.codes[100:200] = A
         self.dist = np.full((self.n, 2), 10.0)  # ball ten metres from everyone
         self.valid = np.ones(self.n, dtype=bool)
-        self.dist[150:160, A] = 1.0  # the away spell is received at 150
+        self.speed = np.zeros(self.n)  # a resting ball
 
-    def runs(self, codes):
-        out, s = [], 0
-        for i in range(1, len(codes)):
-            if codes[i] != codes[s]:
-                out.append((s, i, int(codes[s])))
-                s = i
-        out.append((s, len(codes), int(codes[s])))
-        return out
+    def run_rule(self, codes=None, events=(), dead=None, params=None):
+        return hold_through_flight(
+            np.asarray(self.codes if codes is None else codes, dtype=np.int8),
+            self.dist,
+            self.valid,
+            self.speed,
+            list(events),
+            None,
+            dead,
+            params=params or DEFAULT_TRANSITION_PARAMS,
+        )
 
-    def test_untouched_spell_goes_back_to_the_previous_owner(self):
-        out, rolled = hold_through_flight(self.codes, self.dist, self.valid)
-        self.assertEqual(rolled, 1)
-        self.assertEqual(self.runs(out), [(0, 100, H), (100, 300, A)])
+    def near_contact(self, team, f0, f1, d=1.0):
+        """A player of ``team`` stands at the ball's feet on ``[f0, f1)``: with the
+        ball at rest, three frames of this is a trap from rest, the play's anchor."""
+        self.dist[f0:f1, team] = d
 
-    def test_touch_inside_the_spell_keeps_it(self):
-        self.dist[210:215, H] = 1.5
-        out, rolled = hold_through_flight(self.codes, self.dist, self.valid)
-        self.assertEqual(rolled, 0)
-        self.assertEqual(self.runs(out), [(0, 100, H), (100, 200, A), (200, 300, H)])
+    def test_no_anchor_leaves_everything_alone(self):
+        out, changed = self.run_rule()
+        self.assertEqual(changed, 0)
+        self.assertTrue((out == self.codes).all())  # nothing was played: no verdict
 
-    def test_touch_just_before_the_boundary_keeps_it(self):
-        self.dist[180:190, H] = 2.0
-        out, rolled = hold_through_flight(self.codes, self.dist, self.valid)
-        self.assertEqual(rolled, 0)
-        self.assertTrue((out[200:] == H).all())
+    def test_witnessed_event_anchors_the_spell_that_follows(self):
+        event = TransitionEvent(start=190, frame=190, kind="kick", team=A, distance=1.0, support=0.2)
+        out, changed = self.run_rule(events=[event])
+        self.assertTrue((out[:100] == H).all())
+        self.assertTrue((out[100:] == A).all())  # the A spell and the H spell after it
+        self.assertEqual(changed, 100)  # the H spell 200-299 re-labelled to A
 
-    def test_witnessed_event_keeps_the_spell(self):
-        event = TransitionEvent(start=205, frame=205, kind="kick", team=H, distance=1.0, support=0.2)
-        _out, rolled = hold_through_flight(self.codes, self.dist, self.valid, [event])
-        self.assertEqual(rolled, 0)
+    def test_play_just_before_the_boundary_counts(self):
+        self.near_contact(A, 195, 198)  # a trap 5 frames inside the lookback window
+        out, changed = self.run_rule()
+        self.assertTrue((out[:100] == H).all())
+        self.assertTrue((out[100:] == A).all())
+        self.assertEqual(changed, 100)
 
-    def test_unseen_ball_is_not_judged(self):
-        self.valid[200:] = False
-        _out, rolled = hold_through_flight(self.codes, self.dist, self.valid)
-        self.assertEqual(rolled, 0)
+    def test_play_too_far_before_the_boundary_does_not_count(self):
+        self.near_contact(A, 120, 123)  # 80 frames before the boundary: too old
+        out, changed = self.run_rule()
+        self.assertEqual(changed, 0)
+        self.assertTrue((out == self.codes).all())  # the spell after has no play: it stands
 
-    def test_long_spells_are_not_rewritten(self):
-        params = replace(DEFAULT_TRANSITION_PARAMS, flight_max_rollback_frames=50)
-        _out, rolled = hold_through_flight(self.codes, self.dist, self.valid, params=params)
-        self.assertEqual(rolled, 0)
+    def test_release_anchors_the_spell_when_nobody_witnessed_the_kick(self):
+        self.speed[191:] = 15.0  # the ball leaves the foot at 190
+        self.dist[190, A] = 1.0  # the releasing player at its feet
+        out, changed = self.run_rule()
+        self.assertTrue((out[:100] == H).all())
+        self.assertTrue((out[100:] == A).all())
+        self.assertEqual(changed, 100)
 
-    def test_rule_can_be_disabled(self):
-        params = replace(DEFAULT_TRANSITION_PARAMS, flight_touch_radius_m=0.0)
-        out, rolled = hold_through_flight(self.codes, self.dist, self.valid, params=params)
-        self.assertEqual(rolled, 0)
+    def test_release_needs_the_player_clearly_at_the_feet(self):
+        self.speed[191:] = 15.0
+        self.dist[190, A] = 3.0  # three metres: not at the feet
+        out, changed = self.run_rule()
+        self.assertEqual(changed, 0)
         self.assertTrue((out == self.codes).all())
 
-    def test_a_spell_after_deadness_is_left_alone(self):
+    def test_a_live_speed_ball_is_not_a_trap(self):
+        self.speed[195:] = 15.0  # the ball is rolling at live speed
+        self.near_contact(A, 195, 205)  # a player shadows it, but it was never at rest
+        out, changed = self.run_rule()
+        self.assertEqual(changed, 0)
+        self.assertTrue((out == self.codes).all())
+
+    def test_unseen_ball_is_not_judged(self):
         codes = self.codes.copy()
-        codes[100:200] = D
-        out, rolled = hold_through_flight(codes, self.dist, self.valid)
-        self.assertEqual(rolled, 0)
+        codes[200:] = A  # one A spell to 299
+        self.valid[200:] = False
+        self.near_contact(A, 195, 198)
+        out, changed = self.run_rule(codes)
+        self.assertEqual(changed, 0)
         self.assertTrue((out == codes).all())
 
+    def test_spell_after_deadness_inherits_the_play_before_it(self):
+        codes = self.codes.copy()
+        codes[100:200] = D
+        self.near_contact(A, 95, 98)  # Athletic took the ball just before it went blind
+        out, changed = self.run_rule(codes)
+        self.assertTrue((out[:100] == H).all())
+        self.assertTrue((out[100:200] == D).all())  # the stoppage itself is not judged
+        self.assertTrue((out[200:] == A).all())
+        self.assertEqual(changed, 100)
 
+    def test_spell_after_deadness_without_recent_play_is_left_alone(self):
+        codes = np.full(self.n, D, dtype=np.int8)
+        codes[:50] = A
+        codes[100:] = H
+        self.near_contact(A, 10, 13)  # played, but older than the dead run plus lookback
+        out, changed = self.run_rule(codes)
+        self.assertTrue((out[:50] == A).all())
+        self.assertTrue((out[50:100] == D).all())
+        self.assertTrue((out[100:] == H).all())  # no play in reach: the decode stands
+        self.assertEqual(changed, 0)
+
+    def test_deadness_suppresses_kinematic_anchors_but_not_witnessed_events(self):
+        codes = np.full(self.n, D, dtype=np.int8)
+        codes[:50] = A
+        codes[100:] = H
+        dead = np.zeros(self.n, dtype=bool)
+        dead[50:100] = True
+        self.near_contact(A, 70, 73)  # inside the stoppage: not play
+        out, changed = self.run_rule(codes, dead=dead)
+        self.assertEqual(changed, 0)  # the suppressed contact leaves no anchor at all
+        event = TransitionEvent(start=99, frame=99, kind="kick", team=A, distance=1.0, support=0.2)
+        out, changed = self.run_rule(codes, dead=dead, events=[event])  # the taken restart
+        self.assertTrue((out[100:] == A).all())
+        self.assertEqual(changed, 200)
+
+    def test_anchor_older_than_the_rollback_window_does_not_count(self):
+        n = 1000
+        codes = np.full(n, D, dtype=np.int8)
+        codes[:50] = A
+        codes[900:] = H
+        dist = np.full((n, 2), 10.0)
+        dist[100:103, A] = 1.0  # inside the stoppage, 800 frames before the spell
+        speed = np.zeros(n)
+        valid = np.ones(n, dtype=bool)
+        out, changed = hold_through_flight(codes, dist, valid, speed)
+        self.assertTrue((out[900:] == H).all())  # the old play is out of reach: the decode stands
+        self.assertEqual(changed, 0)
+        dist = np.full((n, 2), 10.0)
+        dist[200:203, A] = 1.0  # inside the window: the spell follows it
+        out, changed = hold_through_flight(codes, dist, valid, speed)
+        self.assertTrue((out[900:] == A).all())
+        self.assertEqual(changed, 100)
+
+    def test_half_clips_the_lookback_window(self):
+        codes = np.full(self.n, D, dtype=np.int8)
+        codes[:100] = A
+        codes[120:] = A
+        self.near_contact(A, 90, 93)  # before the second half begins
+        halves = ((0, 100), (120, self.n))
+        out, changed = hold_through_flight(codes, self.dist, self.valid, self.speed, (), halves)
+        self.assertEqual(changed, 0)  # the play before the restart cannot cross it
+        self.assertTrue((out == codes).all())
+
+    def test_rule_can_be_disabled(self):
+        self.near_contact(A, 195, 198)
+        out, changed = self.run_rule(params=replace(DEFAULT_TRANSITION_PARAMS, flight_max_rollback_frames=0))
+        self.assertEqual(changed, 0)
+        self.assertTrue((out == self.codes).all())
+
+
+class ReleaseTests(unittest.TestCase):
+    """A release: the ball leaves the foot — a kick, a punt, a clearance."""
+
+    def test_release_needs_a_slow_start_and_a_real_speed(self):
+        speed = np.array([0.0, 5.0, 15.0, 20.0, 18.0, 18.0])
+        mask = ball_release_mask(speed, gain=6.0, min_speed=8.0, max_speed=32.0, window_frames=3)
+        self.assertTrue(mask[0] and mask[1])
+        self.assertFalse(mask[2:] .any())
+
+    def test_release_rejects_detector_jumps_and_gentle_moves(self):
+        jump = ball_release_mask(np.array([0.0, 40.0, 40.0]), gain=6.0, min_speed=8.0, max_speed=32.0, window_frames=3)
+        self.assertFalse(jump.any())  # 40 m/s is a jump, not a foot
+        gentle = ball_release_mask(np.array([5.0, 6.0, 6.5, 10.0]), gain=6.0, min_speed=8.0, max_speed=32.0, window_frames=3)
+        self.assertFalse(gentle.any())  # the peak stays under live speed: the ball rolling on
+
+    def test_release_never_fires_on_a_lost_ball(self):
+        speed = np.array([np.nan, 15.0, 15.0])
+        self.assertFalse(ball_release_mask(speed, gain=6.0, min_speed=8.0, max_speed=32.0, window_frames=3).any())
+class RestOwnershipTests(unittest.TestCase):
+    """A stopped, seen ball belongs to the player clearly nearest to it."""
+
+    def setUp(self):
+        self.n = 100
+        self.codes = np.full(self.n, D, dtype=np.int8)
+        self.dist = np.full((self.n, 2), 10.0)
+        self.speed = np.zeros(self.n)
+        self.valid = np.ones(self.n, dtype=bool)
+        self.dead = np.zeros(self.n, dtype=bool)
+        self.consensus = np.full((self.n, 2), 50.0)
+
+    def rule(self, **kw):
+        return rest_ownership(
+            self.codes, self.dist, self.speed, self.valid, self.dead, self.consensus,
+            halves=kw.get("halves"), pitch=kw.get("pitch"),
+            params=kw.get("params", DEFAULT_TRANSITION_PARAMS),
+        )
+
+    def test_resting_ball_goes_to_the_nearest_team(self):
+        self.dist[:, H] = 2.0  # a home player two metres from the dead ball
+        out, changed = self.rule()
+        self.assertTrue((out == H).all())
+        self.assertEqual(changed, self.n)
+
+    def test_player_on_the_ball_is_ownership_even_in_a_scramble(self):
+        # on-ball clause: a foot within half a metre and a metre ahead of the
+        # opponent — the clear-stop clause (8 m of margin) does not apply here
+        self.dist[:, H] = 0.4
+        self.dist[:, A] = 1.6
+        out, changed = self.rule()
+        self.assertTrue((out == H).all())
+        self.assertEqual(changed, self.n)
+
+    def test_on_the_ball_needs_a_clear_foot(self):
+        self.dist[:, H] = 0.4
+        self.dist[:, A] = 1.2  # eighty centimetres ahead: contested, not a foot
+        out, changed = self.rule()
+        self.assertEqual(changed, 0)
+        self.assertTrue((out == D).all())
+
+    def test_contested_ball_is_left_alone(self):
+        self.dist[:, H] = 2.0
+        self.dist[:, A] = 3.0  # one metre apart: nobody clearly nearest
+        out, changed = self.rule()
+        self.assertEqual(changed, 0)
+        self.assertTrue((out == D).all())
+
+    def test_player_passing_by_is_not_ownership(self):
+        self.dist[50:58, H] = 2.0  # eight frames: a walk-past, not a setup
+        out, changed = self.rule()
+        self.assertEqual(changed, 0)
+        self.assertTrue((out == D).all())
+
+    def test_speed_blip_inside_the_rest_run_is_bridged(self):
+        self.dist[:, H] = 2.0
+        self.speed[60:63] = 5.0  # three frames of tracker noise
+        out, changed = self.rule()
+        self.assertTrue((out == H).all())
+        self.assertEqual(changed, self.n)
+
+    def test_speed_run_is_not_bridged(self):
+        self.dist[:, H] = 2.0
+        self.speed[60:65] = 5.0  # five frames: the ball really moved
+        out, changed = self.rule()
+        self.assertTrue((out[:60] == H).all())
+        self.assertTrue((out[60:65] == D).all())
+        self.assertTrue((out[65:] == H).all())
+        self.assertEqual(changed, self.n - 5)
+
+    def test_dead_or_unseen_ball_is_not_judged(self):
+        self.dist[:, H] = 2.0
+        self.dead[:] = True
+        out, changed = self.rule()
+        self.assertEqual(changed, 0)
+        self.dead[:] = False
+        self.valid[:] = False
+        out, changed = self.rule()
+        self.assertEqual(changed, 0)
+        self.assertTrue((out == D).all())
+
+    def test_out_of_bounds_ball_is_not_judged(self):
+        self.dist[:, H] = 2.0
+        self.consensus[:, 0] = -5.0  # well past the touchline
+        out, changed = self.rule(pitch=(105.0, 68.0))
+        self.assertEqual(changed, 0)
+        self.assertTrue((out == D).all())
 class TeamDistancesTests(unittest.TestCase):
     def test_per_team_minimum_distance(self):
         n = 4
@@ -488,7 +690,11 @@ class EndToEndTests(unittest.TestCase):
         self.assertGreaterEqual(len(result.events), 1)
         self.assertTrue(any(e.kind == "kick" and e.team == H for e in result.events))
         self.assertTrue((result.codes[kick_at : kick_at + 25] == H).all())
-        self.assertTrue((result.codes[:30] == A).all())  # before the control phase begins
+        # the ball dries at 1 m/s straight into the home player while the chase is
+        # 15 m away: a dead ball this close is his even before the fused pool
+        # catches up (a direct observation outranks the decode's memory)
+        self.assertEqual(result.codes[0], A)  # frame zero has no ball speed: no verdict
+        self.assertTrue((result.codes[1:kick_at] == H).all())
         rows = events_to_rows(result.events)
         self.assertEqual(rows.shape[1], 6)
 
