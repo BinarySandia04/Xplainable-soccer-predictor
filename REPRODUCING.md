@@ -149,14 +149,30 @@ any ground truth — and they run in this order:
    the clear stop (within 5 m with the opponent 8 m further), sustained for
    at least 0.4 s. A rest run overwrites any decode, `D` included: the ball
    is seen, stopped and owned, so there is no stoppage to remember.
+7. **A stoppage ends where the restart is witnessed** (`restart_ownership`) —
+   the smart tags name the *where* of each Kick Off / Throw-in window; the
+   ball's own streams name the *when* and the players the *who*. A kickoff
+   restarts when the dedicated ball detector locks the kicked ball
+   (confidence at least 0.5, held 3 frames); a throw-in restarts when the
+   ball crosses back in bounds at throw speed (at least 6 m/s within 6
+   frames of the crossing). The restart team is the nearest present player
+   at the ball (kicker within 1.5 m, thrower within 2.5 m, at least 1 m
+   ahead of the nearest opponent). Only then does it paint: the frames
+   before the restart are `D` — the ball is not in play yet — and from the
+   restart frame the attributed team owns play across `D`/`X` frames until
+   the decode's own evidence reasserts itself (a team label, or the ball
+   lost / off the pitch), never over a decoded possession. A restart
+   neither witnessed nor attributed paints nothing: the tag is a stoppage,
+   not a play.
 
 The run's own count line (all 199,319 frames):
 
 > 194 kicks + 23 onsets detected, 523 contacts + 239 win-and-clear kicks + 10
 > keeper holds + 60 area catches from boxes, 2 spell expiries, 0 touch
 > takeovers + 2934 rest balls owned, 5671 flight ownership fixes, 1001 gated
-> out -> 103 transition events; 93,739 frames of lost/out-of-bounds ball
-> marked D; 641 frames revived by live tags, 487 by a player at the ball.
+> out -> 120 transition events; 59,606 frames of lost/out-of-bounds ball
+> marked D; 641 frames revived by live tags, 487 by a player at the ball,
+> 1,033 owned by witnessed restarts.
 
 Against the public 5-minute window (`evaluation/run_evaluation.py`, 7,500
 graded frames): **spellF1 0.7600, macroF1 0.9695, accuracy 0.9675**.
@@ -169,9 +185,9 @@ graded frames): **spellF1 0.7600, macroF1 0.9695, accuracy 0.9675**.
 |---|---|
 | `possession_lab/outputs/perception_new_fixed.npz` | `9d63f358c035fba6e80ca959f913ce90d3cae34f5e8115e221158dd2d7465bf1` |
 | `possession_lab/outputs/fusion.npz` | `fb11ccb7f8e91d5dc79c2bf23f4f7445af4bf846b61c787e682576d2c9354117` |
-| `possession_lab/outputs/transition_predictions.csv` | `2abf87ff5f177e7973b8830d7c51b952b8d59c02c64031f57bc85b04136c6a2e` |
-| `possession_lab/outputs/transition_events.csv` | `aec400824a33c1c6ffa873ec9850fc25fb1364fbbadffb051b56d6036927977c` |
-| `possession_lab/outputs/fusion_transitioned.npz` | `794ff1fea201b441042b5927cf2908fe22f9250a87bb48ea0e347e21f3dcb9a5` |
+| `possession_lab/outputs/transition_predictions.csv` | `510230ed791ae10d98e74ac2702d0e2a14b36fb97c2fdb4d865c808e41ab2ec4` |
+| `possession_lab/outputs/transition_events.csv` | `fb34e75e897555630ede8349accfdfaffb5cb390650004e3e3d68607f2955843` |
+| `possession_lab/outputs/fusion_transitioned.npz` | `8ba0b22a8d1114feb3e51d8c7a5d701dcd194528252a5395574c2c41cdadc1f2` |
 
 `explanations.json` (step 5) is derived from the predictions; its checksum
 follows the one above.
