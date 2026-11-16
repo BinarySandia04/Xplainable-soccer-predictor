@@ -11,7 +11,7 @@ labels `H` / `A` / `D` / `X`. Upload it named `<team_name>.csv`.
 ```bash
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt        # CPU inference for fusion/transitions
-.venv/bin/python -m pytest possession_lab -q     # 347 passed (+4 subtests)
+.venv/bin/python -m pytest possession_lab -q     # 359 passed (+4 subtests)
 ```
 
 The match data lives in `data/` (tactical video, tracking, homography, ATD, smart tags).
@@ -167,12 +167,12 @@ any ground truth — and they run in this order:
 
 The run's own count line (all 199,319 frames):
 
-> 194 kicks + 23 onsets detected, 523 contacts + 239 win-and-clear kicks + 10
+> 194 kicks + 23 onsets detected, 523 contacts + 327 win-and-clear kicks + 10
 > keeper holds + 60 area catches from boxes, 2 spell expiries, 0 touch
-> takeovers + 2934 rest balls owned, 5671 flight ownership fixes, 1001 gated
-> out -> 120 transition events; 59,606 frames of lost/out-of-bounds ball
+> takeovers + 2934 rest balls owned, 5681 flight ownership fixes, 1086 gated
+> out -> 123 transition events; 59,606 frames of lost/out-of-bounds ball
 > marked D; 641 frames revived by live tags, 487 by a player at the ball,
-> 1,033 owned by witnessed restarts.
+> 1,041 owned by witnessed restarts.
 
 Against the public 5-minute window (`evaluation/run_evaluation.py`, 7,500
 graded frames): **spellF1 0.7600, macroF1 0.9695, accuracy 0.9675**.
@@ -185,9 +185,9 @@ graded frames): **spellF1 0.7600, macroF1 0.9695, accuracy 0.9675**.
 |---|---|
 | `possession_lab/outputs/perception_new_fixed.npz` | `9d63f358c035fba6e80ca959f913ce90d3cae34f5e8115e221158dd2d7465bf1` |
 | `possession_lab/outputs/fusion.npz` | `fb11ccb7f8e91d5dc79c2bf23f4f7445af4bf846b61c787e682576d2c9354117` |
-| `possession_lab/outputs/transition_predictions.csv` | `510230ed791ae10d98e74ac2702d0e2a14b36fb97c2fdb4d865c808e41ab2ec4` |
-| `possession_lab/outputs/transition_events.csv` | `fb34e75e897555630ede8349accfdfaffb5cb390650004e3e3d68607f2955843` |
-| `possession_lab/outputs/fusion_transitioned.npz` | `8ba0b22a8d1114feb3e51d8c7a5d701dcd194528252a5395574c2c41cdadc1f2` |
+| `possession_lab/outputs/transition_predictions.csv` | `28cebf28a5cc77ee25af5e6063f163c0711c58f24119ca3c949097cba0f9eba2` |
+| `possession_lab/outputs/transition_events.csv` | `41be3f65ee3fb7439f3fb6af81de7f50480fba18cecbae6e2e54f96e9ee3cd1b` |
+| `possession_lab/outputs/fusion_transitioned.npz` | `b469eae7efe735c4d257d4f461aee2193ac93250d71989fd65577076e9a190ea` |
 
 `explanations.json` (step 5) is derived from the predictions; its checksum
 follows the one above.

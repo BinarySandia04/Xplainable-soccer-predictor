@@ -118,7 +118,8 @@ class TransitionParams:
     # more than a frame or two of a genuine take)
     contact_speed_max: float = 12.0  # m/s; control means a slow ball, not a deflection
     kicker_slow_max: float = 7.0  # m/s at the close frame: the ball starts slow ...
-    kicker_leave_speed: float = 9.0  # ... and reaches this within 3 frames: released
+    kicker_leave_speed: float = 9.0  # ... and reaches this within 4 frames (0.16 s, the
+    # physical ceiling of a single first touch): released
     kicker_release_max: float = 35.0  # above this the track jumped: artifact, not a kick
     kicker_close_px: float = 20.0  # ball-to-nearest-box-foot distance that counts as feet
     kicker_dominance_px: float = 25.0  # the other team's nearest foot must be this further
@@ -636,17 +637,19 @@ def detect_kicker_events(
     ``speed <= kicker_slow_max``), that team clearly owns the ball there (the other
     team's nearest foot is ``kicker_dominance_px`` further away), the team's touch band
     fires within ``[-2, kicker_touch_window]`` frames of the release, and the ball is
-    then put in flight (reaches ``kicker_leave_speed`` within 3 frames while the
-    distance to that team's boxes grows by ``kicker_leave_px``).  Attribution goes to
-    the side that released the ball even when the homography track shows no player near
-    it — the winner touches the ball before any receiver enters the pitch attribution
-    radius.
+    then put in flight (reaches ``kicker_leave_speed`` within 4 frames — 0.16 s, the
+    physical ceiling of a single first touch: a shot arrives in one or two frames, a
+    cushioned first-touch pass in up to four, and anything later is a second touch —
+    while the distance to that team's boxes grows by ``kicker_leave_px``).  Attribution
+    goes to the side that released the ball even when the homography track shows no
+    player near it — the winner touches the ball before any receiver enters the pitch
+    attribution radius.
     """
     dist = _box_foot_distance(evidence)
     n = speed.shape[0]
     events: list[tuple[int, float, int, float, float]] = []
     tail_max = np.full(n, np.nan)
-    for o in (1, 2, 3):
+    for o in (1, 2, 3, 4):  # 0.16 s: the single-first-touch ceiling (see docstring)
         s = np.full(n, np.nan)
         s[:-o] = speed[o:]
         tail_max = np.fmax(tail_max, s)
