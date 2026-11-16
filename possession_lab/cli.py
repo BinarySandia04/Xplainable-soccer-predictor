@@ -895,7 +895,8 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         (15766, 15799, 0),        # Interception: Barca box touch
         (19408, 19700, _D_CODE),  # Case 1: throw-in release at 19700 (dead until release)
         (19990, 20015, 1),        # Case 2: short throw-in turnover to Athletic
-        (21290, 21320, 0),        # Case 3: ball stayed in play along touchline (Barca)
+        (21282, 21609, 0),        # Case 3: ball stayed in play along touchline; continuous Barca passing until actual out at 21609
+        (21609, 21693, _D_CODE),  # Case 3: ball out of bounds preparing throw-in until release at 21693
         (23871, 24078, 0),        # Case 4: keeper save & hold (Barca)
         (25365, 25378, 1),        # Case 5: ball in play for Athletic until crossing at 25378
         (26676, 26730, 1),        # Case 6: keeper save & gathering (Athletic)
