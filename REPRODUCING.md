@@ -11,7 +11,7 @@ labels `H` / `A` / `D` / `X`. Upload it named `<team_name>.csv`.
 ```bash
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt        # CPU inference for fusion/transitions
-.venv/bin/python -m pytest possession_lab -q     # 359 passed (+4 subtests)
+.venv/bin/python -m pytest possession_lab -q     # 373 passed (+4 subtests)
 ```
 
 The match data lives in `data/` (tactical video, tracking, homography, ATD, smart tags).
@@ -164,15 +164,36 @@ any ground truth — and they run in this order:
    lost / off the pitch), never over a decoded possession. A restart
    neither witnessed nor attributed paints nothing: the tag is a stoppage,
    not a play.
+8. **A keeper gathering the ball in his own area** (`keeper_area_catches`) —
+   the pixel channel is blind right by the goal, where depth compresses the
+   boxes, so the pitch geometry reads the catch: the ball decelerates from
+   flight speed to a stop inside the penalty area it defends, with no opponent
+   near, and the catch belongs to the defending side from the kick that fed it.
+   The arrival must be a pass, not a tracker spike: at least two of the 40
+   frames before the stop must show the ball at or above 8 m/s — a single fast
+   frame is a one-frame jitter over a slow roll (measured 129 415). Where the
+   raw voter pool is available, it must back the catcher by a 0.25 mean margin:
+   a ball dying in the area with the voters neutral is a conceded goal, not a
+   gathering (measured 11 598).
+9. **A keeper clearing a ball he held while the fusion went blind**
+   (`blind_keeper_clearances`) — the fused ball is dark (absent, or confidence
+   below 0.5) for at least a second, then reappears inside the defended area
+   with the attributed defender on the ball (within 1.5 m) and the opponent
+   clear (2.0 m or more), and leaves again as a downfield punt: at least
+   10 m/s within 40 frames, gaining at least 5 m away from the goal. A shot
+   moves into the goal, a contested ball has the opponent close, a dead ball
+   or a tagged goal sequence is no clearance at all — so none of them fire.
+   Measured 69 405: blind 69 116-69 404, back at (7.4, 35.3) with the keeper
+   0.4 m from it, the punt building to 20.6 m/s.
 
 The run's own count line (all 199,319 frames):
 
-> 194 kicks + 23 onsets detected, 523 contacts + 327 win-and-clear kicks + 10
-> keeper holds + 60 area catches from boxes, 2 spell expiries, 0 touch
-> takeovers + 2934 rest balls owned, 5681 flight ownership fixes, 1086 gated
-> out -> 123 transition events; 59,606 frames of lost/out-of-bounds ball
-> marked D; 641 frames revived by live tags, 487 by a player at the ball,
-> 1,041 owned by witnessed restarts.
+> 194 kicks + 23 onsets detected, 521 contacts + 327 win-and-clear kicks + 10
+> keeper holds + 50 area catches from boxes + 3 blind keeper clearances,
+> 3 spell expiries, 0 touch takeovers + 3024 rest balls owned, 5701 flight
+> ownership fixes, 1083 gated out -> 117 transition events; 59,606 frames of
+> lost/out-of-bounds ball marked D; 641 frames revived by live tags, 487 by a
+> player at the ball, 1,041 owned by witnessed restarts.
 
 Against the public 5-minute window (`evaluation/run_evaluation.py`, 7,500
 graded frames): **spellF1 0.7600, macroF1 0.9695, accuracy 0.9675**.
@@ -184,10 +205,10 @@ graded frames): **spellF1 0.7600, macroF1 0.9695, accuracy 0.9675**.
 | artefact | SHA-256 |
 |---|---|
 | `possession_lab/outputs/perception_new_fixed.npz` | `9d63f358c035fba6e80ca959f913ce90d3cae34f5e8115e221158dd2d7465bf1` |
-| `possession_lab/outputs/fusion.npz` | `fb11ccb7f8e91d5dc79c2bf23f4f7445af4bf846b61c787e682576d2c9354117` |
-| `possession_lab/outputs/transition_predictions.csv` | `28cebf28a5cc77ee25af5e6063f163c0711c58f24119ca3c949097cba0f9eba2` |
-| `possession_lab/outputs/transition_events.csv` | `41be3f65ee3fb7439f3fb6af81de7f50480fba18cecbae6e2e54f96e9ee3cd1b` |
-| `possession_lab/outputs/fusion_transitioned.npz` | `b469eae7efe735c4d257d4f461aee2193ac93250d71989fd65577076e9a190ea` |
+| `possession_lab/outputs/fusion.npz` | `765317256cd7ec1dc0d8f57624c30b84436a88b4ccf202e44c8d17bb818cbf31` |
+| `possession_lab/outputs/transition_predictions.csv` | `9b9232ee1f2be89e7a8112daf22f843ed4bedfe22cb1d1b57f8361f2310da520` |
+| `possession_lab/outputs/transition_events.csv` | `c02736ceb06356499f457c41416ae77ede3cf0b8e0c48595ae4921da5cb36d49` |
+| `possession_lab/outputs/fusion_transitioned.npz` | `51e00a945bbf37aa91907fd51e388c27b2751fd3a6a344d9a37771ac487bdb5d` |
 
 `explanations.json` (step 5) is derived from the predictions; its checksum
 follows the one above.
