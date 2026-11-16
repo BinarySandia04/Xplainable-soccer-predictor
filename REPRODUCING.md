@@ -11,7 +11,7 @@ labels `H` / `A` / `D` / `X`. Upload it named `<team_name>.csv`.
 ```bash
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt        # CPU inference for fusion/transitions
-.venv/bin/python -m pytest possession_lab -q     # 373 passed (+4 subtests)
+.venv/bin/python -m pytest possession_lab -q     # 384 passed (+4 subtests)
 ```
 
 The match data lives in `data/` (tactical video, tracking, homography, ATD, smart tags).
@@ -185,6 +185,29 @@ any ground truth — and they run in this order:
    or a tagged goal sequence is no clearance at all — so none of them fire.
    Measured 69 405: blind 69 116-69 404, back at (7.4, 35.3) with the keeper
    0.4 m from it, the punt building to 20.6 m/s.
+10. **A blind hand-over waits for the touch** (`snap_blind_handovers`) —
+    **implemented but off by default** (`blind_handover_max_shift_frames = 0`).
+    A team-to-team change made while the incoming side has nobody within
+    1.5 m of the ball cannot be a touch: with the ball in flight the distance
+    kernel is symmetric and the boundary is a ~1e-5 emission residual, not a
+    play. The rule moves such a boundary forward to the first frame of the
+    new spell where the incoming side reaches a controllable ball (within
+    1.5 m at 6 m/s or less), capped at 10 s; a change at the feet, an unseen
+    ball, dead frames and `D`/`X` transitions are never rewritten.
+
+    It is off because the public annotation does **not** wait for the touch:
+    in the four public-window cases the GT boundary sits 3-55 frames from the
+    decode's and 34-109 frames before the first tracked control, so enabling
+    it costs 0.04 spellF1 (0.7600 -> 0.7200, 14/17 -> 11/17 spells). The case
+    that motivated it is frame 38 497 (H 38 417-38 498 -> A 38 499): the ball
+    leaves an H player's feet at 38 486 at 16.5 m/s and Athletic's first
+    control is 38 596, so the A spell runs 97 frames with no A player within
+    5.9 m. The likely reason the GT changes earlier is that a player's tracked
+    position is the **body centre** (a real touch can be 2-3 m away) and the
+    ATD has detection gaps (the Barcelona keeper is out of frame at 38 497,
+    projected to pixel x = -350), so "nobody is near" does not prove "nobody
+    touched it". To continue the experiment, set the parameter to 250 and see
+    `reports/blind_handover_experiment.md` for the measured cases.
 
 The run's own count line (all 199,319 frames):
 

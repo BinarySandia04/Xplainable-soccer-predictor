@@ -817,6 +817,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         "events_total": int(len(result.events)),
         "events_detected": {"kicks": result.n_kicks, "onsets": result.n_onsets},
         "events_gated_out": result.n_gated_out,
+        "blind_handovers_frames": result.n_blind,
         "evidence_keys": evidence_keys,
         "validation": validate_codes(result.codes),
         "full_match": full_match_stats(result.codes),
@@ -824,7 +825,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     _json(output_dir / "transition_metrics_public.json", report)
     print(
         "transitions: spellF1 {:.4f} | macroF1 {:.4f} | accuracy {:.4f} | events {} "
-        "(kicks {} onsets {}, gated out {})".format(
+        "(kicks {} onsets {}, gated out {}, blind handovers {})".format(
             metrics["spell_f1_mean"],
             metrics["macro_f1"],
             metrics["accuracy"],
@@ -832,6 +833,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
             result.n_kicks,
             result.n_onsets,
             result.n_gated_out,
+            result.n_blind,
         )
     )
     print(

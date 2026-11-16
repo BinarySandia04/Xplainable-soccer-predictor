@@ -286,6 +286,22 @@ class TransitionParams:
     rest_trap_min_run: int = 3  # frames of near contact before the trap counts
     rest_trap_prior_frames: int = 6  # window the ball's prior speed is read from
     rest_trap_prior_speed_m: float = 1.5  # m/s: the ball was (nearly) at rest before
+    # a blind hand-over: a team-to-team change made while the incoming side has nobody
+    # within touching distance is not a play, it is the decode guessing inside a flight.
+    # The distance kernel is symmetric there, so the boundary is a residual of the
+    # emission, not a touch (measured 38 499: H->A at 16.5 m/s with the ball 6.3 m from
+    # every player; Athletic's first control is 38 596, so the spell ran 97 frames — 3.9 s
+    # — before any Athletic player could have touched the ball).
+    #
+    # OFF by default.  The public annotation changes possession *during* the flight: in
+    # the four public-window cases the GT boundary sits 3-55 frames from the decode's and
+    # 34-109 frames before the first tracked control, so waiting for that control costs
+    # 0.04 spellF1 (0.7600 -> 0.7200, 14/17 -> 11/17 spells).  Set
+    # ``blind_handover_max_shift_frames`` to 250 to run the experiment.
+    blind_handover_dist_m: float = 1.5  # m: incoming side this close at the change = a play
+    blind_handover_control_m: float = 1.5  # m: where the incoming side must reach the ball
+    blind_handover_control_speed_m: float = 6.0  # m/s: with the ball controllable, not a fly-by
+    blind_handover_max_shift_frames: int = 0  # 0 disables; 250 (10 s) is the tested cap
     # -- rest ownership: a ball that is stopped, seen and in play belongs to the team with
     # the player clearly at its feet — a restart being set, a ball left on the foot — not
     # the decode's memory of who had the ball before the stoppage (measured 122 877: the
@@ -373,6 +389,7 @@ class TransitionLayerResult:
     n_touched: int = 0
     n_restart: int = 0
     n_clearance: int = 0
+    n_blind: int = 0
 
 
 # --------------------------------------------------------------------------- ball kinematics
@@ -2452,6 +2469,87 @@ def hold_through_flight(
     return out, changed
 
 
+def snap_blind_handovers(
+    codes: np.ndarray,
+    distances: np.ndarray,
+    ball_valid: np.ndarray,
+    speed: np.ndarray,
+    halves: tuple[tuple[int, int], ...] | None = None,
+    event_dead: np.ndarray | None = None,
+    params: TransitionParams = DEFAULT_TRANSITION_PARAMS,
+) -> tuple[np.ndarray, int]:
+    """Move a blind team-to-team hand-over to the first real touch.
+
+    ``distances`` is :func:`team_distances` (min ball distance per team, column 0
+    home, column 1 away, ``inf`` where unseen).  The team emission is a distance
+    kernel: while the ball is flying between players, or over their heads, every
+    state fits equally well and the exact boundary is decided by a vanishing
+    residual, not by a play.  A hand-over whose incoming side has nobody within
+    ``blind_handover_dist_m`` of the ball is exactly that: that team cannot have
+    touched it yet.
+
+    Such a change is moved forward to the first frame inside the new spell where
+    the incoming side reaches the ball (``blind_handover_control_m`` at or below
+    ``blind_handover_control_speed_m``), never further than
+    ``blind_handover_max_shift_frames``.  A hand-over at the incoming side's feet
+    is a real play and is left alone; so is a spell with no witnessed control
+    (the decode's verdict stands — nothing is invented), a change where the ball
+    is unseen, and any change into or out of deadness.  Dead frames are never
+    rewritten.  Returns the codes and the number of frames re-labelled.
+
+    The rule is off by default: ``blind_handover_max_shift_frames`` is 0, because
+    the public annotation changes possession during the flight.  The experiment is
+    documented in ``REPRODUCING.md`` and costs 0.04 spellF1 when enabled.
+    """
+    out = np.asarray(codes).copy()
+    n = out.size
+    dist = np.asarray(distances, dtype=np.float64)
+    if dist.shape != (n, 2):
+        raise ValueError("distances must have shape (n, 2)")
+    if n == 0 or params.blind_handover_max_shift_frames <= 0:
+        return out, 0
+    valid = np.asarray(ball_valid, dtype=bool)
+    dead = np.zeros(n, dtype=bool) if event_dead is None else np.asarray(event_dead, dtype=bool)
+    sp = np.asarray(speed, dtype=np.float64)
+    starts = np.flatnonzero(np.r_[True, out[1:] != out[:-1]])
+    ends = np.r_[starts[1:], n]
+    changed = 0
+    for a, b in zip(starts.tolist(), ends.tolist()):
+        team = int(out[a])
+        if a == 0 or team not in (H, 1):
+            continue
+        prev = int(out[a - 1])
+        if prev not in (H, 1) or prev == team:
+            continue
+        if not valid[a] or dead[a]:
+            continue
+        if dist[a, team] <= float(params.blind_handover_dist_m):
+            continue  # the incoming side is at the ball: a play, not a guess
+        hi = b
+        if halves is not None:
+            for start_h, stop_h in halves:
+                if start_h <= a < stop_h:
+                    hi = min(hi, stop_h)
+                    break
+        hi = min(hi, a + int(params.blind_handover_max_shift_frames) + 1)
+        reach = (
+            valid[a:hi]
+            & ~dead[a:hi]
+            & (dist[a:hi, team] <= float(params.blind_handover_control_m))
+            & np.isfinite(sp[a:hi])
+            & (sp[a:hi] <= float(params.blind_handover_control_speed_m))
+        )
+        hit = np.flatnonzero(reach)
+        if hit.size == 0:
+            continue
+        target = a + int(hit[0])
+        if target == a:
+            continue
+        out[a:target] = prev
+        changed += target - a
+    return out, changed
+
+
 def rest_ownership(
     codes: np.ndarray,
     distances: np.ndarray,
@@ -2928,6 +3026,15 @@ def apply_transition_layer(
         keeper_pitch,
         params,
     )
+    codes, n_blind = snap_blind_handovers(
+        codes,
+        dists,
+        valid,
+        speed,
+        active,
+        np.asarray(event_dead, dtype=bool),
+        params,
+    )
     n_rest = 0
     if params.rest_radius_m > 0:
         # a stopped, seen ball belongs to the team at its feet
@@ -2979,6 +3086,7 @@ def apply_transition_layer(
         n_touched=n_touched,
         n_restart=n_restart,
         n_clearance=n_clearance,
+        n_blind=n_blind,
     )
 
 
@@ -3019,6 +3127,7 @@ __all__ = [
     "gate_pixel_events",
     "hold_touch_through",
     "hold_through_flight",
+    "snap_blind_handovers",
     "keeper_area_catches",
     "keeper_holds",
     "KeeperHold",
