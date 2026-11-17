@@ -395,7 +395,9 @@
                 : `PARADA · ${event.trigger} · ${formatFrame(event.start)}–${formatFrame(event.end)}${
                     event.restart === null || event.restart === undefined
                       ? ""
-                      : ` · saque ${formatFrame(event.restart)}`
+                      : ` · ${
+                          event.restart_failed === true ? "saque fallido" : "saque"
+                        } ${formatFrame(event.restart)}`
                   }`,
             )
             .join(" · ");
@@ -1323,10 +1325,15 @@
           ctx.fillStyle = "rgba(255,200,87,0.6)";
           ctx.fillRect(end - 1.5, height - 4, 3, 4);
         }
-        const kick =
-          event.restart === null || event.restart === undefined ? null : xOf(event.restart);
+        const hasRestart = event.restart !== null && event.restart !== undefined;
+        const failed = hasRestart && event.restart_failed === true;
+        const kick = hasRestart ? xOf(event.restart) : null;
         if (kick !== null && kick >= 0 && kick <= width) {
-          ctx.strokeStyle = "rgba(140,214,255,0.35)";
+          // A restart whose ball went back out almost immediately is a failed throw (amber,
+          // crossed diamond), not a resume (green diamond).
+          const line = failed ? "rgba(251,191,36,0.40)" : "rgba(78,230,139,0.35)";
+          const fill = failed ? "#fbbf24" : "#4ee68b";
+          ctx.strokeStyle = line;
           ctx.lineWidth = 1;
           ctx.setLineDash([1, 3]);
           ctx.beginPath();
@@ -1334,7 +1341,7 @@
           ctx.lineTo(kick + 0.5, height);
           ctx.stroke();
           ctx.setLineDash([]);
-          ctx.fillStyle = "rgba(140,214,255,0.9)";
+          ctx.fillStyle = fill;
           ctx.beginPath();
           ctx.moveTo(kick, 1);
           ctx.lineTo(kick + 3.5, 5);
@@ -1342,6 +1349,16 @@
           ctx.lineTo(kick - 3.5, 5);
           ctx.closePath();
           ctx.fill();
+          if (failed) {
+            ctx.strokeStyle = "#081018";
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(kick - 1.6, 3.4);
+            ctx.lineTo(kick + 1.6, 6.6);
+            ctx.moveTo(kick + 1.6, 3.4);
+            ctx.lineTo(kick - 1.6, 6.6);
+            ctx.stroke();
+          }
         }
       } else if (event.type === "goal") {
         const x = xOf(event.frame);

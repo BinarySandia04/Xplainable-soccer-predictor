@@ -660,6 +660,7 @@ class FrameStore:
                         "restart": (
                             None if getattr(stop, "restart", None) is None else int(stop.restart)
                         ),
+                        "restart_failed": bool(getattr(stop, "restart_failed", False)),
                     }
                 )
         return active

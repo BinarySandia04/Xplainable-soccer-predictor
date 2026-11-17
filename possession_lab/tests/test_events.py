@@ -15,6 +15,7 @@ from possession_lab.events import (
     StopEvent,
     _extend_through_lost_view,
     _merge_stop_events,
+    _restart_is_failed,
     _restart_kick,
     _run_end_containing,
     apply_event_overrides,
@@ -326,6 +327,79 @@ class RestartKickTest(unittest.TestCase):
     def test_to_dict_carries_the_restart_frame(self):
         event = StopEvent(start=10, end=50, trigger="whistle", confidence=0.8, restart=32)
         self.assertEqual(event.to_dict()["restart"], 32)
+
+    def test_to_dict_carries_the_failed_flag(self):
+        event = StopEvent(
+            start=10, end=50, trigger="out", confidence=0.9, restart=32, restart_failed=True
+        )
+        self.assertTrue(event.to_dict()["restart_failed"])
+        plain = StopEvent(start=10, end=50, trigger="out", confidence=0.9, restart=32)
+        self.assertFalse(plain.to_dict()["restart_failed"])
+
+
+class FailedRestartTest(unittest.TestCase):
+    """A restart whose ball is back out of play almost immediately is a failed throw (display)."""
+
+    def test_back_out_within_the_horizon_marks_the_restart_failed(self):
+        out = np.zeros(200, dtype=bool)
+        out[100:110] = True  # the out run that contains the restart (the throw itself)
+        out[150:170] = True  # back beyond the line 50 frames later (< 3 s)
+        self.assertTrue(_restart_is_failed(105, out, horizon=75, skip_max=25))
+
+    def test_a_ball_that_stays_in_is_not_failed(self):
+        out = np.zeros(200, dtype=bool)
+        out[100:110] = True
+        self.assertFalse(_restart_is_failed(105, out, horizon=75, skip_max=25))
+
+    def test_a_crossing_after_the_horizon_is_not_failed(self):
+        out = np.zeros(300, dtype=bool)
+        out[100:110] = True
+        out[250:270] = True  # 145 frames later (> 3 s): a normal short passage, not a failed throw
+        self.assertFalse(_restart_is_failed(105, out, horizon=75, skip_max=25))
+
+    def test_a_throw_that_never_came_in_is_failed(self):
+        out = np.zeros(200, dtype=bool)
+        out[100:190] = True  # still out far past the skip limit: the throw never entered play
+        self.assertTrue(_restart_is_failed(105, out, horizon=75, skip_max=25))
+
+    def test_failed_throw_is_flagged_end_to_end(self):
+        # Ball out, thrown back in at a player's feet (the slow-to-fast kick is the restart
+        # marker), then out again 70 frames later: the throw did not resume the match.
+        n = 500
+        x = np.full(n, 50.0, dtype=np.float32)
+        y = np.full(n, 34.0, dtype=np.float32)
+        x[100:160] = 108.0  # out beyond the line
+        x[160:260] = 10.0  # thrown back in, at player 0's feet (10, 10)
+        y[160:260] = 10.0
+        x[260:300] = 108.0  # out again 70 frames after the throw (< 3 s)
+        y[260:300] = 34.0
+        tracking = make_tracking(n, (x, y))
+        tracking.speeds[:100] = 3.0
+        features = extract_features(tracking, TagTable.empty(n))
+        features.ball_speed[190:196] = 20.0  # the throw: a still ball goes fast near the player
+        stops = detect_stoppages(tracking, TagTable.empty(n), features=features)
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0].restart, 190)
+        self.assertTrue(stops[0].restart_failed)
+
+    def test_a_restart_that_keeps_the_ball_in_is_not_failed(self):
+        # Same scene, but the second crossing is 110 frames after the throw (> 3 s horizon):
+        # the first throw-in did resume the match.
+        n = 500
+        x = np.full(n, 50.0, dtype=np.float32)
+        y = np.full(n, 34.0, dtype=np.float32)
+        x[100:160] = 108.0
+        x[300:340] = 108.0  # 110 frames after the throw: past the 3 s horizon
+        x[160:300] = 10.0
+        y[160:300] = 10.0
+        tracking = make_tracking(n, (x, y))
+        tracking.speeds[:100] = 3.0
+        features = extract_features(tracking, TagTable.empty(n))
+        features.ball_speed[190:196] = 20.0
+        stops = detect_stoppages(tracking, TagTable.empty(n), features=features)
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0].restart, 190)
+        self.assertFalse(stops[0].restart_failed)
 
 
 class LostViewStoppageTests(unittest.TestCase):

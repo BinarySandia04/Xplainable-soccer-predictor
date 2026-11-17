@@ -31,6 +31,8 @@ from .config import (
     GOAL_Y_MARGIN,
     GRADED_HALVES,
     STOP_CONTROL_R,
+    STOP_FAILED_RESTART_S,
+    STOP_FAILED_RESTART_SKIP_S,
     STOP_IN_RUN_ACTIVE_FRAMES,
     STOP_IN_RUN_BALL_SPEED,
     STOP_IN_RUN_WHISTLE_S,
@@ -88,6 +90,7 @@ class StopEvent:
     low_start: int | None = None
     low_stop: int | None = None
     restart: int | None = None
+    restart_failed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -101,6 +104,7 @@ class StopEvent:
             "low_start": None if self.low_start is None else int(self.low_start),
             "low_stop": None if self.low_stop is None else int(self.low_stop),
             "restart": None if self.restart is None else int(self.restart),
+            "restart_failed": bool(self.restart_failed),
         }
 
 
@@ -547,6 +551,32 @@ def _restart_kick(
     return None
 
 
+def _restart_is_failed(
+    restart: int,
+    out_of_play: np.ndarray,
+    horizon: int,
+    skip_max: int,
+) -> bool:
+    """True if the ball is out of play again within ``horizon`` frames after the restart.
+
+    Display metadata for the viewer: a throw whose ball is back beyond the line almost immediately
+    did not resume the match, so the marker is drawn as a failed throw, not a resume.  Up to
+    ``skip_max`` frames of out-of-play right at the restart are the throw itself (the ball leaves
+    the thrower's hand beyond the line); a new crossing inside the horizon is the failure.  No
+    stoppage interval, dead mask, or possession label depends on the result.
+    """
+    out_of_play = np.asarray(out_of_play, dtype=bool)
+    n = out_of_play.size
+    r = int(restart)
+    hi = min(n, r + int(horizon))
+    k = r
+    skipped = 0
+    while k < hi and out_of_play[k] and skipped < int(skip_max):
+        k += 1
+        skipped += 1
+    return bool(out_of_play[k:hi].any()) if k < hi else False
+
+
 def _control_resume(
     start: int,
     limit: int,
@@ -637,8 +667,15 @@ def detect_stoppages(
         if end <= start:
             return None
         kick = _restart_kick(start, end, present, ball_speed, near_distance)
-        if kick is not None and not (start < kick < end - 5):
-            kick = None
+        if kick is not None:
+            # The marker must sit strictly inside the stoppage.  When the stoppage's end is pinned
+            # to the restart itself (sustained kicked restart or control resume), the kick lands a
+            # few frames before ``end`` by construction, so the strict boundary is the right one;
+            # when the end is the plain search limit, keep a 5-frame margin so the marker does not
+            # hug a stoppage that runs straight into live play.
+            limit = end if (control is not None or restart is not None) else end - 5
+            if not (start < kick < limit):
+                kick = None
         return StopEvent(
             start=int(start),
             end=int(end),
@@ -814,7 +851,20 @@ def detect_stoppages(
     trimmed = _extend_through_lost_view(
         trimmed, np.asarray(tracking.player_present, dtype=bool).sum(axis=1), n
     )
-    return tuple(trimmed)
+    # Display-only annotation for the viewer's "saque fallido" marker: a restart whose ball is
+    # back out of play within a few seconds did not resume the match.  Measured 179 108: the
+    # first throw-in of the 178 852-179 483 stoppage, ball back beyond the line 68 frames later;
+    # the effective restart is the second throw at 179 480.  Intervals, masks, and labels stay
+    # untouched.
+    horizon = int(round(STOP_FAILED_RESTART_S * FPS))
+    skip_max = int(round(STOP_FAILED_RESTART_SKIP_S * FPS))
+    return tuple(
+        replace(event, restart_failed=True)
+        if event.restart is not None
+        and _restart_is_failed(event.restart, out_of_play, horizon, skip_max)
+        else event
+        for event in trimmed
+    )
 
 
 def build_events(
