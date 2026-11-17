@@ -1920,6 +1920,31 @@ class ApplyOffsideFreekickRestartsTests(unittest.TestCase):
         # Should not be modified
         self.assertEqual(res[20], 1)
 
+    def test_side_restart_at_touchline_is_not_a_freekick_setup(self):
+        # measured 66 030: a throw-in restart sits 0.05 m from the touchline with
+        # the ball already in flight.  It matches the "carry >= 12 m, slow down,
+        # kick again" pattern of a free-kick setup, but a setup that walks the
+        # ball that far begins well inside the pitch (measured 22.7-26.4 m from
+        # the chalk), never on it.  The rule must leave the restart alone.
+        from possession_lab.fusion.transitions import apply_offside_freekick_restarts
+
+        n = 120
+        codes = np.full(n, 2, dtype=np.int8)
+        codes[20:] = 1  # team 1 restarting from the chalk
+        ball = np.full((n, 2), 15.0)
+        ball[:20] = [15.0, 1.0]  # on the chalk: 1.0 m from the touchline
+        # ball in flight: travels >= 12 m inward
+        for f in range(20, 40):
+            ball[f] = [15.0, 1.0 + (f - 20) * 1.0]
+        # late slow patch, then a kick
+        ball[40:65] = [15.0, 21.0]
+        for f in range(65, n):
+            ball[f] = [15.0 + min(15.0, (f - 65) * 1.0), 21.0]
+
+        res = apply_offside_freekick_restarts(codes, ball, (105.0, 68.0), fps=25.0)
+        # untouched: a boundary this close to the chalk is a side-restart
+        self.assertTrue((res == codes).all())
+
 
 if __name__ == "__main__":
     unittest.main()

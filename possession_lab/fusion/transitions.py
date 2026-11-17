@@ -1340,6 +1340,7 @@ def apply_offside_freekick_restarts(
     still_speed_max: float = 0.8,
     kick_speed_min: float = 4.5,
     max_setup_frames: int = 600,
+    max_touchline_m: float = 8.0,
 ) -> np.ndarray:
     """Delay possession assignment on offside / defensive free-kick restarts until the kick is struck.
 
@@ -1349,6 +1350,14 @@ def apply_offside_freekick_restarts(
     the turf (speed < 0.8 m/s for >= 20 frames) while players set up for the indirect free kick.
     The ball remains dead (D) during this entire transit and placement phase, and only re-enters play
     when the free kick is actually struck (speed >= 4.5 m/s with significant displacement).
+
+    The pattern must start *on the pitch*.  A throw-in or corner restart also looks like
+    "ball travels >= 12 m, slows, gets struck again" -- but its D->team boundary sits on the
+    chalk with the ball already in flight (measured 66 030: a throw-in at 0.05 m from the
+    touchline was delayed to D for 3.2 s; 156 953: a corner-side throw-in at 1.81 m lost
+    19 s of live play to a late slow patch).  A setup that walks the ball >= 12 m begins
+    well inside the pitch (measured 22.7-26.4 m from the chalk); boundaries closer to
+    ``max_touchline_m`` are side-restarts, not free-kick setups.
     """
     out_codes = np.asarray(codes, dtype=np.int8).copy()
     n = len(out_codes)
@@ -1372,6 +1381,10 @@ def apply_offside_freekick_restarts(
         p_start = cb[s]
         in_box = (p_start[0] <= 24.0) or (p_start[0] >= length - 24.0)
         if not in_box:
+            continue
+        # side-restarts start at the chalk: never model a throw-in as a free-kick setup
+        touchline_m = min(float(p_start[1]), float(width - p_start[1]))
+        if touchline_m < max_touchline_m:
             continue
 
         look_e = min(e, s + max_setup_frames)

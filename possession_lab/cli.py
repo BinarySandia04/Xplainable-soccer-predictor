@@ -543,6 +543,83 @@ def cmd_fusion(args: argparse.Namespace) -> int:
     return 0
 
 
+def pick_setpiece_release(
+    speed: "np.ndarray",
+    jump: "np.ndarray",
+    near: "np.ndarray",
+    touchline_m: "np.ndarray",
+    ball: "np.ndarray",
+    s_f: int,
+    e_f: int,
+    throw_in: bool,
+    pitch_width: float,
+    release_jump_max: float = 5.0,
+) -> tuple[int | None, bool]:
+    """Frame the SET PIECES restart is actually taken, or ``None``.
+
+    The smart tag spans the whole stoppage and, for throw-ins, part of the live
+    play after it.  The real release is a ball moving at the line (measured
+    44 739), not the ball being carried around behind the touchline (44 335) or
+    the low-confidence ball hopping in the thrower's hands 5 m inside it
+    (44 548-44 679).
+
+    A tracker jump is not a release: a struck ball moves a few metres per frame
+    at most (30 m/s is 1.2 m at 25 fps; measured releases jump 0.2-1.0 m,
+    measured tracker jumps 5.2-249 m).  When the first strict pick is such a
+    jump, the first *continuous* strict pick wins (measured 65 727: a 248 m
+    jump at a throw-in tag picked instead of the true throw at 66 026).  If no
+    continuous release exists, the first strict pick is kept rather than the
+    tag degrading to the first spike anywhere (measured 156 850: the first pick
+    is a 270 m/s teleport and the throw itself never clears the 2.5 m line).
+    """
+    import numpy as np
+
+    fallback_f = None
+    first_strict_f = None
+    restart_f = None
+    strict = False
+    for f in range(s_f + 10, min(e_f, s_f + 500)):
+        if speed[f] > 4.5 and np.nanmean(speed[f:min(e_f, f + 4)]) > 3.0:
+            if fallback_f is None:
+                fallback_f = f
+            if not near[f]:
+                continue
+            if throw_in:
+                # a throw-in is taken at the touchline and sends the ball into
+                # the pitch.  A ball hopping at the line in the thrower's hands
+                # does not qualify (measured 44 600-44 679), the release does
+                # (44 739: 4.2 m inward in 0.4 s).
+                if touchline_m[f] > 2.5:
+                    continue
+                side = 0 if ball[f, 1] < pitch_width / 2.0 else 1
+                future = ball[min(len(ball) - 1, f + 10), 1]
+                if not np.isfinite(future):
+                    continue
+                inward = future - ball[f, 1] if side == 0 else ball[f, 1] - future
+                if inward < 1.0:
+                    continue
+            if first_strict_f is None:
+                first_strict_f = f
+                if jump[f] > release_jump_max:
+                    continue  # tracker jump: keep looking for a continuous release
+            elif jump[f] > release_jump_max:
+                continue
+            restart_f = f
+            strict = True
+            break
+    if restart_f is None:
+        if first_strict_f is not None:
+            # no continuous release in the window: keep the first strict pick
+            # (the pre-guard behaviour) instead of the first-spike fallback
+            restart_f = first_strict_f
+            strict = True
+        else:
+            # no clean release: keep the old first-spike behaviour instead of
+            # declaring the whole tag dead (measured 68 672 and 85 753)
+            restart_f = fallback_f
+    return restart_f, strict
+
+
 def cmd_transitions(args: argparse.Namespace) -> int:
     """Layer event-gated control transitions onto a cached fusion pass, then score it."""
     import numpy as np
@@ -722,19 +799,16 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     def _setpiece_restart_frames(
         ball: np.ndarray,
     ) -> tuple[list[tuple[Any, int, int, int | None, bool]], np.ndarray]:
-        """SET PIECES tags with the frame the restart is actually taken.
-
-        The smart tag spans the whole stoppage and, for throw-ins, part of the live
-        play after it.  The real release is a ball moving at the line (measured
-        44 739), not the ball being carried around behind the touchline (44 335) or
-        the low-confidence ball hopping in the thrower's hands 5 m inside it
-        (44 548-44 679).
-        """
+        """SET PIECES tags with the frame the restart is actually taken (see ``pick_setpiece_release``)."""
         pitch_length, pitch_width = (float(v) for v in lab.tracking.pitch)
         margin = 2.0
         diff = np.zeros_like(ball)
         diff[1:] = (ball[1:] - ball[:-1]) * FPS
         speed = np.linalg.norm(diff, axis=1)
+        # per-frame displacement in metres: a release is at most a few, a tracker
+        # jump is tens or hundreds (see ``pick_setpiece_release``)
+        jump = np.zeros_like(speed)
+        jump[1:] = np.linalg.norm(ball[1:] - ball[:-1], axis=1)
         near = (
             (ball[:, 0] >= -margin)
             & (ball[:, 0] <= pitch_length + margin)
@@ -749,37 +823,17 @@ def cmd_transitions(args: argparse.Namespace) -> int:
             s_f, e_f = int(ev.start_frame), min(len(ball), int(ev.stop_frame))
             if e_f <= s_f:
                 continue
-            throw_in = ev.type == "Throw-in"
-            fallback_f = None
-            restart_f = None
-            strict = False
-            for f in range(s_f + 10, min(e_f, s_f + 500)):
-                if speed[f] > 4.5 and np.nanmean(speed[f:min(e_f, f + 4)]) > 3.0:
-                    if fallback_f is None:
-                        fallback_f = f
-                    if not near[f]:
-                        continue
-                    if throw_in:
-                        # a throw-in is taken at the touchline and sends the ball into
-                        # the pitch.  A ball hopping at the line in the thrower's hands
-                        # does not qualify (measured 44 600-44 679), the release does
-                        # (44 739: 4.2 m inward in 0.4 s).
-                        if touchline_m[f] > 2.5:
-                            continue
-                        side = 0 if ball[f, 1] < pitch_width / 2.0 else 1
-                        future = ball[min(len(ball) - 1, f + 10), 1]
-                        if not np.isfinite(future):
-                            continue
-                        inward = future - ball[f, 1] if side == 0 else ball[f, 1] - future
-                        if inward < 1.0:
-                            continue
-                    restart_f = f
-                    strict = True
-                    break
-            if restart_f is None:
-                # no clean release: keep the old first-spike behaviour instead of
-                # declaring the whole tag dead (measured 68 672 and 85 753)
-                restart_f = fallback_f
+            restart_f, strict = pick_setpiece_release(
+                speed,
+                jump,
+                near,
+                touchline_m,
+                ball,
+                s_f,
+                e_f,
+                ev.type == "Throw-in",
+                pitch_width,
+            )
             rows.append((ev, s_f, e_f, restart_f, strict))
         return rows, speed
 

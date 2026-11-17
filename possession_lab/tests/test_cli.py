@@ -9,7 +9,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-from possession_lab.cli import cmd_evaluate, cmd_visualize
+import numpy as np
+
+from possession_lab.cli import cmd_evaluate, cmd_visualize, pick_setpiece_release
 
 
 class MissingInputsTest(unittest.TestCase):
@@ -42,6 +44,110 @@ class MissingInputsTest(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertNotIn("predictions.csv", message)
         self.assertIn("metrics_public.json", message)
+
+
+class PickSetpieceReleaseTests(unittest.TestCase):
+    """The release frame is a ball in flight, not a tracker jump.
+
+    The 65 558 throw-in tag carried the ball out of bounds, jumped 248 m back to
+    the touchline (frame 65 727), and only threw it properly at 66 026.  The
+    248 m jump is a valid speed spike on the line, so the continuity guard must
+    prefer the later *continuous* release over it.
+    """
+
+    PITCH_WIDTH = 68.0
+    PITCH_LENGTH = 105.0
+    FPS = 25.0
+
+    def _arrays(self, ball):
+        """Build speed/jump/near/touchline_m exactly as ``cmd_transitions`` does."""
+        n = len(ball)
+        diff = np.zeros_like(ball)
+        diff[1:] = (ball[1:] - ball[:-1]) * self.FPS
+        speed = np.linalg.norm(diff, axis=1)
+        jump = np.zeros(n)
+        jump[1:] = np.linalg.norm(ball[1:] - ball[:-1], axis=1)
+        margin = 2.0
+        near = (
+            (ball[:, 0] >= -margin)
+            & (ball[:, 0] <= self.PITCH_LENGTH + margin)
+            & (ball[:, 1] >= -margin)
+            & (ball[:, 1] <= self.PITCH_WIDTH + margin)
+        )
+        touchline_m = np.minimum(np.abs(ball[:, 1]), np.abs(ball[:, 1] - self.PITCH_WIDTH))
+        return speed, jump, near, touchline_m
+
+    def test_continuous_release_wins_over_earlier_tracker_jump(self):
+        n = 120
+        ball = np.tile((10.0, -10.0), (n, 1))          # carried out of bounds
+        for f in range(30, 41):                         # 248 m jump back to the line
+            ball[f] = (10.0, 0.3 + (f - 30) * 0.15)
+        ball[41:60] = (10.0, 1.8)                       # paused
+        for f in range(60, 71):                         # the true continuous throw
+            ball[f] = (10.0, 2.2 + (f - 60) * 0.4)
+        speed, jump, near, touchline_m = self._arrays(ball)
+
+        restart_f, strict = pick_setpiece_release(
+            speed, jump, near, touchline_m, ball, 0, n, True, self.PITCH_WIDTH
+        )
+        # frame 30 (the jump) is skipped; the continuous throw at 60 is taken
+        self.assertEqual(restart_f, 60)
+        self.assertTrue(strict)
+
+    def test_first_strict_pick_kept_when_no_continuous_release(self):
+        n = 120
+        ball = np.tile((10.0, -10.0), (n, 1))
+        for f in range(30, 41):
+            ball[f] = (10.0, 0.3 + (f - 30) * 0.15)
+        ball[41:] = (10.0, 1.8)                         # never a clean continuous throw
+        speed, jump, near, touchline_m = self._arrays(ball)
+
+        restart_f, strict = pick_setpiece_release(
+            speed, jump, near, touchline_m, ball, 0, n, True, self.PITCH_WIDTH
+        )
+        # the jump is the only strict candidate: keep it, do not degrade to the
+        # first-spike fallback (which would report strict=False)
+        self.assertEqual(restart_f, 30)
+        self.assertTrue(strict)
+
+    def test_plain_continuous_release_is_unchanged(self):
+        n = 120
+        ball = np.tile((50.0, 34.0), (n, 1))
+        for f in range(60, 71):
+            ball[f] = (50.0, 34.0 + (f - 59) * 0.4)   # moving from frame 60
+        speed, jump, near, touchline_m = self._arrays(ball)
+
+        restart_f, strict = pick_setpiece_release(
+            speed, jump, near, touchline_m, ball, 0, n, False, self.PITCH_WIDTH
+        )
+        self.assertEqual(restart_f, 60)
+        self.assertTrue(strict)
+
+    def test_no_clean_release_falls_back_to_first_spike(self):
+        n = 120
+        ball = np.tile((10.0, 40.0), (n, 1))
+        ball[50:] = (10.0, 80.0)                        # spike off the pitch: not a release
+        speed, jump, near, touchline_m = self._arrays(ball)
+
+        restart_f, strict = pick_setpiece_release(
+            speed, jump, near, touchline_m, ball, 0, n, False, self.PITCH_WIDTH
+        )
+        self.assertEqual(restart_f, 50)
+        self.assertFalse(strict)
+
+    def test_line_spike_without_inward_motion_is_not_a_release(self):
+        n = 120
+        ball = np.tile((10.0, -10.0), (n, 1))
+        for f in range(30, 41):
+            ball[f] = (10.0, 0.3)                       # at the line but never sent in
+        speed, jump, near, touchline_m = self._arrays(ball)
+
+        restart_f, strict = pick_setpiece_release(
+            speed, jump, near, touchline_m, ball, 0, n, True, self.PITCH_WIDTH
+        )
+        # the throw-in line test rejects it, so this degrades to the spike fallback
+        self.assertEqual(restart_f, 30)
+        self.assertFalse(strict)
 
 
 if __name__ == "__main__":
