@@ -361,6 +361,70 @@ def nearest_team_at(
     return int(team[closest])
 
 
+def nearest_team_map(
+    ball_xy: np.ndarray,
+    players: np.ndarray,
+    teams: np.ndarray,
+    present: np.ndarray,
+    max_distance: float = 2.0,
+    min_margin: float = 1.0,
+) -> np.ndarray:
+    """Per-frame ``nearest_team_at``: team at the ball, or ``-1`` where unclear.
+
+    ``players``/``teams``/``present`` are the per-frame arrays of shape ``(n, P)``.
+    Same claim rule as the single-frame version, so the thrower of a teamless
+    throw-in (the player at the ball when it starts moving) and the moment the
+    flight is taken by the other side both use one definition of "at the ball".
+    """
+    ball = np.asarray(ball_xy, dtype=np.float64)
+    pitch = np.asarray(players, dtype=np.float64)
+    team = np.asarray(teams)
+    n = ball.shape[0]
+    out = np.full(n, -1, dtype=np.int8)
+    if pitch.ndim != 3 or pitch.shape[0] != n or team.shape != pitch.shape[:2]:
+        return out
+    ok = np.asarray(present, dtype=bool) & np.isin(team, (H, 1))
+    if ok.shape != pitch.shape[:2]:
+        return out
+    with np.errstate(invalid="ignore"):
+        dist = np.linalg.norm(pitch - ball[:, None, :], axis=2)
+    dist = np.where(ok & np.isfinite(dist), dist, np.inf)
+    d_home = np.where(team == H, dist, np.inf).min(axis=1)
+    d_away = np.where(team == 1, dist, np.inf).min(axis=1)
+    best = np.minimum(d_home, d_away)
+    who = np.where(d_home <= d_away, H, 1)
+    with np.errstate(invalid="ignore"):
+        margin = np.maximum(d_home, d_away) - best
+    clean = (best <= max_distance) & (margin >= min_margin)
+    out[clean] = who[clean]
+    return out
+
+
+def throw_flight_end(
+    claim: np.ndarray,
+    restart_f: int,
+    restart_team: int,
+    cap_f: int,
+    hold_frames: int = 3,
+) -> int:
+    """Frame at which a thrown ball stops belonging to the throwing team.
+
+    The thrower owns the restart while the ball is in flight; possession passes
+    to the other side the moment it clearly takes the ball — the same geometric
+    claim as ``nearest_team_at``, held for ``hold_frames`` because a catch is
+    sustained contact and a single frame of a runner passing under the ball is
+    not.  If the opponent never takes it clearly, the thrower keeps the whole
+    ``cap_f`` window.
+    """
+    claim = np.asarray(claim)
+    other = 1 - restart_team
+    cap = min(int(cap_f), len(claim) - hold_frames)
+    for f in range(int(restart_f) + 1, cap):
+        if bool((claim[f : f + hold_frames] == other).all()):
+            return f
+    return int(cap_f)
+
+
 # --------------------------------------------------------------------------- pixel contact evidence
 
 @dataclass(frozen=True)

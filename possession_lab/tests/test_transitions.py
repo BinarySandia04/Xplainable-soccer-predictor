@@ -37,10 +37,12 @@ from possession_lab.fusion.transitions import (
     keeper_area_catches,
     keeper_holds,
     nearest_team_at,
+    nearest_team_map,
     pixel_contact,
     raw_evidence_pool,
     relay_contacts,
     setpiece_retrieval_mask,
+    throw_flight_end,
 )
 
 N = 120
@@ -2116,6 +2118,54 @@ class ApplyOffsideFreekickRestartsTests(unittest.TestCase):
         res = apply_offside_freekick_restarts(codes, ball, (105.0, 68.0), fps=25.0)
         # untouched: a boundary this close to the chalk is a side-restart
         self.assertTrue((res == codes).all())
+
+
+class NearestTeamMapTests(unittest.TestCase):
+    """The per-frame claim map must agree with the single-frame rule it vectorises."""
+
+    def test_agrees_with_nearest_team_at_frame_by_frame(self):
+        rng = np.random.default_rng(7)
+        n, p = 40, 6
+        players = rng.uniform(0.0, 100.0, size=(n, p, 2))
+        teams = np.tile(np.array([0, 0, 0, 1, 1, 1]), (n, 1))
+        present = rng.uniform(size=(n, p)) > 0.2
+        ball = rng.uniform(0.0, 100.0, size=(n, 2))
+        mapping = nearest_team_map(ball, players, teams, present)
+        for f in range(n):
+            self.assertEqual(
+                int(mapping[f]),
+                nearest_team_at(ball[f], players[f], teams[f], present[f]),
+                msg=f"frame {f}",
+            )
+
+    def test_contested_ball_is_unclaimed(self):
+        # 1.0 m for home, 1.5 m for away: the margin is under the 1 m floor
+        ball = np.array([[10.0, 10.0]])
+        players = np.array([[[11.0, 10.0], [11.5, 10.0]]])
+        teams = np.array([[0, 1]])
+        present = np.array([[True, True]])
+        self.assertEqual(list(nearest_team_map(ball, players, teams, present)), [-1])
+        # the same ball with the opponent 3 m out is a clear home claim
+        players[:, 1, 0] = 13.0
+        self.assertEqual(list(nearest_team_map(ball, players, teams, present)), [0])
+
+
+class ThrowFlightEndTests(unittest.TestCase):
+    """The thrower owns the throw until the other side clearly takes the ball."""
+
+    def test_hands_over_on_sustained_take(self):
+        claim = np.array([-1, 0, 0, 0, 0, 1, 1, 1, 1, -1, 1, 1, 1])
+        # release at 1, thrower 0: first frame the opponent holds the ball
+        # for three consecutive frames is 5
+        self.assertEqual(throw_flight_end(claim, 1, 0, 13), 5)
+
+    def test_holds_to_cap_without_clear_take(self):
+        claim = np.array([-1, 0, 0, -1, 1, 1, -1, 1, 1])
+        self.assertEqual(throw_flight_end(claim, 1, 0, 9), 9)
+
+    def test_a_runner_passing_under_the_ball_is_not_a_take(self):
+        claim = np.array([0, 0, 1, 0, 0, 0, 0])
+        self.assertEqual(throw_flight_end(claim, 0, 0, 7), 7)
 
 
 if __name__ == "__main__":

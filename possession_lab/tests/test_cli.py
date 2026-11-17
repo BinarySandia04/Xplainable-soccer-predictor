@@ -149,6 +149,52 @@ class PickSetpieceReleaseTests(unittest.TestCase):
         self.assertEqual(restart_f, 30)
         self.assertFalse(strict)
 
+    def test_carry_across_the_line_without_a_player_at_the_ball_is_not_a_release(self):
+        # the tracker carries the ball around behind the touchline to the throw
+        # spot at running speed and crosses the line with nobody at the ball;
+        # the real throw comes later, with the thrower at the ball (measured
+        # 164 964 carry at 13.5 m/s, thrower 3.4 m away; throw 164 993 at 0.4 m)
+        n = 200
+        ball = np.tile((15.0, -5.0), (n, 1))
+        for f in range(30, 49):                          # the carry, crossing the line
+            ball[f] = (15.0 + (f - 30) * 0.2, -5.0 + (f - 30) * 0.35)
+        ball[49:90] = (19.0, 1.2)                        # parked at the throw spot
+        for f in range(90, 121):                         # the true throw, inward for >10 frames
+            ball[f] = (19.0, 1.2 + (f - 90) * 0.4)
+        speed, jump, near, touchline_m = self._arrays(ball)
+        claim = np.full(n, -1)
+        claim[90:121] = 0                                # thrower at the ball, only at the throw
+
+        r0, s0 = pick_setpiece_release(
+            speed, jump, near, touchline_m, ball, 0, n, True, self.PITCH_WIDTH
+        )
+        self.assertEqual(r0, 39)                          # without claims: the carry wins
+        r1, s1 = pick_setpiece_release(
+            speed, jump, near, touchline_m, ball, 0, n, True, self.PITCH_WIDTH, claim=claim
+        )
+        self.assertEqual(r1, 91)                          # with claims: the carry is skipped
+        self.assertTrue(s1)
+
+    def test_no_claimed_release_keeps_the_pre_gate_fallback(self):
+        # nobody ever stands at the ball: the gate must not degrade the tag,
+        # it must return exactly the pre-gate pick
+        n = 120
+        ball = np.tile((10.0, -10.0), (n, 1))
+        for f in range(30, 41):
+            ball[f] = (10.0, 0.3 + (f - 30) * 0.15)
+        ball[41:] = (10.0, 1.8)
+        speed, jump, near, touchline_m = self._arrays(ball)
+        claim = np.full(n, -1)
+
+        r0, s0 = pick_setpiece_release(
+            speed, jump, near, touchline_m, ball, 0, n, True, self.PITCH_WIDTH
+        )
+        r1, s1 = pick_setpiece_release(
+            speed, jump, near, touchline_m, ball, 0, n, True, self.PITCH_WIDTH, claim=claim
+        )
+        self.assertEqual((r0, s0), (r1, s1))
+        self.assertTrue(s1)
+
 
 if __name__ == "__main__":
     unittest.main()

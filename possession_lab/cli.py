@@ -554,6 +554,7 @@ def pick_setpiece_release(
     throw_in: bool,
     pitch_width: float,
     release_jump_max: float = 5.0,
+    claim: "np.ndarray | None" = None,
 ) -> tuple[int | None, bool]:
     """Frame the SET PIECES restart is actually taken, or ``None``.
 
@@ -571,6 +572,14 @@ def pick_setpiece_release(
     continuous release exists, the first strict pick is kept rather than the
     tag degrading to the first spike anywhere (measured 156 850: the first pick
     is a 270 m/s teleport and the throw itself never clears the 2.5 m line).
+
+    For throw-ins, a release also needs the thrower at the ball: when ``claim``
+    is given, a strict candidate whose frame has no clear player claim (see
+    ``nearest_team_map``) is a carry, not a throw (measured 164 964: the tracker
+    carried the ball across the touchline at 13.5 m/s with the thrower 3.4 m
+    away, while the real throw at 164 993 had him 0.4 m from the ball).  Tags
+    with no claimed release keep the pre-gate fallback chain, so the gate can
+    only move a release toward the player at the ball, never off it.
     """
     import numpy as np
 
@@ -603,6 +612,10 @@ def pick_setpiece_release(
                 if jump[f] > release_jump_max:
                     continue  # tracker jump: keep looking for a continuous release
             elif jump[f] > release_jump_max:
+                continue
+            if throw_in and claim is not None and claim[f] not in (0, 1):
+                # nobody standing at the ball: the tracker carrying it behind
+                # the line, not a throw — keep looking
                 continue
             restart_f = f
             strict = True
@@ -638,10 +651,12 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         events_to_rows,
         evidence_probability,
         nearest_team_at,
+        nearest_team_map,
         out_of_bounds_mask,
         possession_revival_mask,
         raw_evidence_pool,
         setpiece_retrieval_mask,
+        throw_flight_end,
     )
     from .fusion.voters import ROLE_BY_KEY
     from .keepers import derive_keeper_slots, keeper_area_team_map
@@ -799,6 +814,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
 
     def _setpiece_restart_frames(
         ball: np.ndarray,
+        claim: np.ndarray | None,
     ) -> tuple[list[tuple[Any, int, int, int | None, bool]], np.ndarray]:
         """SET PIECES tags with the frame the restart is actually taken (see ``pick_setpiece_release``)."""
         pitch_length, pitch_width = (float(v) for v in lab.tracking.pitch)
@@ -834,12 +850,17 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                 e_f,
                 ev.type == "Throw-in",
                 pitch_width,
+                claim=claim if ev.type == "Throw-in" else None,
             )
             rows.append((ev, s_f, e_f, restart_f, strict))
         return rows, speed
 
     c_b = arrays["consensus_ball"].astype(np.float64)
-    setpiece_rows, b_speed = _setpiece_restart_frames(c_b)
+    # who is standing at the ball, per frame: throw-in smart tags carry no team,
+    # so the thrower is the player at the ball when the throw is taken, and the
+    # flight belongs to his team until the other side clearly takes the ball
+    throw_claim = nearest_team_map(c_b, tracking_players, tracking_teams_area, tracking_present)
+    setpiece_rows, b_speed = _setpiece_restart_frames(c_b, throw_claim)
     setpiece_dead = np.zeros(n, dtype=bool)
     for _ev, s_f, e_f, restart_f, _strict in setpiece_rows:
         # a tag supports deadness only until the restart it describes
@@ -1015,7 +1036,16 @@ def cmd_transitions(args: argparse.Namespace) -> int:
                         np.asarray(lab.tracking.player_present, dtype=bool)[restart_f],
                     )
                     if restart_team in (0, 1):
-                        result.codes[restart_f:min(e_f, restart_f + 60)] = restart_team
+                        # the thrower owns the ball for the throw itself, not
+                        # the flight after the other side takes it: hand the
+                        # possession over the moment the opponent clearly holds
+                        # the ball (measured 165 043: a Barcelona throw-in whose
+                        # flight had no owner, so the decode backfilled the
+                        # receiver's team from the release)
+                        end_f = min(e_f, restart_f + 60)
+                        if ev.type == "Throw-in":
+                            end_f = throw_flight_end(throw_claim, restart_f, restart_team, end_f)
+                        result.codes[restart_f:end_f] = restart_team
             elif e_f > s_f + 25:
                 result.codes[s_f:e_f - 25] = _D_CODE
 
