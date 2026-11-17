@@ -3,7 +3,9 @@
 **Challenge:** More than a Hack 2027 — Phase 1: Ball Possession  
 **Match:** FC Barcelona vs Athletic Club, LaLiga EA Sports 2024–25 (Matchday 2)  
 **System Name:** Xplainable Soccer Predictor (`possession_lab`)  
-**Deliverables:** Frame-by-frame possession submission (`predictions.csv` / `fusion_predictions.csv`), verifiable source code, interactive diagnostic viewer, and technical documentation.
+**Deliverables:** `Xplainable.csv` (frame-by-frame possession), `Xplainable.pdf` (technical note), verifiable source code, interactive diagnostic viewer, and the reproducible release assets.
+
+> **Final submission (17 Nov 2026):** the transition-event layer lifts the public score to **0.9257 spellF1** and **0.9661 macroF1** (18 predicted spells vs 17 GT). The table below isolates the HMM/fusion stage (0.6519) that the transition layer starts from. Final artefacts: `deliverables/Xplainable.csv` and `deliverables/Xplainable.pdf`.
 
 ---
 

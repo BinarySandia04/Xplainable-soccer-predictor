@@ -11,7 +11,7 @@ labels `H` / `A` / `D` / `X`. Upload it named `<team_name>.csv`.
 ```bash
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt        # CPU inference for fusion/transitions
-.venv/bin/python -m pytest possession_lab -q     # 315 passed (+4 subtests)
+.venv/bin/python -m pytest possession_lab -q     # 375 passed (+4 subtests)
 ```
 
 The match data lives in `data/` (tactical video, tracking, homography, ATD, smart tags).
@@ -115,8 +115,8 @@ python evaluation/validate_submission.py <team_name>.csv
 |---|---|
 | `possession_lab/outputs/perception_new_fixed.npz` | `9dddaa128dc9eb39eae8419958e4252bb5ed65a423418f33a08ac835ff855f1b` |
 | `possession_lab/outputs/fusion.npz` | `e7ea998b74b963af25413d1938bf5659e56efec1f155e0a668c4dbf4dcae0369` |
-| `possession_lab/outputs/transition_predictions.csv` | `3c0694272da36a648061d72e9931422e66bed80ba96b7e465b19c261b366e59e` |
-| `possession_lab/outputs/explanations.json` | `25023e5b1702613030f20ae6af61af97c51907e8bcc9c294f5e0e09130072b64` |
+| `possession_lab/outputs/transition_predictions.csv` | `9d79ad4bd83327f03299e02919623ef89215145eecabf1aa0a1a9bb4a5ce66fb` |
+| `possession_lab/outputs/explanations.json` | `2e563e7c044e4c198757a9620f5f77515f5de68964e756ed3557ca45330a6a70` |
 
 If your perception cache matches the checksum above, steps 2–4 are pure CPU and reproduce the
 CSV exactly. Perception itself is deterministic given the same weights, `imgsz` (1024), device

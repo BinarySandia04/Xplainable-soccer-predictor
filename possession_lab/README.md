@@ -309,6 +309,11 @@ HMM, the event detector, or the submission.
 
 ## Results
 
+> **Final submission:** after the transition-event layer, the uploaded `Xplainable.csv` scores
+> **0.9257 spellF1** and **0.9661 macroF1** on the public window. The table below isolates the
+> HMM+fusion stage (0.6519) that the transition layer starts from; see
+> [`docs/technical/Xplainable.tex`](../docs/technical/Xplainable.tex) for the full layer.
+
 ### Public 5-minute ground truth
 
 Public window: frames **11,185–18,684** (7,500 frames, 17 possessions).

@@ -1,12 +1,12 @@
 # Xplainable Soccer Predictor — More than a Hack 2027
 
-> **Our Proposal:** A gap-aware hybrid Hidden Markov Model with causal ball trajectory filtering, acoustic referee whistle detection, domain event rules, deep video perception with physical continuity gating, multi-source consensus fusion, and an interactive explainability studio.
+> **Our Proposal:** A gap-aware hybrid Hidden Markov Model with causal ball trajectory filtering, acoustic referee whistle detection, domain event rules, deep video perception with physical continuity gating, multi-source consensus fusion, a transition-event layer, and an interactive explainability studio.
 > 
-> * **Technical Proposal:** Full documentation in **[PROPOSAL.md](PROPOSAL.md)**.
+> * **Technical Proposal:** Full documentation in **[PROPOSAL.md](PROPOSAL.md)** and the final technical note **[deliverables/Xplainable.pdf](deliverables/Xplainable.pdf)**.
 > * **Possession Lab:** Implementation details, CLI commands, and reviewer guide in **[possession_lab/README.md](possession_lab/README.md)**.
-> * **Ball Detector:** A dedicated YOLO11s trained on a merged four-source dataset — match-frame recall 0.55→0.70 and precision 0.36→0.72 over the COCO baseline — wired into perception with `--ball-model` (see **[ball_training/README.md](ball_training/README.md)**).
-> * **Performance:** **0.6519 spellF1** (vs 0.4242 best baseline) and **0.9466 macroF1** (vs 0.5812 best baseline).
-> * **Verification:** 169 passing tests (`pytest`), clean linter (`ruff check .`), and official format validation.
+> * **Perception:** two dedicated YOLO26x detectors (ball and players) trained on external public data only, with physical continuity gating; no frame or label from the provided match was used for training (see **[REPRODUCING.md](REPRODUCING.md)**).
+> * **Final performance:** public 5-minute window **0.9257 spellF1** (vs 0.4242 best baseline) and **0.9661 macroF1** after the transition-event layer; the HMM+fusion stage alone scores 0.6519 / 0.9469.
+> * **Submission artefacts:** **[deliverables/Xplainable.csv](deliverables/Xplainable.csv)** and **[deliverables/Xplainable.pdf](deliverables/Xplainable.pdf)**; 375 tests pass and the official validator returns `OK`.
 
 ---
 
