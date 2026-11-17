@@ -112,15 +112,28 @@ def _metrics_payload(metrics: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _event_payload(events: Any | None) -> list[dict[str, Any]]:
-    """Compact goal/stoppage markers for the timelines."""
-    if events is None:
-        return []
+def _event_payload(events: Any | None, whistle: Any | None = None) -> list[dict[str, Any]]:
+    """Compact goal/stoppage/whistle markers for the timelines."""
     payload: list[dict[str, Any]] = []
-    for goal in getattr(events, "goals", ()):
-        payload.append(goal.to_dict())
-    for stop in getattr(events, "stoppages", ()):
-        payload.append(stop.to_dict())
+    if events is not None:
+        for goal in getattr(events, "goals", ()):
+            payload.append(goal.to_dict())
+        for stop in getattr(events, "stoppages", ()):
+            payload.append(stop.to_dict())
+    if whistle is not None:
+        for ev in getattr(whistle, "events", ()):
+            payload.append(
+                {
+                    "type": "whistle",
+                    "frame": int(ev.get("frame", ev.get("start", 0))),
+                    "start": int(ev.get("start", 0)),
+                    "stop": int(ev.get("stop", 0)),
+                    "peak": float(ev.get("peak", ev.get("confidence", 1.0))),
+                    "confidence": float(ev.get("confidence", ev.get("peak", 1.0))),
+                    "width_s": float(ev.get("width_s", 0.35)),
+                    "whistle_type": str(ev.get("type", "Pitido árbitro")),
+                }
+            )
     payload.sort(key=lambda item: int(item.get("frame", item.get("start", 0))))
     return payload
 
@@ -137,6 +150,7 @@ def build_viewer_data(
     start_frame: int | None = None,
     explanations: dict[str, Any] | None = None,
     events: Any | None = None,
+    whistle: Any | None = None,
     ball_gaps: list[list[int]] | None = None,
     tracking_available: bool = False,
     perception_available: bool = False,
@@ -247,7 +261,19 @@ def build_viewer_data(
         "tracking_available": bool(tracking_available),
         "perception_available": bool(perception_available),
         "fusion_available": bool(fusion_available),
-        "events": _event_payload(events),
+        "events": _event_payload(events, whistle=whistle),
+        "whistles": [
+            {
+                "frame": int(e.get("frame", e.get("start", 0))),
+                "start": int(e.get("start", 0)),
+                "stop": int(e.get("stop", 0)),
+                "peak": float(e.get("peak", 1.0)),
+                "confidence": float(e.get("confidence", e.get("peak", 1.0))),
+                "duration_s": float(e.get("width_s", 0.35)),
+                "type": str(e.get("type", "Pitido árbitro")),
+            }
+            for e in (getattr(whistle, "events", ()) or ())
+        ],
         "ball_gaps": [[int(a), int(b)] for a, b in (ball_gaps or ())],
     }
 
@@ -367,6 +393,7 @@ def load_viewer_data(
     explanations_path: str | Path | None = EXPLANATIONS_PATH,
     start_frame: int | None = None,
     events: Any | None = None,
+    whistle: Any | None = None,
     ball_gaps: list[list[int]] | None = None,
     tracking_available: bool = False,
     perception_available: bool = False,
@@ -403,6 +430,7 @@ def load_viewer_data(
         start_frame=start_frame,
         explanations=explanations,
         events=events,
+        whistle=whistle,
         ball_gaps=ball_gaps,
         tracking_available=tracking_available,
         perception_available=perception_available,
@@ -488,6 +516,7 @@ class FrameStore:
         trail_frames: int = 25,
         perception: Any | None = None,
         fusion: Any | None = None,
+        whistle: Any | None = None,
     ) -> None:
         self.tracking = tracking
         self.homography = homography
@@ -496,6 +525,7 @@ class FrameStore:
         self.features = features
         self.perception = perception
         self.fusion = fusion
+        self.whistle = whistle
         self.trail_frames = max(1, int(trail_frames))
         self.n_frames = int(tracking.n_frames)
         # One float64 view of the roster positions for the relabel lookup: converting
@@ -627,8 +657,53 @@ class FrameStore:
             payload[name] = bool(value) if value is not None else False
         return payload
 
+    def _whistle_payload(self, frame: int) -> dict[str, Any] | None:
+        if self.whistle is None:
+            return None
+        events = getattr(self.whistle, "events", ()) or ()
+        for ev in events:
+            f_start = int(ev.get("start", 0))
+            f_stop = int(ev.get("stop", 0))
+            f_peak = int(ev.get("frame", f_start))
+            if f_start - 2 <= frame <= f_stop + 2:
+                return {
+                    "active": True,
+                    "near": False,
+                    "distance": 0,
+                    "frame": f_peak,
+                    "start": f_start,
+                    "stop": f_stop,
+                    "confidence": float(ev.get("confidence", ev.get("peak", 1.0))),
+                    "duration_s": float(ev.get("width_s", 0.35)),
+                    "type": str(ev.get("type", "Pitido árbitro")),
+                }
+            elif abs(frame - f_peak) <= 25:
+                return {
+                    "active": False,
+                    "near": True,
+                    "distance": int(frame - f_peak),
+                    "frame": f_peak,
+                    "start": f_start,
+                    "stop": f_stop,
+                    "confidence": float(ev.get("confidence", ev.get("peak", 1.0))),
+                    "duration_s": float(ev.get("width_s", 0.35)),
+                    "type": str(ev.get("type", "Pitido árbitro")),
+                }
+        return None
+
     def _active_events(self, frame: int) -> list[dict[str, Any]]:
         active: list[dict[str, Any]] = []
+        w = self._whistle_payload(frame)
+        if w is not None and w.get("active"):
+            active.append(
+                {
+                    "type": "whistle",
+                    "frame": int(w["frame"]),
+                    "confidence": float(w["confidence"]),
+                    "kind": str(w["type"]),
+                    "duration_s": float(w["duration_s"]),
+                }
+            )
         for goal in getattr(self.events, "goals", ()):
             if int(goal.frame) <= frame < int(goal.restart):
                 active.append(
@@ -1001,6 +1076,7 @@ class FrameStore:
             "perception_available": bool(self.perception is not None),
             "fusion_available": fusion_available,
             "features": self._features_payload(frame),
+            "whistle": self._whistle_payload(frame),
             "active_events": self._active_events(frame),
         }
 
@@ -1076,7 +1152,10 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
         # Counted per request: ``Content-Length`` is the total the client declared, so draining has
         # to subtract whatever this handler already consumed.
         self._body_read = 0
-        super().handle_one_request()
+        try:
+            super().handle_one_request()
+        except (ConnectionError, BrokenPipeError):
+            self.close_connection = True
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if self.verbose:
@@ -1373,7 +1452,7 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
+        except (ConnectionError, BrokenPipeError):
             return
 
 
@@ -1384,7 +1463,7 @@ class ViewerHTTPServer(ThreadingHTTPServer):
     def handle_error(self, request: Any, client_address: Any) -> None:
         # The browser aborts the initial open-ended video request after it reads the header/moov
         # range.  That is normal for a 5 GB MP4 and should not dump a traceback into the terminal.
-        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+        if isinstance(sys.exc_info()[1], (ConnectionError, BrokenPipeError)):
             return
         super().handle_error(request, client_address)
 
@@ -1479,6 +1558,7 @@ def build_frame_store(
         features,
         perception=perception,
         fusion=fusion,
+        whistle=whistle,
     )
     return store, events, ball_gap_runs(track, min_frames=max(1, int(0.4 * FPS)))
 
@@ -1568,6 +1648,7 @@ def serve_viewer(
     except Exception as exc:
         print(f"tracking: no disponible ({exc})", flush=True)
 
+    whistle = getattr(frame_store, "whistle", None) if frame_store is not None else None
     data = load_viewer_data(
         predictions,
         gt_path=gt_path,
@@ -1577,6 +1658,7 @@ def serve_viewer(
         explanations_path=explanations_path,
         start_frame=start_frame,
         events=events,
+        whistle=whistle,
         ball_gaps=gaps,
         tracking_available=frame_store is not None,
         perception_available=bool(frame_store is not None and frame_store.perception is not None),
