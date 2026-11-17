@@ -641,10 +641,11 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         out_of_bounds_mask,
         possession_revival_mask,
         raw_evidence_pool,
+        setpiece_retrieval_mask,
     )
     from .fusion.voters import ROLE_BY_KEY
     from .keepers import derive_keeper_slots, keeper_area_team_map
-    from .pipeline import active_halves, load_lab, validate_codes, write_submission
+    from .pipeline import active_halves, fill_match_breaks, load_lab, validate_codes, write_submission
 
     output_dir = Path(args.output_dir or OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -843,6 +844,19 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     for _ev, s_f, e_f, restart_f, _strict in setpiece_rows:
         # a tag supports deadness only until the restart it describes
         setpiece_dead[s_f:(e_f if restart_f is None else restart_f)] = True
+    # the tag opens when the restart is ready, not when the ball crossed the line:
+    # pull the dead state back to the observed out that led to this set piece
+    # (measured 80 233: the corner tag only opens 27 s after the ball went out)
+    retrieval_dead = setpiece_retrieval_mask(
+        c_b,
+        arrays["consensus_confidence"].astype(np.float64),
+        [(s_f, restart_f, ev.type) for ev, s_f, e_f, restart_f, _strict in setpiece_rows],
+        tuple(lab.tracking.pitch),
+        margin_m=float(params.oob_margin_m),
+        min_out_frames=int(params.setpiece_retrieval_min_frames),
+        lookback_s=float(params.setpiece_retrieval_s),
+    )
+    setpiece_dead |= retrieval_dead
 
     oob = out_of_bounds_mask(
         arrays["consensus_ball"].astype(np.float64),
@@ -1054,6 +1068,11 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         tuple(lab.tracking.pitch),
     )
 
+    # nobody possesses the ball while it is being retrieved for a set piece, and then
+    # the match break: the recording window is not the kickoff (measured 111 888)
+    result.codes[retrieval_dead] = _D_CODE
+    result.codes[:] = fill_match_breaks(result.codes, halves)
+
     # Apply manual verification adjustments for visual inspection cases
     _match_adjustments = [
         (15357, 15366, 0),        # Interception: Barca player 11 touch (0.80m)
@@ -1094,7 +1113,8 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         f"+ {result.n_area} area catches from boxes, {result.n_control} spell expiries, "
         f"{result.n_gated_out} gated out -> {len(result.events)} transition events; "
         f"{int(out_of_play.sum()):,} frames of lost/out-of-bounds ball marked D; "
-        f"{int(revived.sum()):,} frames revived by live tags, {int(touched.sum()):,} by a player at the ball"
+        f"{int(revived.sum()):,} frames revived by live tags, {int(touched.sum()):,} by a player at the ball, "
+        f"{int(retrieval_dead.sum()):,} of set-piece retrieval marked D"
     )
     events_path = output_dir / "transition_events.csv"
     from dataclasses import replace

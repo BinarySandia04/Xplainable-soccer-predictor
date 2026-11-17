@@ -214,6 +214,12 @@ class TransitionParams:
     lost_conf_eps: float = 0.02
     oob_margin_m: float = 0.8  # metres past the chalk before "out" (a line ball is in)
     oob_min_frames: int = 25  # frames outside before the stoppage is called
+    # -- set-piece retrieval: the tag opens when the restart is ready, not when the
+    # ball crossed the line, and the tracker usually loses the ball after the
+    # crossing (measured 80 233: two confident frames over the goal line, the
+    # corner tag only at 80 913, and 27 s of Athletic possession in between)
+    setpiece_retrieval_s: float = 30.0  # seconds between the out and its restart tag
+    setpiece_retrieval_min_frames: int = 2  # confident out frames that anchor the retrieval
     # -- escape from a falsely locked dead state: the events ballot (weight 1.0)
     # pins the label to D, so no voter can reopen it — but the smart tags can.
     # A live-phase tag naming the team the voters already back, with the ball on
@@ -833,6 +839,73 @@ def out_of_bounds_mask(
     for s, e in _bool_runs(out):
         if e - s >= int(min_frames):
             mask[s:e] = True
+    return mask
+
+
+def setpiece_retrieval_mask(
+    ball_pitch: np.ndarray,
+    confidence: np.ndarray,
+    restart_tags: Sequence[tuple[int, int | None, str]],
+    pitch: tuple[float, float],
+    margin_m: float = 0.8,
+    min_out_frames: int = 2,
+    lookback_s: float = 30.0,
+    conf_eps: float = 0.05,
+    fps: int = FPS,
+) -> np.ndarray:
+    """Frames between a ball crossing the line and the restart tag it leads to.
+
+    The SET PIECES tag opens when the restart is ready, not when the ball went out.  A
+    corner or throw-in can take half a minute to retrieve, and the tracker normally loses
+    the ball right after the crossing: ``out_of_bounds_mask`` needs a sustained confident
+    run and never fires.  The decoded possession then keeps the team that was defending
+    the line for the whole retrieval (measured 80 233: two confident frames over the goal
+    line at the corner, the ``Corner Kick`` tag only at 80 913, 27 s of Athletic
+    possession while the ball was dead).
+
+    Each restart tag is anchored to the last observed out before it, but only when that
+    out is the first tag's own out (no other set piece sits between them) and the
+    retrieval gap is at most ``lookback_s``.  ``restart_tags`` carries
+    ``(tag_start, restart_frame_or_None, type)``; kick-offs are ignored because the ball
+    did not leave the pitch for them.
+    """
+    b = np.asarray(ball_pitch, dtype=np.float64)
+    c = np.asarray(confidence, dtype=np.float64)
+    n = b.shape[0]
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    finite = np.isfinite(b).all(axis=1) & np.isfinite(c)
+    observed = finite & (c > float(conf_eps))
+    length, width = float(pitch[0]), float(pitch[1])
+    out = observed & (
+        (b[:, 0] < -margin_m)
+        | (b[:, 0] > length + margin_m)
+        | (b[:, 1] < -margin_m)
+        | (b[:, 1] > width + margin_m)
+    )
+    out_runs = _bool_runs(out)
+    tags = sorted(
+        (int(start), None if restart is None else int(restart), str(kind))
+        for start, restart, kind in restart_tags
+    )
+    mask = np.zeros(n, dtype=bool)
+    for tag_start, restart, kind in tags:
+        if "Kick Off" in kind:
+            continue
+        previous = [(s, e) for s, e in out_runs if s < tag_start]
+        if not previous:
+            continue
+        start, stop = previous[-1]
+        if stop - start < int(min_out_frames):
+            continue
+        if tag_start > stop and tag_start - stop > int(round(float(lookback_s) * fps)):
+            continue
+        first_tag = next((tag for tag in tags if tag[0] >= start), None)
+        if first_tag is None or first_tag[0] != tag_start:
+            continue
+        end = tag_start if restart is None else max(tag_start, min(n, restart))
+        if end > start:
+            mask[start:end] = True
     return mask
 
 

@@ -40,6 +40,7 @@ from possession_lab.fusion.transitions import (
     pixel_contact,
     raw_evidence_pool,
     relay_contacts,
+    setpiece_retrieval_mask,
 )
 
 N = 120
@@ -1560,6 +1561,70 @@ class OutOfBoundsMaskTests(unittest.TestCase):
         ball[115:120, 1] = np.nan
         m = out_of_bounds_mask(ball, (105.0, 68.0), margin_m=0.8, min_frames=25)
         self.assertFalse(bool(m.any()))
+
+
+class SetpieceRetrievalMaskTests(unittest.TestCase):
+    """The restart tag opens when the restart is ready, not when the ball crossed the line.
+
+    Measured 80 233: two confident frames over the goal line at the corner, the
+    ``Corner Kick`` tag only at 80 913, and 27 s of decoded Athletic possession while
+    the ball was being retrieved.  The out is the anchor, the tag supplies the restart.
+    """
+
+    @staticmethod
+    def _ball(n=400):
+        ball = np.stack([np.full(n, 50.0), np.full(n, 30.0)], axis=1)
+        ball[100:102, 1] = -4.0  # two confident frames over the touchline
+        return ball
+
+    def test_out_to_restart_tag_is_dead(self):
+        m = setpiece_retrieval_mask(
+            self._ball(), np.ones(400), [(200, 240, "Corner Kick")], (105.0, 68.0),
+            lookback_s=10.0,
+        )
+        self.assertTrue(bool(m[100:240].all()))
+        self.assertFalse(bool(m[:100].any() or m[240:].any()))
+
+    def test_tag_without_a_release_is_dead_to_its_start(self):
+        m = setpiece_retrieval_mask(
+            self._ball(), np.ones(400), [(200, None, "Throw-in")], (105.0, 68.0),
+            lookback_s=10.0,
+        )
+        self.assertTrue(bool(m[100:200].all()))
+        self.assertFalse(bool(m[200:].any()))
+
+    def test_kickoff_is_not_an_out_restart(self):
+        m = setpiece_retrieval_mask(
+            self._ball(), np.ones(400), [(200, 240, "Kick Off (Start)")], (105.0, 68.0),
+            lookback_s=10.0,
+        )
+        self.assertFalse(bool(m.any()))
+
+    def test_lookback_caps_the_retrieval(self):
+        m = setpiece_retrieval_mask(
+            self._ball(600), np.ones(600), [(500, 540, "Goal Kick")], (105.0, 68.0),
+            lookback_s=10.0,
+        )
+        self.assertFalse(bool(m.any()))
+
+    def test_a_single_frame_is_not_an_out(self):
+        ball = self._ball()
+        ball[101, 1] = 30.0  # only frame 100 is out
+        m = setpiece_retrieval_mask(
+            ball, np.ones(400), [(200, 240, "Corner Kick")], (105.0, 68.0),
+            lookback_s=10.0,
+        )
+        self.assertFalse(bool(m.any()))
+
+    def test_the_last_out_before_the_tag_wins(self):
+        ball = self._ball()
+        ball[180:182, 1] = -4.0  # the real crossing; the first two frames were a blip
+        m = setpiece_retrieval_mask(
+            ball, np.ones(400), [(200, 240, "Throw-in")], (105.0, 68.0),
+            lookback_s=10.0,
+        )
+        self.assertTrue(bool(m[180:240].all()))
+        self.assertFalse(bool(m[100:180].any()))
 
 
 class PitchContradictionGateTests(unittest.TestCase):
