@@ -32,6 +32,7 @@ from possession_lab.fusion.transitions import (
     fill_blind_continuity,
     gate_events,
     gate_pixel_events,
+    honor_clean_interceptions,
     hold_touch_through,
     keeper_area_catches,
     keeper_holds,
@@ -1180,6 +1181,112 @@ class FillBlindContinuityTests(unittest.TestCase):
     def test_edge_gaps_are_left_alone(self):
         codes = np.array([D] * 10 + [H] * 30, dtype=np.int8)
         out = fill_blind_continuity(codes, np.zeros(codes.size))
+        np.testing.assert_array_equal(out, codes)
+
+
+class HonorCleanInterceptionTests(unittest.TestCase):
+    """A clean in-motion steal the motion channels cannot see relabels from the touch."""
+
+    def scene(self, steal=1, ball_step=0.4, touch_dist=0.1, touch_at=50, run_end=70,
+              pre_dist=0.5, near_after=2.0, prob_lo=0.3, prob_hi=0.7,
+              dead=None, codes=None):
+        """Ball rolls in +x at ``ball_step`` m/frame (10 m/s by default).
+
+        The steal team's player sits 5 m away, comes to the ball for
+        ``[touch_at, run_end)`` and leaves again; the spell team's player is at the
+        ball first and stays near afterwards.  ``codes`` label every frame with the
+        spell team, so the spell outlives a steal the events never saw.
+        """
+        n = 120
+        t = np.arange(n)
+        x = 20.0 + ball_step * t
+        in_run = (t >= touch_at) & (t < run_end)
+        steal_x = np.where(in_run, x - touch_dist, x + 5.0)
+        spell_x = np.where(t < touch_at, x + pre_dist, x + near_after)
+        pos = {steal: steal_x, 1 - steal: spell_x}
+        players = np.stack([
+            np.column_stack([pos[H], np.full(n, 30.0)]),
+            np.column_stack([pos[A], np.full(n, 30.0)]),
+        ], axis=1)
+        teams = np.array([H, A], dtype=np.int8)
+        present = np.ones((n, 2), dtype=bool)
+        ball = np.column_stack([x, np.full(n, 30.0)])
+        prob = np.full((n, 2), prob_lo)
+        prob[:, steal] = prob_hi
+        if codes is None:
+            codes = np.full(n, 1 - steal, dtype=np.int8)
+        if dead is None:
+            dead = np.zeros(n, dtype=bool)
+        return codes, ball, players, teams, present, prob, dead
+
+    def apply(self, codes, ball, players, teams, present, prob, dead):
+        return honor_clean_interceptions(
+            codes, ball, players, teams, present, prob,
+            dead, np.zeros(codes.size, dtype=bool), (105.3, 68.0),
+        )
+
+    def test_a_clean_in_motion_steal_relabels_from_the_touch(self):
+        codes, ball, players, teams, present, prob, dead = self.scene()
+        out = self.apply(codes, ball, players, teams, present, prob, dead)
+        np.testing.assert_array_equal(out[:50], np.full(50, H, dtype=np.int8))
+        np.testing.assert_array_equal(out[50:70], np.full(20, A, dtype=np.int8))
+        np.testing.assert_array_equal(out[70:], np.full(50, H, dtype=np.int8))
+
+    def test_the_steal_works_in_both_directions(self):
+        codes, ball, players, teams, present, prob, dead = self.scene(steal=H)
+        out = self.apply(codes, ball, players, teams, present, prob, dead)
+        np.testing.assert_array_equal(out[50:70], np.full(20, H, dtype=np.int8))
+        np.testing.assert_array_equal(np.concatenate([out[:50], out[70:]]),
+                                      np.full(100, A, dtype=np.int8))
+
+    def test_a_slow_ball_is_not_an_interception(self):
+        codes, ball, players, teams, present, prob, dead = self.scene(ball_step=0.2)  # 5 m/s
+        out = self.apply(codes, ball, players, teams, present, prob, dead)
+        np.testing.assert_array_equal(out, codes)
+
+    def test_a_loose_touch_is_not_an_interception(self):
+        codes, ball, players, teams, present, prob, dead = self.scene(touch_dist=0.5)
+        out = self.apply(codes, ball, players, teams, present, prob, dead)
+        np.testing.assert_array_equal(out, codes)
+
+    def test_a_short_run_is_not_an_interception(self):
+        codes, ball, players, teams, present, prob, dead = self.scene(run_end=58)  # 8 frames
+        out = self.apply(codes, ball, players, teams, present, prob, dead)
+        np.testing.assert_array_equal(out, codes)
+
+    def test_a_marginal_contest_is_not_an_interception(self):
+        codes, ball, players, teams, present, prob, dead = self.scene(near_after=0.5)  # margin 0.4 m
+        out = self.apply(codes, ball, players, teams, present, prob, dead)
+        np.testing.assert_array_equal(out, codes)
+
+    def test_a_ball_nobody_owned_is_not_a_steal(self):
+        codes, ball, players, teams, present, prob, dead = self.scene(pre_dist=3.0)
+        out = self.apply(codes, ball, players, teams, present, prob, dead)
+        np.testing.assert_array_equal(out, codes)
+
+    def test_without_probability_support(self):
+        codes, ball, players, teams, present, prob, dead = self.scene(prob_lo=0.5, prob_hi=0.5)
+        out = self.apply(codes, ball, players, teams, present, prob, dead)
+        np.testing.assert_array_equal(out, codes)
+
+    def test_a_dead_frame_breaks_the_run(self):
+        dead = np.zeros(120, dtype=bool)
+        dead[60] = True
+        codes, ball, players, teams, present, prob, _ = self.scene(dead=dead)
+        out = self.apply(codes, ball, players, teams, present, prob, dead)
+        np.testing.assert_array_equal(out, codes)
+
+    def test_an_already_stealed_spell_is_left_alone(self):
+        codes = np.full(120, A, dtype=np.int8)
+        codes, ball, players, teams, present, prob, dead = self.scene(codes=codes)
+        out = self.apply(codes, ball, players, teams, present, prob, dead)
+        np.testing.assert_array_equal(out, codes)
+
+    def test_dead_codes_are_left_alone(self):
+        codes = np.full(120, H, dtype=np.int8)
+        codes[50:70] = D
+        codes, ball, players, teams, present, prob, dead = self.scene(codes=codes)
+        out = self.apply(codes, ball, players, teams, present, prob, dead)
         np.testing.assert_array_equal(out, codes)
 
 

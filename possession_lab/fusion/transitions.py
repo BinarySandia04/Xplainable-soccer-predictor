@@ -1248,6 +1248,128 @@ def fill_blind_continuity(
     return out
 
 
+def honor_clean_interceptions(
+    codes: np.ndarray,
+    consensus_ball: np.ndarray,
+    players: np.ndarray,
+    teams: np.ndarray,
+    present: np.ndarray,
+    atd_ball_probability: np.ndarray,
+    event_dead: np.ndarray,
+    setpiece_dead: np.ndarray,
+    pitch: tuple[float, float],
+    touch_dist_m: float = 0.20,
+    ball_min_speed: float = 8.0,
+    ball_max_speed: float = 32.0,
+    min_frames: int = 12,
+    prior_win_frames: int = 20,
+    prior_dist_m: float = 1.0,
+    min_margin_m: float = 0.70,
+    min_prob: float = 0.30,
+    pitch_tol_m: float = 0.5,
+    fps: float = FPS,
+) -> np.ndarray:
+    """Reclaim a live spell that a clean in-motion interception should have ended.
+
+    The poll keeps the spell's team when the interception is silent: the ball is poked
+    away at speed and never slows to the onset channel's floor, and at the re-acceleration
+    no player sits inside the kick channel's attribution radius — so no event fires, and
+    the smoothed baseline never sees a turnover.  The provided tracking still shows the
+    whole affair at ball level; when it does with margin to rule out a loose-ball chase,
+    the label follows the ball:
+
+    * the stealing team is the nearest provided-tracking player for a sustained run of
+      at least ``min_frames`` during which the whole run is live (on the pitch, tracked,
+      outside dead and set-piece windows);
+    * inside that run one of its players is at the ball's feet (``touch_dist_m``) while
+      the ball is in firm motion — ``ball_min_speed`` to ``ball_max_speed`` m/s, the same
+      physical ceiling the kick channel applies to discard tracking artifacts;
+    * from that touch to the end of the run the stealing team stays nearest by at least
+      ``min_margin_m`` — a clear, sustained take, not a marginal contest;
+    * the ATD ball probability favours the stealing team over the spell's team by at
+      least ``min_prob`` on average over the same stretch — the direct evidence, not the
+      smoothed baseline, backs the switch;
+    * the spell's team was at the ball within the last ``prior_win_frames`` (no closer
+      than ``prior_dist_m``) — a steal from live opponent possession, not a pickup of a
+      ball nobody owned.
+
+    The label changes from the touch frame to the end of the run.  Measured 178 806:
+    a poke at 0.14 m with the ball at 10 m/s that the onset floor (4 m/s) can never see.
+    """
+    out = np.asarray(codes, dtype=np.int8).copy()
+    n = out.size
+    if n == 0:
+        return out
+    players = np.asarray(players, dtype=np.float64)
+    teams = np.asarray(teams, dtype=np.int8)
+    present = np.asarray(present, dtype=bool)
+    cball = np.asarray(consensus_ball, dtype=np.float64)
+    prob = np.asarray(atd_ball_probability, dtype=np.float64)
+    dead = np.asarray(event_dead, dtype=bool) | np.asarray(setpiece_dead, dtype=bool)
+
+    onball = np.isfinite(cball).all(axis=1)
+    onpitch = (
+        (cball[:, 0] >= -pitch_tol_m)
+        & (cball[:, 0] <= pitch[0] + pitch_tol_m)
+        & (cball[:, 1] >= -pitch_tol_m)
+        & (cball[:, 1] <= pitch[1] + pitch_tol_m)
+    )
+    valid = onball & onpitch & ~dead
+
+    # consensus-ball speed: displacement between two consecutive valid frames
+    speed = np.full(n, np.nan)
+    pair = valid[1:] & valid[:-1]
+    speed[1:][pair] = np.hypot(cball[1:, 0] - cball[:-1, 0], cball[1:, 1] - cball[:-1, 1])[pair] * fps
+
+    # per-team closest distance and the nearest playing team's margin
+    dH = np.full(n, np.inf)
+    dA = np.full(n, np.inf)
+    for s in range(0, n, CHUNK):
+        e = min(n, s + CHUNK)
+        d = np.linalg.norm(players[s:e] - cball[s:e][:, None, :], axis=2)
+        d = np.where(np.isfinite(d) & present[s:e], d, np.inf)
+        if teams.ndim == 2:
+            h = teams[s:e] == H
+            a = teams[s:e] == 1
+        else:
+            h = (teams == H)[None, :]
+            a = (teams == 1)[None, :]
+        dH[s:e] = np.where(h.any(axis=1), np.where(h, d, np.inf).min(axis=1), np.inf)
+        dA[s:e] = np.where(a.any(axis=1), np.where(a, d, np.inf).min(axis=1), np.inf)
+
+    margin = np.where(dH <= dA, dA - dH, dH - dA)
+    nearest = np.where(dH <= dA, H, 1)
+    nearest[~np.isfinite(dH) & ~np.isfinite(dA)] = -1
+    nearest[~valid] = -1
+
+    for o in (H, 1):
+        T = 1 - o
+        d_o = dH if o == H else dA
+        d_T = dA if o == H else dH
+        for start, stop in _bool_runs(nearest == o):
+            if stop - start < min_frames:
+                continue
+            if not np.all(out[start:stop] == T):
+                continue
+            if not np.all(valid[start:stop]):
+                continue
+            tf = start + int(np.argmin(d_o[start:stop]))
+            if not np.isfinite(d_o[tf]) or d_o[tf] > touch_dist_m:
+                continue
+            v = speed[tf]
+            if not np.isfinite(v) or not (ball_min_speed <= v <= ball_max_speed):
+                continue
+            if margin[tf:stop].min() < min_margin_m:
+                continue
+            if prob[tf:stop, o].mean() - prob[tf:stop, T].mean() < min_prob:
+                continue
+            pre = slice(max(0, start - prior_win_frames), start)
+            if not np.isfinite(d_T[pre]).any() or float(d_T[pre].min()) > prior_dist_m:
+                continue
+            out[tf:stop] = o
+    return out
+
+
 def stitch_aerial_excursions(
     codes: np.ndarray,
     consensus_ball: np.ndarray,
@@ -2643,6 +2765,7 @@ __all__ = [
     "fill_blind_continuity",
     "gate_events",
     "gate_pixel_events",
+    "honor_clean_interceptions",
     "hold_touch_through",
     "keeper_area_catches",
     "keeper_holds",

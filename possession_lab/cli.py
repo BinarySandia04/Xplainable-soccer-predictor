@@ -1009,6 +1009,7 @@ def cmd_transitions(args: argparse.Namespace) -> int:
     from .fusion.transitions import (
         apply_offside_freekick_restarts,
         fill_blind_continuity,
+        honor_clean_interceptions,
         stitch_aerial_excursions,
     )
 
@@ -1037,6 +1038,20 @@ def cmd_transitions(args: argparse.Namespace) -> int:
         arrays["consensus_confidence"].astype(np.float64),
         dead_support=np.asarray(arrays["event_dead"], dtype=bool) | setpiece_dead,
         out_of_bounds=oob,
+    )
+    # a steal the motion channels cannot see: the ball is poked away at speed and never
+    # slows to the onset floor, so no event fires while the tracking shows a clean,
+    # sustained change of control (measured 178 806 and 147 965)
+    result.codes[:] = honor_clean_interceptions(
+        result.codes,
+        arrays["consensus_ball"].astype(np.float64),
+        np.asarray(lab.tracking.players, dtype=np.float64),
+        np.asarray(lab.tracking.teams, dtype=np.int8),
+        np.asarray(lab.tracking.player_present, dtype=bool),
+        np.asarray(arrays["src_atd_ball_probability"], dtype=np.float64),
+        event_dead,
+        setpiece_dead,
+        tuple(lab.tracking.pitch),
     )
 
     # Apply manual verification adjustments for visual inspection cases
