@@ -28,12 +28,12 @@ and no ground-truth possession label was used in any training.
 | `players_yolo26x_1024_clu.pt` | player + keeper detector (YOLO26x @ 1024) | `03031012298e134eb13f4dd03c25651cc3ffc231c27f93f16fb38c4b2de04865` |
 
 Both weights ship as assets of the
-[`champion-run` release](https://github.com/BinarySandia04/Xplainable-soccer-predictor/releases/tag/champion-run),
-along with the full-match perception cache and the fusion pool, so the chain can be viewed or
-reproduced without retraining anything:
+[`champion-run` release](https://github.com/BinarySandia04/Xplainable-soccer-predictor/releases/tag/champion-run).
+The release intentionally contains **only the two weights**: no match data, no perception cache
+and no frame-level tracking export, in line with the data rules:
 
 ```bash
-gh release download champion-run --dir .     # or pick single assets with --pattern
+gh release download champion-run --pattern "*.pt" --dir .
 ```
 
 **Training provenance** — both detectors are YOLO26x @ 1024, DDP on a multi-GPU server, trained
@@ -52,34 +52,17 @@ on **external public data only** (no frame of the provided match and no possessi
 The stock COCO weights (`yolo11x.pt` etc.) are only used by the excluded side experiment in
 `ball_training/`, which is **not** part of this chain — see that README's status banner.
 
-## Viewing the real detections on any PC (no GPU, no model needed)
-
-The heavy step is perception (YOLO26x over all 199,319 frames). Its finished output is shipped
-in the release, so a personal PC can play the actual ball and player detections without running
-any model — everything after perception is pure CPU:
-
-```bash
-# requires the gated bundle unpacked under data/ (tactical video, tracking, homography, tags)
-gh release download champion-run --pattern "perception_new_fixed.npz" --dir possession_lab/outputs
-gh release download champion-run --pattern "fusion.npz"               --dir possession_lab/outputs
-gh release download champion-run --pattern "outputs_view_bundle.tar.gz" --dir /tmp
-tar xzf /tmp/outputs_view_bundle.tar.gz -C possession_lab/outputs/
-
-python -m possession_lab viewer \
-    --perception  possession_lab/outputs/perception_new_fixed.npz \
-    --fusion      possession_lab/outputs/fusion.npz \
-    --predictions possession_lab/outputs/transition_predictions.csv
-```
-
-The viewer plays the tactical video with the detected ball, every player/goalkeeper/referee box,
-the possession spell per frame and the explanation layer.
-
 ## The chain
 
 Only step 1 needs a GPU; everything after it is deterministic CPU code (no RNG in the pipeline).
+The perception output is a local frame-level detection cache; it is **not** distributed because it
+would reconstruct part of the match tracking.
 
 ```bash
 P=possession_lab/outputs
+
+# 0. Weights (external-data training only; no match data in the release).
+gh release download champion-run --pattern "*.pt" --dir .
 
 # 1. Perception (GPU): ball + players over the tactical video, keeper rescue included.
 #    Run farm_perceive.py (SLURM wrapper: farm_perceive.sbatch) against the two weights above.
@@ -113,15 +96,16 @@ python evaluation/validate_submission.py <team_name>.csv
 
 | artefact | SHA-256 |
 |---|---|
-| `possession_lab/outputs/perception_new_fixed.npz` | `9dddaa128dc9eb39eae8419958e4252bb5ed65a423418f33a08ac835ff855f1b` |
-| `possession_lab/outputs/fusion.npz` | `e7ea998b74b963af25413d1938bf5659e56efec1f155e0a668c4dbf4dcae0369` |
 | `possession_lab/outputs/transition_predictions.csv` | `9d79ad4bd83327f03299e02919623ef89215145eecabf1aa0a1a9bb4a5ce66fb` |
 | `possession_lab/outputs/explanations.json` | `2e563e7c044e4c198757a9620f5f77515f5de68964e756ed3557ca45330a6a70` |
+| `possession_lab/outputs/perception_new_fixed.npz` (local only) | `9dddaa128dc9eb39eae8419958e4252bb5ed65a423418f33a08ac835ff855f1b` |
+| `possession_lab/outputs/fusion.npz` (local only) | `e7ea998b74b963af25413d1938bf5659e56efec1f155e0a668c4dbf4dcae0369` |
 
-If your perception cache matches the checksum above, steps 2–4 are pure CPU and reproduce the
-CSV exactly. Perception itself is deterministic given the same weights, `imgsz` (1024), device
-and library versions (see `requirements-perception.txt`); small GPU-library differences are the
-only known source of drift — check the perception checksum first if the CSV differs.
+The last two are reference hashes for a local run; they are not published. Perception is
+deterministic given the same weights, `imgsz` (1024), device and library versions (see
+`requirements-perception.txt`), but small GPU-library differences can change those intermediate
+files. If your perception hash matches, steps 2–4 are pure CPU and reproduce the CSV exactly;
+otherwise check the final CSV hash, which is the submission.
 
 ## Compliance notes
 
@@ -131,3 +115,5 @@ only known source of drift — check the perception checksum first if the CSV di
   correctness checks of the pipeline, never as a tuning target.
 - The provided data (video, tracking, tags) never enters this repository: `data/` is
   `.gitignore`d and no derived data of the match is committed except predictions.
+- No frame-level tracking export, perception cache or fusion pool is published. The release
+  contains only the two weights trained on external data; the match itself is not redistributed.

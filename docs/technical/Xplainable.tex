@@ -611,9 +611,9 @@ identidad.
 \item \textbf{Smart tags.} Cubren el 70,1\,\% del partido; su voto de equipo es débil y los saques
 de banda no traen equipo. La capa de transiciones no depende de ellos para la decisión principal.
 \item \textbf{Percepción.} La inferencia YOLO es determinista con los mismos pesos, resolución y
-versiones de librerías, pero pequeñas diferencias de GPU pueden cambiar el caché. Por eso el
-release publica el caché de percepción y su SHA-256; si no coincide, la reproducibilidad del CSV
-no está garantizada.
+versiones de librerías, pero pequeñas diferencias de GPU pueden cambiar el caché. El caché no se
+publica porque es un tracking derivado del partido; se documenta su SHA-256 local como referencia.
+Si no coincide, la reproducibilidad del CSV no está garantizada.
 \item \textbf{Precisión antes que recall.} La capa de eventos está pensada para no inventar
 transiciones: puede perder deflexiones o posesiones de menos de un segundo. El resultado son 18
 posesiones predichas frente a 17 reales en la ventana pública.
@@ -625,8 +625,10 @@ posesiones predichas frente a 17 reales en la ventana pública.
 El repositorio público es
 \href{https://github.com/BinarySandia04/Xplainable-soccer-predictor}{github.com/BinarySandia04/Xplainable-soccer-predictor}.
 Los datos del partido no se distribuyen con el código; se obtienen del bundle de la organización.
-Los pesos, el caché de percepción y el CSV final se publican en el release
-\href{https://github.com/BinarySandia04/Xplainable-soccer-predictor/releases/tag/champion-run}{\texttt{champion-run}}.
+Los dos pesos se publican en el release
+\href{https://github.com/BinarySandia04/Xplainable-soccer-predictor/releases/tag/champion-run}{\texttt{champion-run}};
+el CSV final está en \texttt{deliverables/}. El caché de percepción no se publica: es un tracking
+derivado del partido.
 
 \begin{lstlisting}
 python -m venv .venv
@@ -656,8 +658,9 @@ PYTHONPATH=. .venv/bin/python -m pytest possession_lab/tests/ -q
 \end{lstlisting}
 
 \begin{samepage}
-Si el caché de percepción del release se usa directamente, los pasos 2 y 3 son CPU pura y
-reproducen el CSV byte a byte. Las sumas de verificación esperadas son:
+Si tu caché de percepción local coincide con las sumas de referencia, los pasos 2 y 3 son CPU pura y
+reproducen el CSV byte a byte. Las sumas de verificación esperadas son (las dos primeras filas son
+cachés locales, no publicados):
 
 \begin{center}
 \footnotesize
@@ -705,8 +708,8 @@ Etiquetas algorítmicas & Las 199.319 etiquetas salen de la cadena
 aplicada a mano sobre el CSV. \\
 Sin verdad privada & La única verdad usada es el CSV público de 7.500 fotogramas; se usó para
 evaluar, ajustar parámetros y el bootstrap, nunca como entrada online ni para etiquetar a mano. \\
-Reproducible & El repositorio incluye dependencias fijadas, pesos y caché de percepción en el
-release, comandos y sumas SHA-256. El CSV enviado coincide byte a byte con
+Reproducible & El repositorio incluye dependencias fijadas, los pesos en el release, comandos y
+sumas SHA-256. El CSV enviado coincide byte a byte con
 \texttt{transition\_predictions.csv}. \\
 Datos no redistribuidos & \texttt{data/} está excluido de Git; no se publican vídeo, tracking ni
 recortes. Sólo se publican código, pesos entrenados con datos externos y las etiquetas de la
